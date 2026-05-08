@@ -35,6 +35,7 @@
 #   20  No stderr writes outside cli.rs / panic hook (corrupts TUI)
 #   21  Generic placeholder `command:` literals (mirrors #16 for command prefix)
 #   22  Saturating sub on inner/popup height too (extends #5 beyond `area.*`)
+#   23  No captured numeric values in comments (per CLAUDE.md "Comments")
 
 set -e
 
@@ -526,6 +527,64 @@ if [ -n "$COMMAND_HITS" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
+# 23. Captured numeric values in `//` comments (per CLAUDE.md "Comments" rule).
+# Catches percentages (`94%`, `100.0%`), magnitude suffixes (`76.2K`, `4.46M`),
+# and dollar amounts in narrative comments — they look like illustrations but
+# are stale snapshots of user data the moment they're written.
+# Exemptions:
+#   * `mod tests` blocks — test docstrings document fixture arithmetic that
+#     IS the contract and won't drift independently of the assertions.
+#   * `src/aggregator/pricing.rs` — rate constants are self-documented inline.
+#   * `silent-$0` / `silent $0` — term-of-art for the "model lacks pricing"
+#     bug class (like "silent NaN").
+NUMERIC_COMMENTS=$(python3 -c "
+import re
+pct = re.compile(r'(?<![A-Za-z0-9_.])\d+(?:\.\d+)?%')
+mag = re.compile(r'(?<![A-Za-z0-9_.])\d+\.\d+[KMGB]\b')
+dol = re.compile(r'\\\$\d+(?:\.\d+)?')
+silent_zero = re.compile(r'silent[ -]?\\\$0')
+for fname in '$ALL_RUST_FILES'.split():
+    if fname.endswith('pricing.rs'):
+        continue
+    with open(fname) as f:
+        lines = f.read().split('\n')
+    in_tests = False
+    test_depth = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Track 'mod tests {' nesting by brace count once entered.
+        if not in_tests and re.match(r'mod\s+tests\s*\{', stripped):
+            in_tests = True
+            test_depth = line.count('{') - line.count('}')
+            continue
+        if in_tests:
+            test_depth += line.count('{') - line.count('}')
+            if test_depth <= 0:
+                in_tests = False
+            continue
+        # Find comment start; skip lines without // (avoid false matches in code).
+        idx = line.find('//')
+        if idx < 0:
+            continue
+        comment = line[idx:]
+        # Strip 'silent-\$0' style term so the dollar regex doesn't trip on it.
+        scrubbed = silent_zero.sub('', comment)
+        hits = []
+        if pct.search(scrubbed):
+            hits.append('%')
+        if mag.search(scrubbed):
+            hits.append('K/M/G/B')
+        if dol.search(scrubbed):
+            hits.append('\$')
+        if hits:
+            print(f'  {fname}:L{i+1} [{\",\".join(hits)}]: {stripped}')
+" 2>/dev/null || true)
+if [ -n "$NUMERIC_COMMENTS" ]; then
+    echo "ERROR: Captured numeric values in comments (CLAUDE.md \"Comments\"):"
+    echo "$NUMERIC_COMMENTS"
+    ERRORS=$((ERRORS + 1))
+fi
+
 # 22. Raw subtraction on inner / popup dimensions.
 # Extends #5 beyond bare `area.*`. Variables named `inner.height`,
 # `popup_area.height`, `popup_height`, etc. carry the same u16-underflow risk
@@ -545,6 +604,43 @@ for fname in '$UI_FILES'.split():
 if [ -n "$RAW_SUB_INNER" ]; then
     echo "ERROR: Raw subtraction on inner/popup dimensions (use saturating_sub):"
     echo "$RAW_SUB_INNER"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 24. Direct `shorten_project()` in render paths instead of `state.project_label()`.
+# `shorten_project` returns just the basename — when two projects share a basename
+# (`/work/dev/foo` vs `/other/area/foo`), it loses the disambiguating context.
+# Render paths must go through `state.project_label`, which prepends the parent
+# dir on collision. Allowed call sites:
+#   - the `shorten_project` definition itself (mod.rs:172)
+#   - `unwrap_or_else(|| shorten_project(...))` fallback when `project_labels` is missing
+#   - `summary.rs` (AI prompt generation, single session, no list to disambiguate against)
+SHORTEN_DIRECT=$(python3 -c "
+import re
+pat = re.compile(r'\bshorten_project\s*\(')
+for fname in 'src/ui/dashboard.rs src/ui/insights.rs src/ui/mod.rs'.split():
+    try:
+        with open(fname) as f:
+            content = f.read()
+    except FileNotFoundError:
+        continue
+    for i, line in enumerate(content.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith('//') or stripped.startswith('///'):
+            continue
+        if not pat.search(line):
+            continue
+        # Allow the definition itself.
+        if 'fn shorten_project' in line:
+            continue
+        # Allow the fallback inside an unwrap_or_else closure (typically '|| shorten_project(...)').
+        if 'unwrap_or_else' in line or '||' in line.split('shorten_project')[0]:
+            continue
+        print(f'  {fname}:L{i+1}: {stripped}')
+" 2>/dev/null || true)
+if [ -n "$SHORTEN_DIRECT" ]; then
+    echo "ERROR: Direct shorten_project() in render path (use state.project_label() so two projects with the same basename stay distinguishable):"
+    echo "$SHORTEN_DIRECT"
     ERRORS=$((ERRORS + 1))
 fi
 

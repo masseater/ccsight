@@ -10,9 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-// 23: revert `extract_project_name` to FIRST cwd (was briefly rev() in 1.1.0
-// dev) — needed to invalidate buckets cached with the wrong semantics.
-const CACHE_VERSION: u32 = 23;
+const CACHE_VERSION: u32 = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -69,6 +67,8 @@ pub struct CachedFileStats {
     pub summary: Option<String>,
     #[serde(default)]
     pub custom_title: Option<String>,
+    #[serde(default)]
+    pub ai_title: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -333,6 +333,7 @@ mod tests {
                             last_timestamp: None,
                             summary: None,
                             custom_title: None,
+                            ai_title: None,
                             model: None,
                             is_subagent: false,
                             daily_stats: HashMap::new(),

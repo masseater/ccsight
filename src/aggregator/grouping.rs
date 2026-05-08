@@ -28,6 +28,7 @@ pub struct SessionInfo {
     pub day_extension_usage: HashMap<String, usize>,
     pub summary: Option<String>,
     pub custom_title: Option<String>,
+    pub ai_title: Option<String>,
     pub model: Option<String>,
     pub is_subagent: bool,
     pub is_continued: bool,
@@ -75,7 +76,13 @@ impl DailyGrouper {
         }
 
         for sessions in date_map.values_mut() {
-            sessions.sort_by_key(|s| std::cmp::Reverse(s.day_last_timestamp));
+            // Stable tiebreak by file_path so two sessions sharing the same
+            // `day_last_timestamp` keep a deterministic order across reloads.
+            sessions.sort_by(|a, b| {
+                b.day_last_timestamp
+                    .cmp(&a.day_last_timestamp)
+                    .then_with(|| a.file_path.cmp(&b.file_path))
+            });
         }
 
         let mut groups: Vec<DailyGroup> = date_map
@@ -142,6 +149,7 @@ impl DailyGrouper {
                         day_extension_usage: ds.extension_usage.clone(),
                         summary: cached.summary.clone(),
                         custom_title: cached.custom_title.clone(),
+                        ai_title: cached.ai_title.clone(),
                         model: cached.model.clone(),
                         is_subagent: cached.is_subagent,
                         is_continued: date != session_start_date,
@@ -241,6 +249,24 @@ impl DailyGrouper {
         let custom_title =
             custom_title.or_else(|| crate::infrastructure::resolve_cowork_title(file));
 
+        // Anthropic-generated short title; preferred over custom_title and
+        // summary in the display precedence.
+        let ai_title = if let Some(c) = cache {
+            if c.is_valid(file) {
+                c.get(file).and_then(|cached| cached.ai_title.clone())
+            } else {
+                entries
+                    .iter()
+                    .rfind(|e| e.entry_type == EntryType::AiTitle)
+                    .and_then(|e| e.ai_title.clone())
+            }
+        } else {
+            entries
+                .iter()
+                .rfind(|e| e.entry_type == EntryType::AiTitle)
+                .and_then(|e| e.ai_title.clone())
+        };
+
         let model = super::extract_session_model(&entries);
 
         let mut daily_stats: HashMap<NaiveDate, DailyStats> = HashMap::new();
@@ -285,15 +311,22 @@ impl DailyGrouper {
                             {
                                 let key = crate::aggregator::tool_usage_key(name, input);
                                 *stats.tool_usage.entry(key).or_insert(0) += 1;
-                                if let Some(lang) =
-                                    StatsAggregator::extract_language_from_tool_input(name, input)
-                                {
-                                    *stats.language_usage.entry(lang.to_string()).or_insert(0) += 1;
-                                }
-                                for ext in
-                                    StatsAggregator::extract_extensions_from_tool_input(name, input)
-                                {
-                                    *stats.extension_usage.entry(ext).or_insert(0) += 1;
+                                let extensions =
+                                    StatsAggregator::extract_extensions_from_tool_input(name, input);
+                                if extensions.is_empty() {
+                                    // Special filenames (Dockerfile, Makefile, etc.) carry a
+                                    // language but no extension — count them under language only.
+                                    if let Some(lang) =
+                                        StatsAggregator::extract_language_from_tool_input(name, input)
+                                    {
+                                        *stats.language_usage.entry(lang.to_string()).or_insert(0) += 1;
+                                    }
+                                } else {
+                                    for ext in extensions {
+                                        let lang = crate::aggregator::language::for_extension(&ext);
+                                        *stats.extension_usage.entry(ext).or_insert(0) += 1;
+                                        *stats.language_usage.entry(lang.to_string()).or_insert(0) += 1;
+                                    }
                                 }
                             }
                         }
@@ -352,6 +385,7 @@ impl DailyGrouper {
                         day_extension_usage: stats.extension_usage,
                         summary: summary.clone(),
                         custom_title: custom_title.clone(),
+                        ai_title: ai_title.clone(),
                         model: model.clone(),
                         is_subagent,
                         is_continued,
@@ -482,6 +516,7 @@ mod tests {
             message: None,
             summary: None,
             custom_title: None,
+            ai_title: None,
             cwd: Some("/Users/test/projects/myproject".to_string()),
             git_branch: None,
             version: None,
@@ -504,6 +539,7 @@ mod tests {
             message: None,
             summary: None,
             custom_title: None,
+            ai_title: None,
             cwd: None,
             git_branch: None,
             version: None,
@@ -537,6 +573,7 @@ mod tests {
             last_timestamp: None,
             summary: None,
             custom_title: None,
+            ai_title: None,
             model: None,
             is_subagent: false,
             daily_stats,

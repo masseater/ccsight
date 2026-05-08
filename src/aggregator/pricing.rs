@@ -73,21 +73,6 @@ pub struct ModelPricing {
     pub cache_read_cost_per_mtok: f64,  // 0.1x input
 }
 
-pub struct CostBreakdown {
-    pub input: f64,
-    pub output: f64,
-}
-
-impl CostBreakdown {
-    pub fn effective_rate(cost: f64, tokens: u64) -> Option<f64> {
-        if tokens > 0 {
-            Some(cost / (tokens as f64 / 1_000_000.0))
-        } else {
-            None
-        }
-    }
-}
-
 pub struct CostCalculator {
     pricing: HashMap<String, ModelPricing>,
     sorted_keys: Vec<String>,
@@ -282,19 +267,6 @@ impl CostCalculator {
             tokens.cache_read_tokens as f64 / million * pricing.cache_read_cost_per_mtok;
 
         Some(input_cost + output_cost + cache_write_cost + cache_read_cost)
-    }
-
-    pub fn cost_breakdown_by_display_name(
-        &self,
-        display_name: &str,
-        tokens: &TokenStats,
-    ) -> Option<CostBreakdown> {
-        let pricing = self.get_pricing_by_display_name(display_name)?;
-        let million = 1_000_000.0;
-        Some(CostBreakdown {
-            input: tokens.input_tokens as f64 / million * pricing.input_cost_per_mtok,
-            output: tokens.output_tokens as f64 / million * pricing.output_cost_per_mtok,
-        })
     }
 
     pub fn get_pricing_by_display_name(&self, display_name: &str) -> Option<&ModelPricing> {

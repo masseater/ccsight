@@ -385,7 +385,12 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
             } else {
                 month_name(month).to_string()
             };
-            let gap = expected_pos.saturating_sub(used_chars);
+            // Always insert at least 1 space between adjacent labels so a
+            // month that starts the same column where the previous label
+            // ended doesn't render as one run-on token. After the first
+            // label, a 0-gap means visual collision.
+            let raw_gap = expected_pos.saturating_sub(used_chars);
+            let gap = if used_chars == 0 { raw_gap } else { raw_gap.max(1) };
             if gap > 0 {
                 month_row.push(Span::raw(" ".repeat(gap)));
                 used_chars += gap;
@@ -397,6 +402,29 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
             used_chars += label.len();
             prev_month = month;
             prev_year = year;
+        }
+    }
+    // If the last visible cell falls in a month whose label was never pushed
+    // (the trailing partial week starts in the previous month), right-align
+    // a synthetic label so the user can still tell which month the rightmost
+    // cells belong to.
+    let trailing = display_end.min(today);
+    if trailing.month() != prev_month {
+        let label = if trailing.year() != prev_year {
+            format!("{}/{}", trailing.year() % 100, month_name(trailing.month()))
+        } else {
+            month_name(trailing.month()).to_string()
+        };
+        let cells_width = weeks * 2;
+        let target_end = cells_width;
+        let label_start = target_end.saturating_sub(label.len());
+        if label_start > used_chars {
+            let gap = label_start - used_chars;
+            month_row.push(Span::raw(" ".repeat(gap)));
+            month_row.push(Span::styled(
+                label,
+                Style::default().fg(theme::LABEL_SUBTLE),
+            ));
         }
     }
     lines.push(Line::from(month_row));
@@ -596,7 +624,7 @@ fn draw_top_projects(
             } else {
                 0
             };
-            let dir_name = super::shorten_project(name);
+            let dir_name = state.project_label(name);
             let tokens_str = crate::format_number(stats.work_tokens);
 
             Row::new(vec![
@@ -675,6 +703,12 @@ fn draw_model_tokens(
 
     let (visible_height, _, scroll) = calc_scroll(area.height, models.len(), scroll, 2);
 
+    // Name column receives whatever Min(8) leaves after the fixed columns
+    // (rank 3, tokens 6, pct 8 — pct keeps a `tok` suffix so the share basis
+    // is unambiguous against the Insights popup's cost-share row, which
+    // labels its column with a `$` suffix instead) and 3 inter-column gaps,
+    // plus 2 borders.
+    let name_w = (area.width as usize).saturating_sub(3 + 6 + 8 + 3 + 2).max(4);
     let rows: Vec<Row> = models
         .iter()
         .enumerate()
@@ -683,13 +717,13 @@ fn draw_model_tokens(
         .map(|(i, (name, tokens, _cost))| {
             let rank = format!("{}.", i + 1);
             let pct = if total_tokens > 0 {
-                format!("{:.0}%", *tokens as f64 / total_tokens as f64 * 100.0)
+                format!("{:.0}% tok", *tokens as f64 / total_tokens as f64 * 100.0)
             } else {
-                "0%".to_string()
+                "0% tok".to_string()
             };
             Row::new(vec![
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
-                Cell::from(name.clone()),
+                Cell::from(super::truncate_with_ellipsis(name, name_w)),
                 Cell::from(crate::format_number(*tokens))
                     .style(Style::default().fg(theme::PRIMARY)),
                 Cell::from(pct)
@@ -722,7 +756,7 @@ fn draw_model_tokens(
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(6),
-            Constraint::Length(4),
+            Constraint::Length(8),
         ],
     )
     .block(
@@ -938,10 +972,8 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
         category_rows.iter().enumerate()
     {
         let prefix_label = format!(" {label:<10}");
-        let middle_base = format!(
-            " {uniq_count} {uniq_unit} · {}",
-            crate::format_number(*total as u64)
-        );
+        let total_str = crate::format_number(*total as u64);
+        let middle_full = format!(" {uniq_count} {uniq_unit} · {total_str}");
         let arrow_pos = (inner_width as usize).saturating_sub(2);
         // Inline stale flag on the Tools row only if it leaves room for the
         // trailing `▶`. The Tier 3 health alert below carries the same info
@@ -952,9 +984,19 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
         } else {
             String::new()
         };
-        let base_len = prefix_label.chars().count() + middle_base.chars().count();
+        let prefix_len = prefix_label.chars().count();
+        let middle_avail = arrow_pos.saturating_sub(prefix_len);
+        // When the full "{N groups · {total}}" doesn't fit before the trailing
+        // ▶, drop the group/uniq prefix and show just the total. Truncating
+        // mid-number would mislead the reader: a clipped magnitude suffix
+        // (e.g. losing the `K`/`M`) reads as a much smaller value than it is.
+        let middle_base = if middle_full.chars().count() <= middle_avail {
+            middle_full
+        } else {
+            format!(" {total_str}")
+        };
         let middle = if mcp_stale_inline
-            && base_len + stale_suffix.chars().count() < arrow_pos
+            && middle_base.chars().count() + stale_suffix.chars().count() <= middle_avail
         {
             format!("{middle_base}{stale_suffix}")
         } else {
@@ -1099,6 +1141,8 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
     // scroll bar stops at the actual end of content. Configured-but-unused
     // entries from `configured_resources` add zero-call rows.
     let mut has_builtin = false;
+    let mut builtin_calls = 0usize;
+    let mut mcp_calls = 0usize;
     let mut mcp_servers: HashSet<String> = HashSet::new();
     let mut skill_keys: HashSet<String> = HashSet::new();
     let mut command_keys: HashSet<String> = HashSet::new();
@@ -1107,9 +1151,11 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
         match classify_tool(t.0) {
             ToolCategory::BuiltIn => {
                 has_builtin = true;
+                builtin_calls += t.1;
             }
             ToolCategory::Mcp { server } => {
                 mcp_servers.insert(server);
+                mcp_calls += t.1;
             }
             ToolCategory::Skill { .. } => {
                 skill_keys.insert((*t.0).clone());
@@ -1167,11 +1213,24 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
             .iter()
             .map(|name| crate::mcp_tool_count(state, name))
             .sum();
-        usize::from(any_stale) + expanded_rows
+        // The Built-in vs MCP ratio line renders only when both subgroups
+        // have nonzero calls. Counted here so the scrollbar reaches every
+        // body line.
+        let has_ratio = builtin_calls > 0 && mcp_calls > 0;
+        usize::from(any_stale) + usize::from(has_ratio) + expanded_rows
     } else {
         0
     };
-    1 + counts[active] + extra
+    // Tools tab pins 1 header line ("groups · calls") in the body slice, so
+    // its scrollable item count is `1 + groups + extra`. The other tabs pin
+    // their `N uniq · M calls` line as a fixed header (not part of the body
+    // slice) — return just the row count so pagination matches what the
+    // user actually scrolls through.
+    if active == 0 {
+        1 + counts[active] + extra
+    } else {
+        counts[active]
+    }
 }
 
 fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: bool, scroll: usize) {
@@ -1186,6 +1245,9 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
     let total_usage: usize = languages.iter().map(|(_, c)| **c).sum();
     let (visible_height, _, scroll) = calc_scroll(area.height, languages.len(), scroll, 2);
 
+    // Same Min(8) name column as Models; trailing fixed columns are wider here
+    // (rank 4, count 6, pct 4) plus 3 inter-column gaps and 2 borders.
+    let name_w = (area.width as usize).saturating_sub(4 + 6 + 4 + 3 + 2).max(4);
     let rows: Vec<Row> = languages
         .iter()
         .enumerate()
@@ -1200,7 +1262,7 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
             };
             Row::new(vec![
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
-                Cell::from(name.as_str()),
+                Cell::from(super::truncate_with_ellipsis(name, name_w)),
                 Cell::from(count.to_string()).style(Style::default().fg(theme::PRIMARY)),
                 Cell::from(format!("{percentage}%")).style(Style::default().fg(theme::MUTED)),
             ])
@@ -1253,6 +1315,12 @@ fn draw_recent_costs(
 ) {
     let (visible_height, _, scroll) = calc_scroll(area.height, state.daily_costs.len(), scroll, 2);
 
+    // Drop the cost decimals when the panel is too narrow to fit
+    // `$NNN.NN` — otherwise ratatui silently clips the trailing decimals
+    // and leaves the user reading a wrong value. `${:.0}` keeps the
+    // magnitude intact.
+    let cost_precision = if area.width >= 70 { 2 } else { 0 };
+
     let rows: Vec<Row> = state
         .daily_costs
         .iter()
@@ -1262,7 +1330,7 @@ fn draw_recent_costs(
         .map(|(i, (date, cost))| {
             let date_str = date.format("%m-%d(%a)").to_string();
             let cost_display = cost.max(0.0);
-            let cost_str = super::format_cost(cost_display, 2);
+            let cost_str = super::format_cost(cost_display, cost_precision);
             let tokens: u64 = state
                 .daily_groups
                 .iter()
@@ -1322,6 +1390,38 @@ fn draw_recent_costs(
     );
 
     frame.render_widget(table, area);
+}
+
+/// Append a month-summary divider line for the popup body. Same layout for
+/// the Daily Costs and Daily Activity detail popups: `── YY-MM  Nd  $cost
+/// tokens  avg $X/d ──...`. Width-aware trailing fill.
+fn push_month_divider_line(
+    lines: &mut Vec<Line<'static>>,
+    year: i32,
+    month: u32,
+    days: usize,
+    cost: f64,
+    tokens: u64,
+    content_width: usize,
+) {
+    let avg_per_day = if days > 0 { cost / days as f64 } else { 0.0 };
+    let label = format!(
+        "{:02}-{:02}  {}d  ${:.0}  {}  avg ${:.0}/d",
+        year % 100,
+        month,
+        days,
+        cost.max(0.0),
+        crate::format_number(tokens),
+        avg_per_day.max(0.0),
+    );
+    let label_w = unicode_width::UnicodeWidthStr::width(label.as_str());
+    let trail = "─".repeat(content_width.saturating_sub(2 + 3 + 1 + label_w + 1));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("── ", Style::default().fg(theme::SEPARATOR)),
+        Span::styled(label, Style::default().fg(theme::LABEL_MUTED)),
+        Span::styled(format!(" {trail}"), Style::default().fg(theme::SEPARATOR)),
+    ]));
 }
 
 pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -1385,6 +1485,12 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         _ => visible_height,
     };
 
+    // Clamp scroll so it can't park past the last full page (mirrors the
+    // `calc_scroll` rule on the compact panels).
+    let max_scroll = total_items.saturating_sub(items_per_screen);
+    let scroll = scroll.min(max_scroll);
+    state.dashboard_scroll[state.dashboard_panel] = scroll;
+
     let can_scroll_up = scroll > 0;
     let can_scroll_down = scroll + items_per_screen < total_items;
 
@@ -1400,7 +1506,35 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 .fold(0.0f64, f64::max);
             let bar_width = 12usize;
 
-            let mut prev_month: Option<u32> = None;
+            // Per-month aggregates so each divider can carry the month's
+            // active-day count, total cost, total tokens and average cost
+            // per active day. Tokens come from `daily_groups`; costs come
+            // from `daily_costs` so the divider stays in sync with the
+            // panel rows themselves.
+            let mut monthly_cost: std::collections::HashMap<(i32, u32), (f64, usize)> =
+                std::collections::HashMap::new();
+            for (date, cost) in &state.daily_costs {
+                let entry = monthly_cost
+                    .entry((date.year(), date.month()))
+                    .or_insert((0.0, 0));
+                entry.0 += cost;
+                entry.1 += 1;
+            }
+            let mut monthly_tok: std::collections::HashMap<(i32, u32), u64> =
+                std::collections::HashMap::new();
+            for group in &state.daily_groups {
+                let tokens: u64 = group
+                    .sessions
+                    .iter()
+                    .filter(|s| !s.is_subagent)
+                    .map(crate::aggregator::SessionInfo::work_tokens)
+                    .sum();
+                *monthly_tok
+                    .entry((group.date.year(), group.date.month()))
+                    .or_insert(0) += tokens;
+            }
+            let cw = content_width;
+            let mut prev_month: Option<(i32, u32)> = None;
             for (i, (date, cost)) in state
                 .daily_costs
                 .iter()
@@ -1408,16 +1542,14 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 .skip(scroll)
                 .take(visible_height)
             {
-                let month = date.month();
+                let key = (date.year(), date.month());
                 if let Some(pm) = prev_month
-                    && pm != month {
-                        let separator = "─".repeat(content_width.saturating_sub(2));
-                        lines.push(Line::from(Span::styled(
-                            format!("  {separator}"),
-                            Style::default().fg(theme::SEPARATOR),
-                        )));
+                    && pm != key {
+                        let (c, d) = monthly_cost.get(&pm).copied().unwrap_or((0.0, 0));
+                        let t = monthly_tok.get(&pm).copied().unwrap_or(0);
+                        push_month_divider_line(&mut lines, pm.0, pm.1, d, c, t, cw);
                     }
-                prev_month = Some(month);
+                prev_month = Some(key);
 
                 let cost_display = cost.max(0.0);
                 let ratio = if max_cost > 0.0 {
@@ -1701,33 +1833,27 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
                     )
                 } else {
-                    let effective = calculator
-                        .cost_breakdown_by_display_name(model, ts)
-                        .map(|b| {
-                            use crate::aggregator::CostBreakdown;
-                            let in_r = CostBreakdown::effective_rate(b.input, ts.input_tokens);
-                            let out_r = CostBreakdown::effective_rate(b.output, ts.output_tokens);
-                            let mut parts = Vec::new();
-                            if let Some(r) = in_r {
-                                parts.push(format!("in:${r:.1}"));
-                            }
-                            if let Some(r) = out_r {
-                                parts.push(format!("out:${r:.1}"));
-                            }
-                            if !parts.is_empty() {
-                                format!("  eff/MTok {}", parts.join(" "))
-                            } else {
-                                String::new()
-                            }
-                        })
-                        .unwrap_or_default();
+                    // "actual" rate = total cost ÷ all tokens (input + output +
+                    // cache). The next line shows the static `rate/MTok` per
+                    // category; this one shows what was actually paid per
+                    // million tokens once cache reads are factored in, so the
+                    // gap between the two reflects how much cache is saving.
+                    let total_tokens = ts.input_tokens
+                        + ts.output_tokens
+                        + ts.cache_creation_tokens
+                        + ts.cache_read_tokens;
+                    let actual = if total_tokens > 0 {
+                        format!("  actual:${:.2}/MTok", cost / (total_tokens as f64 / 1_000_000.0))
+                    } else {
+                        String::new()
+                    };
                     format!(
                         "in:{} out:{} cache:{}  ${:.2}{}",
                         crate::format_number(ts.input_tokens),
                         crate::format_number(ts.output_tokens),
                         crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
                         cost,
-                        effective,
+                        actual,
                     )
                 };
 
@@ -1934,7 +2060,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             };
 
             // Build tab spans in main-tabs style:
-            //   active: reversed color block (TEXT_DARK on PRIMARY, BOLD) e.g. ` Built-in 68.7K (94%) `
+            //   active: reversed color block (TEXT_DARK on PRIMARY, BOLD)
             //   inactive: `N:` prefix in FAINT + label in section color (DIM for empty)
             //   click areas recorded per-tab (absolute coords within popup)
             let mut tab_spans: Vec<Span> = vec![Span::raw("  ")];
@@ -1946,7 +2072,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             for (i, sec) in sections.iter().enumerate() {
                 let is_active = i == active;
                 let empty = !tab_has_rows(i);
-                // Absolute count only — a cross-category % here (e.g. "94%") would
+                // Absolute count only — a cross-category percentage here would
                 // misleadingly suggest Built-in and Skills can be compared on the same
                 // axis when their call-count semantics are very different (dispatcher vs
                 // primitive). Keep call count for scale, drop %.
@@ -2132,6 +2258,30 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     ),
                     Style::default().fg(theme::DIM),
                 )]));
+                if total_calls > 0 && builtin_total > 0 && mcp_total > 0 {
+                    let bi_pct = builtin_total as f64 / total_calls as f64 * 100.0;
+                    let mcp_pct = mcp_total as f64 / total_calls as f64 * 100.0;
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            format!(
+                                "Built-in {} ({:.0}%)",
+                                crate::format_number(builtin_total as u64),
+                                bi_pct
+                            ),
+                            Style::default().fg(theme::CAT_BUILTIN),
+                        ),
+                        Span::styled("  ·  ", Style::default().fg(theme::DIM)),
+                        Span::styled(
+                            format!(
+                                "MCP {} ({:.0}%)",
+                                crate::format_number(mcp_total as u64),
+                                mcp_pct
+                            ),
+                            Style::default().fg(theme::CAT_MCP),
+                        ),
+                    ]));
+                }
                 if stale_count > 0 {
                     lines.push(Line::from(vec![Span::styled(
                         format!("  ⚠ {stale_count} stale (>30d)"),
@@ -2169,18 +2319,24 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     let ratio = agg.calls as f64 / bar_max as f64;
                     // Percentage uses a per-category denominator: Built-in is
                     // compared against `builtin_total`, MCP servers against
-                    // `mcp_total`. Sharing one denominator made Built-in look
-                    // like ~95% in nearly every account, which crushed the MCP
-                    // bars to "0–1%" and erased per-server ranking detail.
+                    // `mcp_total`. A shared denominator would make Built-in
+                    // dominate and squash every MCP server into a flat trough,
+                    // erasing per-server ranking detail.
                     let pct_denom = if agg.is_builtin {
                         builtin_total
                     } else {
                         mcp_total
                     };
-                    let pct = if pct_denom > 0 {
-                        (agg.calls as f64 / pct_denom as f64 * 100.0) as u32
+                    // Built-in is its own per-category denominator — the
+                    // resulting fraction is always full and carries no
+                    // information; the share vs grand total appears in the
+                    // summary line above, so suppress this column here.
+                    let pct: Option<u32> = if agg.is_builtin {
+                        None
+                    } else if pct_denom > 0 {
+                        Some((agg.calls as f64 / pct_denom as f64 * 100.0) as u32)
                     } else {
-                        0
+                        Some(0)
                     };
                     let filled = (ratio * bar_width as f64).round() as usize;
                     let bar =
@@ -2279,7 +2435,13 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             format!(" {:>5}", crate::format_number(agg.calls as u64)),
                             Style::default().fg(theme::LABEL_MUTED),
                         ),
-                        Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                        Span::styled(
+                            match pct {
+                                Some(p) => format!(" {p:>2}%"),
+                                None => "    ".to_string(),
+                            },
+                            Style::default().fg(theme::DIM),
+                        ),
                         Span::styled(
                             format!(
                                 " · {tool_count} tool{}",
@@ -2497,8 +2659,11 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 }
             }
 
-            // Pinned: blank + Total + tab bar + separator (4 lines). Body scrolls.
-            let headers = 4;
+            // Pinned headers: blank + Total + tab bar + separator (4). The
+            // Skills/Commands/Subagents tabs add a fifth pinned line — the
+            // `N uniq · M calls` summary — so the user-visible row count and
+            // the pagination footer agree (body row count == total_items).
+            let headers = if active == 0 { 4 } else { 5 };
             let total_len = lines.len();
             if total_len > headers {
                 let body_start = headers;
@@ -2629,13 +2794,20 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 ]));
 
                 if is_known
-                    && let LangItem::Known(lang, _) = item
+                    && let LangItem::Known(lang, lang_count) = item
                         && let Some(exts) = ext_by_lang.get(lang) {
+                            // Surface the residual: `language_usage[lang]`
+                            // counts hits without a file extension too (see
+                            // `extract_language_from_tool_input`); without
+                            // this tail the breakdown wouldn't add up to
+                            // the row header.
+                            let ext_sum: usize = exts.iter().map(|(_, c)| **c).sum();
+                            let no_ext = lang_count.saturating_sub(ext_sum);
                             let indent = "        ";
                             let max_line_width = content_width.saturating_sub(2);
                             let mut current_line = String::from(indent);
-                            for (j, (ext, c)) in exts.iter().enumerate() {
-                                let part = format!(".{ext}({c})");
+                            let mut wrote_any = false;
+                            let push_part = |part: String, current_line: &mut String, wrote_any: &mut bool, lines: &mut Vec<Line>| {
                                 let needed = if current_line.len() == indent.len() {
                                     current_line.len() + part.len()
                                 } else {
@@ -2646,13 +2818,20 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                                         current_line.clone(),
                                         Style::default().fg(theme::DIM),
                                     )));
-                                    current_line = format!("{indent}{part}");
+                                    *current_line = format!("{indent}{part}");
                                 } else {
-                                    if j > 0 {
+                                    if *wrote_any {
                                         current_line.push_str("  ");
                                     }
                                     current_line.push_str(&part);
                                 }
+                                *wrote_any = true;
+                            };
+                            for (ext, c) in exts.iter() {
+                                push_part(format!(".{ext}({c})"), &mut current_line, &mut wrote_any, &mut lines);
+                            }
+                            if no_ext > 0 {
+                                push_part(format!("(no-ext: {no_ext})"), &mut current_line, &mut wrote_any, &mut lines);
                             }
                             if current_line.len() > indent.len() {
                                 lines.push(Line::from(Span::styled(
@@ -2691,18 +2870,32 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let max_tokens = daily.iter().map(|(_, t)| *t).max().unwrap_or(1);
             let bar_width = 15usize;
 
-            let mut prev_month: Option<u32> = None;
+            // Per-month totals (active days, work tokens, cost) so each
+            // divider row can summarise the month that just finished
+            // scrolling past. Costs come from `state.daily_costs` and stay
+            // in sync with the Costs panel by construction.
+            let mut monthly_tok: std::collections::HashMap<(i32, u32), (u64, usize)> =
+                std::collections::HashMap::new();
+            for (date, tokens) in &daily {
+                let entry = monthly_tok.entry((date.year(), date.month())).or_insert((0, 0));
+                entry.0 += *tokens;
+                entry.1 += 1;
+            }
+            let mut monthly_cost: std::collections::HashMap<(i32, u32), f64> =
+                std::collections::HashMap::new();
+            for (date, cost) in &state.daily_costs {
+                *monthly_cost.entry((date.year(), date.month())).or_insert(0.0) += cost;
+            }
+            let mut prev_month: Option<(i32, u32)> = None;
             for (i, (date, tokens)) in daily.iter().enumerate().skip(scroll).take(visible_height) {
-                let month = date.month();
+                let key = (date.year(), date.month());
                 if let Some(pm) = prev_month
-                    && pm != month {
-                        let separator = "─".repeat(content_width.saturating_sub(2));
-                        lines.push(Line::from(Span::styled(
-                            format!("  {separator}"),
-                            Style::default().fg(theme::SEPARATOR),
-                        )));
+                    && pm != key {
+                        let (t, d) = monthly_tok.get(&pm).copied().unwrap_or((0, 0));
+                        let c = monthly_cost.get(&pm).copied().unwrap_or(0.0);
+                        push_month_divider_line(&mut lines, pm.0, pm.1, d, c, t, content_width);
                     }
-                prev_month = Some(month);
+                prev_month = Some(key);
 
                 let ratio = *tokens as f64 / max_tokens as f64;
                 let filled = (ratio * bar_width as f64).round() as usize;
@@ -2834,4 +3027,45 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
     );
 
     frame.render_widget(popup, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_month_divider_line;
+    use ratatui::text::Line;
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn divider_formats_year_month_days_cost_tokens_avg() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_month_divider_line(&mut lines, 2026, 5, 3, 706.0, 2_240_000, 80);
+        assert_eq!(lines.len(), 1);
+        let text = line_text(&lines[0]);
+        assert!(text.contains("26-05"), "expected YY-MM, got: {text}");
+        assert!(text.contains("3d"), "expected 3d, got: {text}");
+        assert!(text.contains("$706"));
+        assert!(text.contains("2.24M"));
+        // 706 / 3 = 235.33 → ${:.0} → 235
+        assert!(text.contains("avg $235/d"), "got: {text}");
+    }
+
+    #[test]
+    fn divider_handles_zero_days_without_div_by_zero() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_month_divider_line(&mut lines, 2026, 5, 0, 0.0, 0, 80);
+        let text = line_text(&lines[0]);
+        assert!(text.contains("0d"));
+        assert!(text.contains("avg $0/d"));
+    }
+
+    #[test]
+    fn divider_clamps_negative_cost_to_zero() {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        push_month_divider_line(&mut lines, 2026, 5, 1, -50.0, 1000, 80);
+        let text = line_text(&lines[0]);
+        assert!(text.contains("$0"), "negative cost should clamp to 0, got: {text}");
+    }
 }

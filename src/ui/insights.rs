@@ -10,6 +10,40 @@ use crate::AppState;
 use super::theme;
 use super::cost_style;
 
+/// Trailing-N-months `(YYYY-MM, cost)` pairs ending at today, oldest first.
+/// Months absent from `monthly_costs` are filled with `0.0` so the chart
+/// range agrees with the heatmap (which shows a fixed trailing window) and
+/// the inline / popup `Monthly` views share the same denominator.
+fn trailing_n_months(
+    monthly_costs: &std::collections::BTreeMap<String, f64>,
+    n: usize,
+) -> Vec<(String, f64)> {
+    use chrono::Local;
+    trailing_n_months_at(monthly_costs, n, Local::now().date_naive())
+}
+
+fn trailing_n_months_at(
+    monthly_costs: &std::collections::BTreeMap<String, f64>,
+    n: usize,
+    now: chrono::NaiveDate,
+) -> Vec<(String, f64)> {
+    use chrono::Datelike;
+    let mut result: Vec<(String, f64)> = Vec::with_capacity(n);
+    for i in (0..n).rev() {
+        let total_months_back = i as i32;
+        let mut year = now.year();
+        let mut month = now.month() as i32 - total_months_back;
+        while month <= 0 {
+            month += 12;
+            year -= 1;
+        }
+        let key = format!("{year}-{month:02}");
+        let cost = monthly_costs.get(&key).copied().unwrap_or(0.0);
+        result.push((key, cost));
+    }
+    result
+}
+
 pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState) {
     use chrono::{Datelike, Local, Timelike, Weekday};
 
@@ -126,7 +160,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         (
             // Match the cache / success neighbours and the popup body — all
             // three rate metrics print with one decimal so the row reads as
-            // a uniform set instead of `100.0% / 94.7% / 93%`.
+            // a uniform set rather than mixing `:.0` and `:.1` precisions.
             format!("{completion_rate:.1}%"),
             "summary",
             if completion_rate >= 80.0 {
@@ -493,7 +527,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
                 Span::styled(" ●", Style::default().fg(theme::SUCCESS)),
                 Span::styled("Today", Style::default().fg(theme::SUCCESS)),
                 Span::styled("  ○", Style::default().fg(theme::TEXT_BRIGHT)),
-                Span::styled("Avg", Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled("full-day avg", Style::default().fg(theme::TEXT_BRIGHT)),
                 Span::styled(
                     format!("  │ {}", crate::format_number(today_total)),
                     Style::default()
@@ -534,25 +568,31 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
 
     // Monthly trend (compact)
     let monthly_costs = super::aggregate_monthly_costs(&state.daily_costs);
-    // Avg is over ALL months so this panel and the detail popup show the same
-    // delta for the same row regardless of how many months the visible window
-    // holds.
-    let avg_monthly_all: f64 = if monthly_costs.is_empty() {
+    // Trailing 12 months including zero-cost months so the range mirrors the
+    // dashboard heatmap's trailing-year window. Avg divides by 12 (the
+    // window size, not just months that happen to have data).
+    let trailing_window = trailing_n_months(&monthly_costs, 12);
+    let avg_monthly_all: f64 = if trailing_window.is_empty() {
         0.0
     } else {
-        monthly_costs.values().sum::<f64>() / monthly_costs.len() as f64
+        trailing_window.iter().map(|(_, c)| *c).sum::<f64>() / trailing_window.len() as f64
     };
     let col_width = 7usize;
     let max_months = ((bottom_chunks[1].width.saturating_sub(3)) as usize / col_width).max(1);
-    let months: Vec<_> = monthly_costs
+    // Show the most recent `max_months` of the trailing window so a narrow
+    // panel keeps the right edge anchored at "this month".
+    let months: Vec<(String, f64)> = trailing_window
         .iter()
         .rev()
         .take(max_months)
+        .cloned()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
-    let max_monthly = months
+    let months_view: Vec<(&String, &f64)> =
+        months.iter().map(|(k, v)| (k, v)).collect();
+    let max_monthly = months_view
         .iter()
         .map(|(_, c)| **c)
         .fold(0.0f64, f64::max)
@@ -568,7 +608,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     // anything under 1/8 of the tallest month).
     for row in (0..bar_height).rev() {
         let mut row_spans: Vec<Span> = vec![Span::raw(" ")];
-        for (_, cost) in &months {
+        for (_, cost) in &months_view {
             let ratio = **cost / max_monthly;
             let intensity = (ratio * 0.7 + 0.3).min(1.0);
             let color = theme::primary_with_intensity(intensity);
@@ -601,7 +641,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     let mut label_spans: Vec<Span> = vec![Span::raw(" ")];
     let mut cost_spans: Vec<Span> = vec![Span::raw(" ")];
     let mut diff_spans: Vec<Span> = vec![Span::raw(" ")];
-    for (month, cost) in &months {
+    for (month, cost) in &months_view {
         // `month` is "YYYY-MM"; show as "YY-MM" (ISO 8601 separator) so year
         // transitions (e.g. 25-12 → 26-01) are unambiguous and the format
         // matches the project's date-style rule (no locale-dependent `/`).
@@ -661,13 +701,23 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         if let Some(current_cost) = monthly_costs.get(&current_month_key) {
             if days_elapsed > 0.0 {
                 let forecast = current_cost / days_elapsed * days_in_month;
-                vec![
+                let mut spans = vec![
                     Span::styled("this mo: ", Style::default().fg(theme::DIM)),
                     Span::styled(
-                        format!("${:.0} est", forecast.max(0.0)),
+                        format!("${:.0}", current_cost.max(0.0)),
                         Style::default().fg(theme::PRIMARY),
                     ),
-                ]
+                ];
+                // Projection only adds information when more than one day
+                // remains; at month-end forecast collapses to current_cost.
+                if days_elapsed < days_in_month {
+                    spans.push(Span::styled("  ·  proj ", Style::default().fg(theme::DIM)));
+                    spans.push(Span::styled(
+                        format!("${:.0}", forecast.max(0.0)),
+                        Style::default().fg(theme::WARM),
+                    ));
+                }
+                spans
             } else {
                 vec![]
             }
@@ -764,7 +814,11 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         ]));
     }
 
-    let avg_daily_tokens = total_weekly / 7;
+    // Use `total_tokens / calendar_days` so this footer agrees with the
+    // Insights metrics `tokens/day`. Summing seven integer-divided per-weekday
+    // averages drifts because each weekday occurrence count is an int and
+    // the per-weekday quotient floors away that fractional remainder.
+    let avg_daily_tokens = state.stats.total_tokens.work_tokens() / calendar_days as u64;
     let weekly_block = Paragraph::new(weekly_lines).centered().block(
         Block::default()
             .borders(Borders::ALL)
@@ -809,7 +863,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
 
 
 pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let popup_width = 75.min(area.width.saturating_sub(4));
+    let popup_width = 80.min(area.width.saturating_sub(4));
     let popup_height = area.height.saturating_sub(4).min(40);
 
     let popup_area = Rect {
@@ -953,10 +1007,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             ]));
             lines.push(sep.clone());
 
-            // Models (blue gradient, matching dashboard detail)
+            // Models (blue gradient, matching dashboard detail). Percent
+            // labelled `$%` so it doesn't get confused with the Dashboard
+            // Models panel's token-share `tok%` column.
             if !state.model_costs.is_empty() {
                 let name_w = 12;
-                let bar_max = w.saturating_sub(name_w + 18);
+                let bar_max = w.saturating_sub(name_w + 20);
                 let total_cost: f64 = state.model_costs.iter().map(|(_, c)| *c).sum();
                 let max_cost = state.model_costs.iter().map(|(_, c)| *c).fold(0.0f64, f64::max).max(0.01);
                 for (model, cost) in state.model_costs.iter().take(5) {
@@ -975,7 +1031,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         Span::styled("█".repeat(filled.min(bar_max)), Style::default().fg(bar_color)),
                         Span::styled("░".repeat(bar_max.saturating_sub(filled)), Style::default().fg(theme::SEPARATOR)),
                         Span::styled(format!(" {:>6}", super::format_cost(*cost, 0)), Style::default().fg(theme::WARM)),
-                        Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                        Span::styled(format!(" {pct:>2}% $"), Style::default().fg(theme::DIM)),
                     ]));
                 }
                 lines.push(sep.clone());
@@ -989,7 +1045,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 projects.sort_by_key(|p| std::cmp::Reverse(p.1.work_tokens));
                 let max_tokens = projects.first().map_or(1, |(_, s)| s.work_tokens);
                 for (name, ps) in projects.iter().take(5) {
-                    let short = super::shorten_project(name);
+                    let short = state.project_label(name);
                     let display: String = short.chars().take(name_w).collect();
                     let ratio = ps.work_tokens as f64 / max_tokens as f64;
                     let filled = (ratio * bar_max as f64).round() as usize;
@@ -1042,9 +1098,8 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 // Bar widths normalize against the per-category top entry, so
                 // the `%` column has to use the **same** denominator (category
                 // total). Sharing a grand-total denominator across categories
-                // produced misleading rows like an MCP tool with a full bar
-                // and `0%` because 545 / 77 000 rounds down — see CLAUDE.md
-                // "Tool category order" / lint #__ rationale.
+                // would let the bar render full while the `%` rounds to zero
+                // for categories that are small relative to the dominant one.
                 let builtin_total: usize = builtin.iter().map(|(_, c)| **c).sum();
                 let mcp_total: usize = mcp.iter().map(|(_, c)| **c).sum();
                 let skill_total: usize = skill.iter().map(|(_, c)| **c).sum();
@@ -1102,8 +1157,8 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
 
                 let has_meta = !skill.is_empty() || !agent.is_empty() || !mcp.is_empty();
                 // Header makes the segmentation explicit so the % column is
-                // readable: a 63% skill row and a 28% builtin row both refer to
-                // *their own* category total, not the grand total.
+                // readable: each row's percentage is against its own category
+                // total, not against the grand total across categories.
                 lines.push(Line::from(vec![Span::styled(
                     " Top tools (% per category)",
                     Style::default().fg(theme::DIM),
@@ -1337,14 +1392,14 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 }
             }
 
-            let mut today_total = 0u64;
-            let mut avg_total = 0u64;
-            for hour in 0..=current_hour {
-                today_total += today_hourly.get(&hour).copied().unwrap_or(0);
-                avg_total += hourly_avg.get(&hour).copied().unwrap_or(0);
-            }
-
+            // Match the inline panel: today_total = today's running cumulative
+            // (zero past current_hour), avg_total = full-day average. This
+            // keeps popup `today/avg` percentage in step with the inline
+            // footer instead of inventing a same-hour avg that ends up
+            // labelled "avg" twice (once in the chart, once in the caption).
+            let today_total: u64 = today_hourly.values().sum();
             let full_day_avg: u64 = hourly_avg.values().sum();
+            let avg_total = full_day_avg;
             let today_cost = state
                 .daily_costs
                 .iter()
@@ -1465,22 +1520,19 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             lines.push(Line::from(vec![
                 Span::styled(" ●", Style::default().fg(theme::SUCCESS)),
                 Span::styled(
-                    format!("{} ", crate::format_number(today_total)),
+                    format!("{} today  ", crate::format_number(today_total)),
                     Style::default().fg(theme::SUCCESS).bold(),
                 ),
-                Span::styled(" ○", Style::default().fg(theme::TEXT_BRIGHT)),
+                Span::styled("○", Style::default().fg(theme::TEXT_BRIGHT)),
                 Span::styled(
-                    format!("{} ", crate::format_number(avg_total)),
+                    format!("{} full-day avg ", crate::format_number(avg_total)),
                     Style::default().fg(theme::TEXT_BRIGHT),
                 ),
-                Span::styled(format!("{diff_pct}%"), Style::default().fg(diff_color)),
+                Span::styled(format!("({diff_pct}%)"), Style::default().fg(diff_color)),
+                Span::styled("  ", Style::default()),
                 Span::styled(
-                    format!(
-                        "  avg: {}/day ${:.2}",
-                        crate::format_number(full_day_avg),
-                        today_cost.max(0.0)
-                    ),
-                    Style::default().fg(theme::DIM),
+                    format!("${:.2}", today_cost.max(0.0)),
+                    cost_style(today_cost),
                 ),
             ]));
         }
@@ -1552,7 +1604,8 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             }
 
             lines.push(Line::from(""));
-            let avg_daily_tokens = total_weekly / 7;
+            let avg_daily_tokens =
+                state.stats.total_tokens.work_tokens() / calendar_days as u64;
             if max_avg > 0 {
                 let max_label = weekdays
                     .iter()
@@ -1582,10 +1635,29 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             // path's accounting upstream.
             let monthly_tokens = super::aggregate_monthly_tokens(&state.daily_groups);
 
-            let col_width = 8usize;
-            let visible_months = (inner_width.saturating_sub(2) / col_width).max(1);
-            let all_months: Vec<_> = monthly_costs.iter().rev().collect();
+            // Trailing window covers max(data months, 12) so the popup keeps
+            // the inline panel's 12-month minimum (with zero months filled
+            // when data is sparse) and still surfaces older history when the
+            // user has more than 12 months of data.
+            let window_size = monthly_costs.len().max(12);
+            let trailing_window = trailing_n_months(&monthly_costs, window_size);
+            let all_months: Vec<(&String, &f64)> =
+                trailing_window.iter().rev().map(|(k, v)| (k, v)).collect();
             let total_months = all_months.len();
+            // Stretch the column width when there are few enough months to fit
+            // the whole history without scrolling. Default 8 leaves a ragged
+            // gap on the right when total fits in the popup; this picks the
+            // largest column width (capped at 10) that lets every month show.
+            let avail = inner_width.saturating_sub(2);
+            // Pick the widest column that still fits every month — falls back
+            // to the default 8 only when the popup is too narrow to fit them
+            // all. Floor of 6 keeps the labels (`YY-MM`) readable.
+            let col_width = if total_months > 0 {
+                (avail / total_months.max(1)).clamp(6, 10)
+            } else {
+                8
+            };
+            let visible_months = (avail / col_width).max(1);
             let max_scroll = total_months.saturating_sub(visible_months);
             if state.insights_detail_scroll > max_scroll {
                 state.insights_detail_scroll = max_scroll;
@@ -1599,12 +1671,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 .skip(skip)
                 .take(visible_months)
                 .collect();
-            // Avg uses ALL months (not just the visible window) so the inline
-            // panel and this popup show the same delta for the same row.
-            let avg_monthly = if monthly_costs.is_empty() {
+            // Avg over the same trailing window as the inline panel (12 mo
+            // minimum, including zero-cost months) so the row delta agrees.
+            let avg_monthly = if total_months == 0 {
                 0.0
             } else {
-                monthly_costs.values().sum::<f64>() / monthly_costs.len() as f64
+                trailing_window.iter().map(|(_, c)| *c).sum::<f64>() / total_months as f64
             };
             let max_monthly = months
                 .iter()
@@ -1726,9 +1798,19 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         summary_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
                         summary_spans.push(Span::styled("this mo: ", Style::default().fg(theme::DIM)));
                         summary_spans.push(Span::styled(
-                            format!("${:.0} est", forecast.max(0.0)),
+                            format!("${:.0}", current_cost.max(0.0)),
                             Style::default().fg(theme::PRIMARY),
                         ));
+                        if days_elapsed < days_in_month {
+                            summary_spans.push(Span::styled(
+                                "  ·  proj ",
+                                Style::default().fg(theme::DIM),
+                            ));
+                            summary_spans.push(Span::styled(
+                                format!("${:.0}", forecast.max(0.0)),
+                                Style::default().fg(theme::WARM),
+                            ));
+                        }
                     }
             }
             summary_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
@@ -1786,4 +1868,46 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
         );
 
     frame.render_widget(popup, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trailing_n_months_at;
+    use chrono::NaiveDate;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn trailing_window_crosses_year_boundary() {
+        let costs: BTreeMap<String, f64> = [
+            ("2025-12".to_string(), 100.0),
+            ("2026-01".to_string(), 200.0),
+        ]
+        .into_iter()
+        .collect();
+        let now = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let window = trailing_n_months_at(&costs, 12, now);
+
+        assert_eq!(window.len(), 12);
+        assert_eq!(window.first().unwrap().0, "2025-02");
+        assert_eq!(window.last().unwrap().0, "2026-01");
+        let dec_2025 = window.iter().find(|(k, _)| k == "2025-12").unwrap();
+        assert_eq!(dec_2025.1, 100.0);
+        let jan_2026 = window.iter().find(|(k, _)| k == "2026-01").unwrap();
+        assert_eq!(jan_2026.1, 200.0);
+    }
+
+    #[test]
+    fn trailing_window_fills_zero_for_missing_months() {
+        let costs: BTreeMap<String, f64> =
+            [("2026-03".to_string(), 50.0)].into_iter().collect();
+        let now = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let window = trailing_n_months_at(&costs, 12, now);
+
+        assert_eq!(window.len(), 12);
+        let zeros = window.iter().filter(|(_, c)| *c == 0.0).count();
+        assert_eq!(zeros, 11);
+        let with_data = window.iter().find(|(_, c)| *c > 0.0).unwrap();
+        assert_eq!(with_data.0, "2026-03");
+        assert_eq!(with_data.1, 50.0);
+    }
 }

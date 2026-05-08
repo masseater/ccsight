@@ -48,10 +48,13 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
             .enumerate()
         {
             if session.project_name.to_lowercase().contains(&query_lower) {
+                // The project column is already on line 1, so a snippet that
+                // re-prints the project name would just duplicate it. Set
+                // None and let the renderer collapse the row to a single line.
                 results.push(SearchResult {
                     day_idx,
                     session_idx,
-                    snippet: Some(session.project_name.clone()),
+                    snippet: None,
                     match_type: SearchMatchType::ProjectName,
                     session_path: None,
                 });
@@ -73,10 +76,12 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
 
             if let Some(ref branch) = session.git_branch
                 && branch.to_lowercase().contains(&query_lower) {
+                    // Branch column is already on line 1; same rationale as
+                    // ProjectName above.
                     results.push(SearchResult {
                         day_idx,
                         session_idx,
-                        snippet: Some(branch.clone()),
+                        snippet: None,
                         match_type: SearchMatchType::GitBranch,
                         session_path: None,
                     });

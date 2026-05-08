@@ -55,12 +55,13 @@ pub(crate) fn aggregate_weekday_avg(
         Weekday::Sat,
         Weekday::Sun,
     ];
+    // Include subagent sessions to match the Costs panel and Insights
+    // `tokens/day` accounting, so all `K/day` values agree.
     let mut work: HashMap<Weekday, u64> = HashMap::new();
     for group in daily_groups {
         let tokens: u64 = group
             .sessions
             .iter()
-            .filter(|s| !s.is_subagent)
             .map(SessionInfo::work_tokens)
             .sum();
         *work.entry(group.date.weekday()).or_insert(0) += tokens;

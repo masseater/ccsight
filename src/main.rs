@@ -248,6 +248,11 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         if let Some(ref reload_rx) = state.data_reload_task
             && let Ok(result) = reload_rx.try_recv() {
                 state.data_reload_task = None;
+                // Reset the throttle timestamp regardless of outcome so a
+                // transient load failure (filesystem hiccup, partial JSONL)
+                // doesn't immediately re-spawn the loader on the next tick
+                // and turn into a thread storm.
+                state.last_data_update = Some(std::time::Instant::now());
                 if let Ok(data) = result {
                     state.apply_loaded_data(data);
 
@@ -391,11 +396,22 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                 state.summary_task = None;
             }
 
-        if let Some(ref index_rx) = state.index_build_task
-            && let Ok(index) = index_rx.try_recv() {
-                state.search_index = Some(index);
-                state.index_build_task = None;
+        if let Some(ref index_rx) = state.index_build_task {
+            match index_rx.try_recv() {
+                Ok(index) => {
+                    state.search_index = Some(index);
+                    state.index_build_task = None;
+                    state.last_index_build = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Builder failed without sending; clear the flag so the
+                    // top-bar indicator doesn't lie.
+                    state.index_build_task = None;
+                    state.last_index_build = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
 
         if let Some((ref rx, ref query)) = state.search_task
             && let Ok(content_results) = rx.try_recv() {
@@ -503,22 +519,10 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 let text =
                                     extract_selected_text_from_buffer(sel, buf, conv_area, wrap_flags, conv_scroll);
                                 if !text.is_empty() {
-                                    match arboard::Clipboard::new() {
-                                        Ok(mut clipboard) => {
-                                            if clipboard.set_text(&text).is_ok() {
-                                                let len = text.chars().count();
-                                                state.toast_message =
-                                                    Some(format!("Copied ({len} chars)"));
-                                                state.toast_time =
-                                                    Some(std::time::Instant::now());
-                                            }
-                                        }
-                                        Err(_) => {
-                                            state.toast_message =
-                                                Some("Clipboard unavailable".to_string());
-                                            state.toast_time = Some(std::time::Instant::now());
-                                        }
-                                    }
+                                    let len = text.chars().count();
+                                    state.toast_message = Some(format!("Copied ({len} chars)"));
+                                    state.toast_time = Some(std::time::Instant::now());
+                                    handlers::tasks::spawn_clipboard_write(text);
                                 }
                             }
                         } else {
@@ -559,6 +563,17 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             pane.search_input.insert_char(c);
                         }
                         ui::update_pane_search_matches(pane);
+                        pane.search_current = 0;
+                        if let Some(&first) = pane.search_matches.first() {
+                            pane.scroll = first;
+                            if let Some(msg_idx) = pane
+                                .message_lines
+                                .iter()
+                                .rposition(|&(start, _)| start <= first)
+                            {
+                                pane.selected_message = msg_idx;
+                            }
+                        }
                     }
                 }
                 Event::Key(key)
@@ -776,11 +791,9 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     let cost: f64 = model_costs.iter().map(|(_, c)| c).sum();
 
     // Daily costs include subagent contributions so the per-day breakdown sums
-    // back to `total_cost` (Overview). Earlier this filtered `!is_subagent`
-    // which created a $264 (~2%) gap between Overview and the Costs panel
-    // total — confusing for users since both totals are labelled the same.
-    // Subagent dispatch is a real spend on Anthropic's bill and should be
-    // visible alongside the day it ran on.
+    // back to `total_cost` (Overview). Filtering `!is_subagent` here would
+    // make the two totals disagree even though they share the same label.
+    // Subagent dispatch is a real spend and belongs on the day it ran.
     let daily_costs: Vec<(NaiveDate, f64)> = daily_groups
         .iter()
         .map(|group| {
@@ -914,7 +927,25 @@ fn start_content_search(state: &mut AppState) {
 fn start_index_build(state: &mut AppState) {
     use std::sync::Arc;
 
-    let groups: Vec<DailyGroup> = state.daily_groups.clone();
+    // Skip when a build is already in flight: overwriting the receiver
+    // orphans the prior thread (its `tx.send` will fail silently after
+    // committing) and leaves a `Vec<DailyGroup>` clone alive in RAM until
+    // it finishes. The data reload path can fire this while the initial
+    // build is still running.
+    if state.index_build_task.is_some() {
+        return;
+    }
+
+    // Throttle to one rebuild per minute. Initial launch (last = None)
+    // always builds; subsequent reload-driven rebuilds wait at least 60 s
+    // so an actively-growing session JSONL doesn't keep the indicator lit.
+    if let Some(last) = state.last_index_build
+        && last.elapsed() < std::time::Duration::from_secs(60) {
+            return;
+        }
+
+    // Index unfiltered groups so the manifest covers every session.
+    let groups: Vec<DailyGroup> = state.original_daily_groups.clone();
     let (tx, rx) = mpsc::channel();
     state.index_build_task = Some(rx);
 

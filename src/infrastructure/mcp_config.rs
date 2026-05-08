@@ -320,6 +320,7 @@ mod tests {
                 day_extension_usage: HashMap::new(),
                 summary: None,
                 custom_title: None,
+                ai_title: None,
                 model: None,
                 is_subagent: false,
                 is_continued: false,

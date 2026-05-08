@@ -30,9 +30,15 @@ pub mod theme {
     pub const SUCCESS: Color = Color::Rgb(130, 166, 110);
     // Amber gold
     pub const WARNING: Color = Color::Rgb(210, 160, 70);
-    // Terracotta red
-    pub const ERROR: Color = Color::Rgb(195, 90, 80);
-    pub const DANGER: Color = Color::Rgb(180, 70, 70);
+    // Terracotta red — moderate band; DANGER deepens just enough to read
+    // as a distinct tier without going so dark it's hard to scan.
+    pub const ERROR: Color = Color::Rgb(220, 110, 90);
+    pub const DANGER: Color = Color::Rgb(180, 65, 70);
+    // Bright pink-magenta — reserved for cost tiers above DANGER so
+    // heavy-usage days stay visually distinct from merely-bad ones. The
+    // earlier deep variant (~150,60,110) blended into the background on
+    // dark themes; this lighter mix lifts above the surrounding rows.
+    pub const CRITICAL: Color = Color::Rgb(220, 120, 175);
     // Teal accent (complement)
     pub const ACCENT: Color = Color::Rgb(86, 165, 180);
 
@@ -138,6 +144,35 @@ pub fn truncate_to_display_width(s: &str, max_width: usize) -> String {
     result
 }
 
+/// Truncate so the result fits within `max_width` columns, appending `…`
+/// when truncation occurred. Returns the original string when it already
+/// fits. `max_width` < 1 produces an empty string.
+pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut width = 0;
+    let mut result = String::new();
+    for ch in s.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_w > max_width.saturating_sub(1) {
+            break;
+        }
+        result.push(ch);
+        width += ch_w;
+    }
+    result.push('…');
+    result
+}
+
+/// Strip a project path down to its basename. Reserved for AI prompt
+/// generation (`summary.rs`) and for the `state.project_label` fallback —
+/// render paths must call `state.project_label(name)` instead so two
+/// projects that share a basename stay distinguishable. Lint #24 enforces.
 pub(crate) fn shorten_project(name: &str) -> &str {
     std::path::Path::new(name)
         .file_name()
@@ -145,15 +180,22 @@ pub(crate) fn shorten_project(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+
 pub(crate) use crate::aggregator::{
     aggregate_monthly_costs, aggregate_monthly_tokens, aggregate_weekday_avg,
 };
 
 pub fn cost_style(cost: f64) -> Style {
+    // Five-tier scale tuned for daily spend on Anthropic API. Wider bands
+    // than the original three-cutoff scheme so heavy-usage days don't all
+    // collapse into the same color; the top tier surfaces unusually large
+    // days at a glance without further inspection.
     let c = cost.max(0.0);
-    let color = if c > 100.0 {
+    let color = if c > 300.0 {
+        theme::CRITICAL
+    } else if c > 100.0 {
         theme::DANGER
-    } else if c > 50.0 {
+    } else if c > 60.0 {
         theme::ERROR
     } else if c > 20.0 {
         theme::WARNING
@@ -554,10 +596,17 @@ fn compute_search_matches(
 }
 
 pub fn update_pane_search_matches(pane: &mut ConversationPane) {
+    // Recomputes matches against the current rendered lines. Called both on
+    // text change (where resetting position to the first match is desired)
+    // and on bare rerender (where the user's navigation position must be
+    // preserved). The caller is expected to set `search_current = 0` and
+    // `scroll = matches[0]` itself when it knows the query just changed; we
+    // only clamp position to keep it inside the new bounds.
     pane.search_matches = compute_search_matches(&pane.rendered, &pane.search_input.text);
-    pane.search_current = 0;
-    if let Some(&first_match) = pane.search_matches.first() {
-        pane.scroll = first_match;
+    if pane.search_matches.is_empty() {
+        pane.search_current = 0;
+    } else if pane.search_current >= pane.search_matches.len() {
+        pane.search_current = pane.search_matches.len() - 1;
     }
 }
 
@@ -579,7 +628,9 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     ])
     .split(area);
 
-    draw_header(frame, chunks[0], state);
+    if !state.loading {
+        draw_header(frame, chunks[0], state);
+    }
 
     if show_warning {
         draw_retention_warning(frame, chunks[1], state);
@@ -597,8 +648,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         let dim = theme::DIM;
         let faint = theme::FAINT;
 
-        // Logo with creative animation (Claude logo - aligned)
-        let logo_lines = [" ▐▛███▜▌", "▝▜█████▛▘", " ▘▘ ▝▝"];
+        // Logo with creative animation. Lines are padded to a common width so
+        // `Paragraph::centered()` lines them up at the same column even though
+        // the cloud silhouette is asymmetric.
+        let logo_lines = [" ▐▛███▜▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  "];
 
         // Random fragment characters for the chaos phase
         let fragment_chars = ['░', '▒', '▓', '█', '▄', '▀', '▌', '▐', '▖', '▗', '▘', '▝'];
@@ -820,60 +873,34 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             })
             .collect();
 
+        // No leading-space prefixes: `Paragraph::centered()` aligns each line
+        // to the same horizontal centre. Mixing prefix widths (4 / 6 / 8)
+        // shifted the visible content of each line by different amounts, so
+        // logo / title / decoration / bar / message ended up on slightly
+        // different vertical lines.
         let loading_text = vec![
             Line::from(""),
             Line::from(make_starfield(0)),
             Line::from(""),
             Line::from(""),
-            Line::from(
-                vec![Span::raw("        ")]
-                    .into_iter()
-                    .chain(logo1_spans)
-                    .collect::<Vec<_>>(),
-            ),
-            Line::from(
-                vec![Span::raw("        ")]
-                    .into_iter()
-                    .chain(logo2_spans)
-                    .collect::<Vec<_>>(),
-            ),
-            Line::from(
-                vec![Span::raw("        ")]
-                    .into_iter()
-                    .chain(logo3_spans)
-                    .collect::<Vec<_>>(),
-            ),
+            Line::from(logo1_spans),
+            Line::from(logo2_spans),
+            Line::from(logo3_spans),
             Line::from(""),
-            Line::from(
-                vec![Span::raw("        ")]
-                    .into_iter()
-                    .chain(title_spans)
-                    .collect::<Vec<_>>(),
-            ),
+            Line::from(title_spans),
             Line::from(""),
-            Line::from(Span::styled(
-                format!("    {deco_line}"),
-                Style::default().fg(faint),
-            )),
+            Line::from(Span::styled(deco_line, Style::default().fg(faint))),
             Line::from(""),
-            Line::from(
-                vec![Span::raw("      ")]
-                    .into_iter()
-                    .chain(bar)
-                    .collect::<Vec<_>>(),
-            ),
+            Line::from(bar),
             Line::from(""),
             Line::from(vec![
-                Span::styled(format!("        {msg}..."), Style::default().fg(dim)),
+                Span::styled(format!("{msg}..."), Style::default().fg(dim)),
                 Span::styled(cursor, Style::default().fg(primary)),
             ]),
             Line::from(""),
             Line::from(make_starfield(17)),
             Line::from(""),
-            Line::from(Span::styled(
-                "        press q to quit",
-                Style::default().fg(faint),
-            )),
+            Line::from(Span::styled("press q to quit", Style::default().fg(faint))),
         ];
         let loading = Paragraph::new(loading_text)
             .block(Block::default().borders(Borders::NONE))
@@ -999,6 +1026,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     sessions,
                     &state.original_daily_groups,
                     &state.pins,
+                    &state.project_labels,
                 );
                 if is_active {
                     state.conversation_content_area = ca;
@@ -1021,8 +1049,8 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             Span::styled(":summary ", Style::default().fg(theme::DIM)),
             Span::styled("y", Style::default().fg(theme::PRIMARY)),
             Span::styled(":copy ", Style::default().fg(theme::DIM)),
-            Span::styled("H", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":list", Style::default().fg(theme::DIM)),
+            Span::styled("H/L", Style::default().fg(theme::PRIMARY)),
+            Span::styled(":day", Style::default().fg(theme::DIM)),
         ];
         let help_line = Paragraph::new(Line::from(help_spans));
         frame.render_widget(help_line, help_area);
@@ -1047,6 +1075,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     " Space:pin  s:summary  r:regen  ↑↓:scroll  i/Esc:close ",
                     pinned,
                     state.session_detail_scroll,
+                    &state.project_labels,
                 );
                 state.active_popup_area = Some(pa);
             }
@@ -1149,9 +1178,11 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
 
     if let Some(ref cache) = state.cache_stats
         && cache.cached_files > 0 {
+            // `files`, not `sessions`: one JSONL can span multiple days,
+            // so the file count is smaller than the session-day count.
             spans.push(Span::styled(
                 format!(
-                    "  ·  cache {}/{}",
+                    "  ·  cache {}/{} files",
                     cache.cached_files,
                     cache.cached_files + cache.parsed_files
                 ),
@@ -1160,7 +1191,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         }
 
     if state.index_build_task.is_some() {
-        spans.push(Span::styled("  ·  indexing...", Style::default().fg(theme::DIM)));
+        spans.push(Span::styled("  ·  building search index...", Style::default().fg(theme::DIM)));
     }
 
     let title = Paragraph::new(Line::from(spans));
@@ -1205,24 +1236,24 @@ fn draw_retention_warning(frame: &mut Frame, area: Rect, state: &AppState) {
 fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let dim = theme::DIM;
 
-    let today = chrono::Local::now().date_naive();
-    let today_sessions = state
+    // The Daily/Insights tab labels show the count for the most recent day in
+    // the current view. When no filter is applied this is today; under a date
+    // filter it falls back to the latest day in the filtered range so the
+    // label reflects what the user is actually browsing rather than a literal
+    // "today" that may sit outside the filter.
+    let latest_group = state
         .daily_groups
         .iter()
-        .find(|g| g.date == today)
-        .map_or(0, |g| g.user_sessions().count());
-    let today_tokens: u64 = state
-        .daily_groups
-        .iter()
-        .find(|g| g.date == today)
-        .map_or(0, |g| {
-            g.sessions
-                .iter()
-                .filter(|s| !s.is_subagent)
-                .flat_map(|s| s.day_tokens_by_model.values())
-                .map(super::aggregator::stats::TokenStats::work_tokens)
-                .sum()
-        });
+        .max_by_key(|g| g.date);
+    let today_sessions = latest_group.map_or(0, |g| g.user_sessions().count());
+    let today_tokens: u64 = latest_group.map_or(0, |g| {
+        g.sessions
+            .iter()
+            .filter(|s| !s.is_subagent)
+            .flat_map(|s| s.day_tokens_by_model.values())
+            .map(super::aggregator::stats::TokenStats::work_tokens)
+            .sum()
+    });
 
     let tabs_data = [
         (Tab::Dashboard, "1", "Dashboard".to_string()),
@@ -1289,7 +1320,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let filter_width = unicode_width::UnicodeWidthStr::width(filter_label.as_str()) as u16;
 
     let project_label = if let Some(ref project) = state.project_filter {
-        let short = project.rsplit('/').next().unwrap_or(project);
+        let short = state.project_label(project);
         format!(" {short} ")
     } else {
         " p:Project ".to_string()
@@ -1458,7 +1489,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
         for (tool, count) in &s.day_tool_usage {
             *tool_counts.entry(tool.clone()).or_insert(0) += count;
         }
-        let proj = shorten_project(&s.project_name).to_string();
+        let proj = state.project_label(&s.project_name);
         *project_tokens.entry(proj).or_insert(0) += session_total;
     }
 
@@ -1660,7 +1691,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 let bar_len = (*pct / 100.0 * 3.0).round() as usize;
                 let bar = "█".repeat(bar_len);
                 let max_name = col_width.saturating_sub(bar_len + info.len() + 3);
-                let short: String = name.chars().take(max_name).collect();
+                let short = truncate_with_ellipsis(name, max_name);
                 Line::from(vec![
                     Span::styled(format!(" {bar}"), Style::default().fg(color)),
                     Span::styled(
@@ -1690,7 +1721,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 let bar_len = (*pct / 100.0 * 3.0).round() as usize;
                 let bar = "█".repeat(bar_len);
                 let max_name = col_width.saturating_sub(bar_len + info.len() + 3);
-                let short: String = name.chars().take(max_name).collect();
+                let short = truncate_with_ellipsis(name, max_name);
                 let color = tool_category_color(name);
                 Line::from(vec![
                     Span::styled(format!(" {bar}"), Style::default().fg(color)),
@@ -1725,9 +1756,9 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let max_lines = inner.height.saturating_sub(1) as usize;
 
         let proj_items: Vec<_> = sorted_projects.iter().map(|(name, tokens)| {
-            let short = shorten_project(name);
+            let short = state.project_label(name);
             let pct = if total_project_tokens > 0 { **tokens as f64 / total_project_tokens as f64 * 100.0 } else { 0.0 };
-            (short.to_string(), format!("{pct:.0}%"), pct)
+            (short, format!("{pct:.0}%"), pct)
         }).collect();
         let model_items: Vec<_> = sorted_models.iter().map(|(name, tokens)| {
             let short = crate::aggregator::normalize_model_name(name);
@@ -1815,11 +1846,15 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 "  "
             };
 
-            let project_short = shorten_project(&s.project_name);
+            let project_short = state.project_label(&s.project_name);
 
-            let summary_text = s.summary.as_ref().map(|sum| {
+            // Title precedence: ai_title > custom_title > summary.
+            let title_source = s.ai_title.as_deref()
+                .or(s.custom_title.as_deref())
+                .or(s.summary.as_deref());
+            let summary_text = title_source.map(|sum| {
                 let truncated = truncate_to_display_width(sum, max_summary_len);
-                if unicode_width::UnicodeWidthStr::width(sum.as_str()) > max_summary_len {
+                if unicode_width::UnicodeWidthStr::width(sum) > max_summary_len {
                     format!("{truncated}...")
                 } else {
                     truncated
@@ -1857,7 +1892,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             }
             line1_spans.push(Span::styled(format!("{time_str} "), time_style));
             line1_spans.push(Span::styled(
-                project_short.to_string(),
+                project_short.clone(),
                 Style::default().fg(theme::WARM),
             ));
             if let Some(ref branch) = branch_short {
@@ -2025,6 +2060,13 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
     let proj_max_len = area.width.saturating_sub(11) as usize;
     let summary_max_len = area.width.saturating_sub(6) as usize;
 
+    let project_labels = &state.project_labels;
+    let label_for = |name: &str| -> String {
+        project_labels
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| shorten_project(name).to_string())
+    };
     let (sessions_display, title) = match state.conv_list_mode {
         crate::ConvListMode::Pinned => {
         let pinned: Vec<SessionDisplay> = state
@@ -2039,11 +2081,12 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
                         .map(|s| SessionDisplay {
                             file_path: s.file_path.clone(),
                             time_or_date: g.date.format("%Y-%m-%d").to_string(),
-                            project_short: shorten_project(&s.project_name).to_string(),
+                            project_short: label_for(&s.project_name),
                             summary: s
-                                .summary
+                                .ai_title
                                 .as_deref()
                                 .or(s.custom_title.as_deref())
+                                .or(s.summary.as_deref())
                                 .map(ToString::to_string),
                             is_recent: false,
                             is_pinned: true,
@@ -2076,11 +2119,12 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
                     .map(move |s| SessionDisplay {
                         file_path: s.file_path.clone(),
                         time_or_date: g.date.format("%Y-%m-%d").to_string(),
-                        project_short: shorten_project(&s.project_name).to_string(),
+                        project_short: label_for(&s.project_name),
                         summary: s
-                            .summary
+                            .ai_title
                             .as_deref()
                             .or(s.custom_title.as_deref())
+                            .or(s.summary.as_deref())
                             .map(ToString::to_string),
                         is_recent: false,
                         is_pinned: pins_ref.is_pinned(&s.file_path),
@@ -2121,11 +2165,12 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
                         .with_timezone(&Local)
                         .format("%H:%M")
                         .to_string(),
-                    project_short: shorten_project(&s.project_name).to_string(),
+                    project_short: label_for(&s.project_name),
                     summary: s
-                        .summary
+                        .ai_title
                         .as_deref()
                         .or(s.custom_title.as_deref())
+                        .or(s.summary.as_deref())
                         .map(ToString::to_string),
                     is_recent,
                     is_pinned: state.pins.is_pinned(&s.file_path),
@@ -2282,6 +2327,7 @@ fn draw_conversation_pane(
     sessions: &[SessionInfo],
     all_groups: &[crate::aggregator::DailyGroup],
     pins_ref: &crate::pins::Pins,
+    project_labels: &std::collections::HashMap<String, String>,
 ) -> Option<Rect> {
     use ratatui::widgets::Clear;
 
@@ -2333,7 +2379,11 @@ fn draw_conversation_pane(
         let title = if let Some(s) = session {
             let available = area.width.saturating_sub(2) as usize;
             let pin = if pins_ref.is_pinned(&s.file_path) { "*" } else { "" };
-            let proj = shorten_project(&s.project_name);
+            let proj_owned = project_labels
+                .get(&s.project_name)
+                .cloned()
+                .unwrap_or_else(|| shorten_project(&s.project_name).to_string());
+            let proj = proj_owned.as_str();
             let branch = s.git_branch.as_ref().map(|b| {
                 let name = b.split('/').next_back().unwrap_or(b);
                 if name.chars().count() > 10 {
@@ -3198,6 +3248,7 @@ fn draw_session_detail(
     footer: &str,
     is_pinned: bool,
     scroll: usize,
+    project_labels: &std::collections::HashMap<String, String>,
 ) -> Rect {
     use ratatui::widgets::Clear;
 
@@ -3273,8 +3324,12 @@ fn draw_session_detail(
     if !marker.is_empty() {
         header.push(Span::styled(marker, Style::default().fg(theme::PRIMARY)));
     }
+    let project_label = project_labels
+        .get(&session.project_name)
+        .cloned()
+        .unwrap_or_else(|| shorten_project(&session.project_name).to_string());
     header.push(Span::styled(
-        shorten_project(&session.project_name),
+        project_label,
         Style::default().fg(theme::WARM).bold(),
     ));
     if let Some(ref branch) = session.git_branch {
@@ -3295,11 +3350,12 @@ fn draw_session_detail(
     lines.push(Line::from(""));
     lines.push(Line::from(header));
 
-    // Summary
+    // Title precedence: ai_title > custom_title > summary.
     let summary_text = session
-        .summary
+        .ai_title
         .as_deref()
         .or(session.custom_title.as_deref())
+        .or(session.summary.as_deref())
         .unwrap_or("—");
     lines.push(Line::from(vec![
         Span::raw("  "),
@@ -3383,36 +3439,49 @@ fn draw_session_detail(
     }
 
     // Tools
-    if !session.day_tool_usage.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Tools",
-            Style::default().fg(theme::PRIMARY).bold(),
-        )));
-        let mut tools: Vec<_> = session.day_tool_usage.iter().collect();
-        tools.sort_by(|a, b| b.1.cmp(a.1));
+    let mut tools: Vec<_> = session
+        .day_tool_usage
+        .iter()
+        .filter(|(name, count)| !name.is_empty() && **count > 0)
+        .collect();
+    tools.sort_by(|a, b| b.1.cmp(a.1));
+    if !tools.is_empty() {
         let tool_strs: Vec<String> = tools
             .iter()
             .take(8)
             .map(|(name, count)| format!("{name}({count})"))
             .collect();
         let inner_width = popup_width.saturating_sub(6) as usize;
+        // Build content lines first so an empty / all-whitespace render leaves
+        // no orphan "Tools" header behind. Skip leading whitespace-only flushes
+        // (an oversize first tool string would otherwise push "    " alone).
+        let mut content_lines: Vec<Line> = Vec::new();
         let mut current_line = String::from("    ");
         for (i, tool_str) in tool_strs.iter().enumerate() {
             let sep = if i > 0 { "  " } else { "" };
             if current_line.len() + sep.len() + tool_str.len() > inner_width {
-                lines.push(Line::from(Span::styled(
-                    current_line.clone(),
-                    label_style,
-                )));
+                if !current_line.trim().is_empty() {
+                    content_lines.push(Line::from(Span::styled(
+                        current_line.clone(),
+                        label_style,
+                    )));
+                }
                 current_line = format!("    {tool_str}");
             } else {
                 current_line = format!("{current_line}{sep}{tool_str}");
             }
         }
         if !current_line.trim().is_empty() {
-            lines.push(Line::from(Span::styled(current_line, label_style)));
+            content_lines.push(Line::from(Span::styled(current_line, label_style)));
         }
-        lines.push(Line::from(""));
+        if !content_lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  Tools",
+                Style::default().fg(theme::PRIMARY).bold(),
+            )));
+            lines.extend(content_lines);
+            lines.push(Line::from(""));
+        }
     }
 
     // Directory — wrap long paths so Cowork session paths and deeply-nested
@@ -3545,6 +3614,7 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         " Space:pin  s:summary  r:regen  ↑↓:scroll  i/Esc:close ",
         pinned,
         state.session_detail_scroll,
+        &state.project_labels,
     );
     state.active_popup_area = Some(popup_area);
 }
@@ -3768,7 +3838,7 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     let footer = if state.filter_input_mode {
         " YYYY · YYYY-MM · YYYY-MM-DD · YYYY-MM-DD..YYYY-MM-DD "
     } else {
-        " ↑↓  Enter  Esc "
+        " ↑↓: nav  Enter: apply  Esc: close "
     };
 
     let popup = Paragraph::new(lines).block(
@@ -3818,9 +3888,9 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
     }
     state.project_popup_scroll = scroll_val;
 
-    // Detect basename collisions so we can disambiguate (e.g. `~/dev/tmp` vs
-    // `~/.claude/projects/.../tmp` both showed as just "tmp" in the list).
-    // Colliding entries get the parent directory appended in dim brackets.
+    // Detect basename collisions so we can disambiguate two projects that
+    // share a final path segment. Colliding entries get the parent directory
+    // appended in dim brackets.
     let mut basename_counts: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
     for (name, _, _) in &state.project_list {
@@ -3851,8 +3921,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
             let marker = if is_current { "\u{25cf}" } else { " " };
             let basename = name.rsplit('/').next().unwrap_or(name.as_str());
             // When two projects share a basename, append the immediate parent
-            // directory in parentheses to disambiguate. The full project_name
-            // (e.g. `~/dev/tmp` or `~/.claude/projects/.../tmp`) provides it.
+            // directory in parentheses to disambiguate.
             let short_owned: String = if basename_counts.get(basename).copied().unwrap_or(0) > 1 {
                 let parent = name
                     .rsplit_once('/')
@@ -3905,7 +3974,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
         }
     }
 
-    let footer = " ↑↓  Enter  Esc ";
+    let footer = " ↑↓: nav  Enter: apply  Esc: close ";
 
     let popup = Paragraph::new(lines).block(
         Block::default()
@@ -3964,6 +4033,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  ←/→ h/l Tab   Switch section (Tools/Skills/Commands/Subagents)"),
         Line::from("  1-4           Jump to section"),
         Line::from("  ↑/↓ j/k       Scroll within section"),
+        Line::from("  PgUp/PgDn u/d Page scroll (10 lines)"),
+        Line::from("  Home/End g/G  Jump to top / bottom"),
         Line::from("  Enter         (Tools) Expand/collapse MCP server"),
         Line::from("  o / c         (Tools) Open all / close all MCP servers"),
         Line::from(""),
@@ -3990,6 +4061,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from("  /             Search in conversation"),
         Line::from("  n/N           Next / Previous search match"),
         Line::from("  g/G           Top / Bottom"),
+        Line::from("  C             Open another session in a new pane"),
+        Line::from("  H/L           Previous / next day (when not pane-focused)"),
         Line::from("  q/Esc         Close (or exit search)"),
         Line::from(""),
         Line::from(Span::styled(
@@ -4012,6 +4085,9 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         )),
         Line::from("  Tokens = input + output (excludes cache)"),
         Line::from("  Costs  = estimated from API pricing"),
+        Line::from("  rate/MTok   = static API pricing per million tokens"),
+        Line::from("  actual/MTok = total cost ÷ all tokens (input+output+cache)"),
+        Line::from("                — what was paid per million tokens once cache is counted."),
         Line::from("  Cache  = ~/.ccsight/cache.json"),
         Line::from("  Pins   = ~/.ccsight/pins.json"),
     ]);
@@ -4058,12 +4134,16 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     let inner = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(popup_area);
     state.search_results_area = Some(inner[1]);
 
-    let title = if state.searching {
-        " Search [Searching...] "
+    let title: String = if state.searching {
+        " Search [Searching...] ".to_string()
     } else if state.search_index.is_none() && state.index_build_task.is_some() {
-        " Search [Indexing...] "
+        " Search [Indexing...] ".to_string()
+    } else if state.search_input.text.is_empty() {
+        " Search (Esc: cancel, Enter: select) ".to_string()
     } else {
-        " Search (Esc: cancel, Enter: select) "
+        // Surface the hit count so the user can gauge how broad/narrow the
+        // current query is without mentally counting the rendered list.
+        format!(" Search · {} hits ", state.search_results.len())
     };
 
     let input_block = Block::default()
@@ -4105,6 +4185,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         };
 
         let inner_w = inner[1].width.saturating_sub(2) as usize;
+        let cost_calculator = crate::aggregator::CostCalculator::global();
         let items: Vec<ListItem> = state
             .search_results
             .iter()
@@ -4115,7 +4196,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                 let group = &state.daily_groups[result.day_idx];
                 let session = group.user_sessions().nth(result.session_idx).unwrap_or_else(|| &group.sessions[0]);
                 let date_str = group.date.format("%Y-%m-%d").to_string();
-                let project = shorten_project(&session.project_name);
+                let project = state.project_label(&session.project_name);
                 let branch = session.git_branch.as_ref()
                     .map(|b| format!("#{}", b.split('/').next_back().unwrap_or(b)))
                     .unwrap_or_default();
@@ -4129,11 +4210,31 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                     search::SearchMatchType::Content => "[msg]",
                 };
 
-                let summary = session.summary.as_deref()
+                // Title precedence: ai_title > custom_title > summary.
+                let summary = session.ai_title.as_deref()
                     .or(session.custom_title.as_deref())
+                    .or(session.summary.as_deref())
                     .unwrap_or("");
-                let snippet_text = result.snippet.as_deref().unwrap_or(summary);
-                let snippet = truncate_to_display_width(snippet_text, inner_w.saturating_sub(8));
+                // Suppress the line-2 preview when it would just repeat the
+                // summary already shown on line 1. For [sum] hits we also
+                // skip a from-start snippet (extract_snippet emits no leading
+                // ellipsis when the query matches at offset 0, so the snippet
+                // equals the summary's prefix character-for-character).
+                let snippet_text = match result.snippet.as_deref() {
+                    Some(s) => {
+                        let suppress_for_summary =
+                            matches!(result.match_type, search::SearchMatchType::Summary)
+                                && !s.starts_with('…')
+                                && !s.starts_with("...");
+                        if suppress_for_summary { "" } else { s }
+                    }
+                    None => "",
+                };
+                let snippet = if snippet_text.is_empty() {
+                    String::new()
+                } else {
+                    truncate_to_display_width(snippet_text, inner_w.saturating_sub(8))
+                };
 
                 let time_range = {
                     use chrono::Timelike;
@@ -4142,8 +4243,25 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                     format!("{:02}:{:02}-{:02}:{:02}", first.hour(), first.minute(), last.hour(), last.minute())
                 };
                 let tokens = crate::format_number(session.work_tokens());
-                let meta_len = date_str.len() + project.len() + branch.len() + time_range.len() + tokens.len() + match_indicator.len() + 8;
-                let summary_short = truncate_to_display_width(summary, inner_w.saturating_sub(meta_len));
+
+                let session_cost: f64 = session.day_tokens_by_model.iter()
+                    .map(|(m, t)| cost_calculator.calculate_cost(t, Some(m)).unwrap_or(0.0))
+                    .sum();
+                let cost_str = format_cost(session_cost, 0);
+
+                let model_short = session
+                    .model
+                    .as_deref()
+                    .map_or_else(|| "?".to_string(), crate::aggregator::normalize_model_name);
+                let model_clr = session
+                    .model
+                    .as_ref()
+                    .map_or(theme::LABEL_MUTED, |m| model_color(m));
+                let model_tag = format!("[{model_short}]");
+
+                let pinned = state.pins.is_pinned(&session.file_path);
+                let pin_glyph = if pinned { "*" } else { " " };
+                let pin_color = if pinned { theme::WARNING } else { theme::SEPARATOR };
 
                 let match_color = match result.match_type {
                     search::SearchMatchType::ProjectName => theme::SECONDARY,
@@ -4157,13 +4275,31 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                 let selected = i == state.search_selected;
                 let sel_style = Style::default().bg(theme::FAINT).fg(theme::TEXT_BRIGHT);
 
+                // Reserve the space the new spans need so summary truncation
+                // accounts for them. Layout (separators counted as 1 char):
+                //   `* date project#branch HH:MM-HH:MM TOK $C [Model] [tag] summary`
+                let meta_len = 2 // "* "
+                    + date_str.len() + 1
+                    + project.len()
+                    + branch.len() + 1
+                    + time_range.len() + 1
+                    + tokens.len() + 1
+                    + cost_str.len() + 1
+                    + model_tag.len() + 1
+                    + match_indicator.len() + 1;
+                let summary_short = truncate_to_display_width(summary, inner_w.saturating_sub(meta_len));
+
                 let line1 = Line::from(vec![
+                    Span::styled(
+                        format!("{pin_glyph} "),
+                        if selected { sel_style } else { Style::default().fg(pin_color) },
+                    ),
                     Span::styled(
                         format!("{date_str} "),
                         if selected { sel_style } else { Style::default().fg(theme::PRIMARY) },
                     ),
                     Span::styled(
-                        project.to_string(),
+                        project.clone(),
                         if selected { sel_style } else { Style::default().fg(theme::SECONDARY) },
                     ),
                     Span::styled(
@@ -4177,6 +4313,14 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                     Span::styled(
                         format!("{tokens} "),
                         if selected { sel_style } else { Style::default().fg(theme::WARM) },
+                    ),
+                    Span::styled(
+                        format!("{cost_str} "),
+                        if selected { sel_style } else { cost_style(session_cost) },
+                    ),
+                    Span::styled(
+                        format!("{model_tag} "),
+                        if selected { sel_style } else { Style::default().fg(model_clr) },
                     ),
                     Span::styled(
                         format!("{match_indicator} "),
@@ -4458,27 +4602,28 @@ mod tests {
     }
 
     #[test]
-    fn test_cost_style_high() {
-        let style = cost_style(150.0);
-        assert_eq!(style.fg, Some(theme::DANGER));
+    fn test_cost_style_critical() {
+        assert_eq!(cost_style(500.0).fg, Some(theme::CRITICAL));
     }
 
     #[test]
-    fn test_cost_style_medium_high() {
-        let style = cost_style(75.0);
-        assert_eq!(style.fg, Some(theme::ERROR));
+    fn test_cost_style_danger() {
+        assert_eq!(cost_style(200.0).fg, Some(theme::DANGER));
     }
 
     #[test]
-    fn test_cost_style_medium() {
-        let style = cost_style(30.0);
-        assert_eq!(style.fg, Some(theme::WARNING));
+    fn test_cost_style_error() {
+        assert_eq!(cost_style(80.0).fg, Some(theme::ERROR));
     }
 
     #[test]
-    fn test_cost_style_low() {
-        let style = cost_style(10.0);
-        assert_eq!(style.fg, Some(theme::SUCCESS));
+    fn test_cost_style_warning() {
+        assert_eq!(cost_style(30.0).fg, Some(theme::WARNING));
+    }
+
+    #[test]
+    fn test_cost_style_success() {
+        assert_eq!(cost_style(10.0).fg, Some(theme::SUCCESS));
     }
 
     fn create_test_state() -> crate::AppState {
@@ -4532,6 +4677,7 @@ mod tests {
             day_last_timestamp: chrono::Utc::now(),
             summary: None,
             custom_title: None,
+            ai_title: None,
             is_subagent: false,
             is_continued: false,
         };
@@ -4646,6 +4792,7 @@ mod tests {
             updating_session: None,
             updating_task: None,
             last_data_update: None,
+            last_index_build: None,
             data_reload_task: None,
             data_limit: 50,
             animation_frame: 0,
@@ -4697,6 +4844,7 @@ mod tests {
                     today - chrono::Duration::days(3),
                 ),
             ],
+            project_labels: std::collections::HashMap::new(),
             original_daily_groups: daily_groups,
             original_daily_costs: daily_costs,
             original_stats: stats,
@@ -5549,15 +5697,16 @@ mod tests {
 
     #[test]
     fn test_cost_style_boundary_values() {
-        // 100.0 is NOT > 100.0, so it should be ERROR, not DANGER
-        assert_eq!(cost_style(100.0).fg, Some(theme::ERROR));
-        assert_eq!(cost_style(100.01).fg, Some(theme::DANGER));
-        // 50.0 is NOT > 50.0, so it should be WARNING, not ERROR
-        assert_eq!(cost_style(50.0).fg, Some(theme::WARNING));
-        assert_eq!(cost_style(50.01).fg, Some(theme::ERROR));
-        // 20.0 is NOT > 20.0, so it should be SUCCESS, not WARNING
+        // Each cutoff uses a strict `>` comparison, so the cutoff itself
+        // belongs to the lower tier. Spot-check every band edge.
         assert_eq!(cost_style(20.0).fg, Some(theme::SUCCESS));
         assert_eq!(cost_style(20.01).fg, Some(theme::WARNING));
+        assert_eq!(cost_style(60.0).fg, Some(theme::WARNING));
+        assert_eq!(cost_style(60.01).fg, Some(theme::ERROR));
+        assert_eq!(cost_style(100.0).fg, Some(theme::ERROR));
+        assert_eq!(cost_style(100.01).fg, Some(theme::DANGER));
+        assert_eq!(cost_style(300.0).fg, Some(theme::DANGER));
+        assert_eq!(cost_style(300.01).fg, Some(theme::CRITICAL));
     }
 
     #[test]
@@ -5603,6 +5752,7 @@ mod tests {
             day_last_timestamp: chrono::Utc::now(),
             summary: None,
             custom_title: None,
+            ai_title: None,
             is_subagent: true,
             is_continued: false,
         };
@@ -5703,27 +5853,27 @@ mod tests {
     }
 
     #[test]
-    fn test_monthly_forecast_in_insights() {
+    fn test_monthly_actual_in_insights() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
-            text.contains("est"),
-            "Insights Monthly panel should contain forecast 'est', got:\n{}",
+            text.contains("this mo:"),
+            "Insights Monthly panel should label current month, got:\n{}",
             text
         );
     }
 
     #[test]
-    fn test_monthly_forecast_in_insights_detail() {
+    fn test_monthly_actual_in_insights_detail() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
         state.show_insights_detail = true;
         state.insights_panel = 3;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
-            text.contains("est"),
-            "Insights detail popup panel 3 should contain forecast 'est', got:\n{}",
+            text.contains("this mo:"),
+            "Insights detail popup panel 3 should label current month, got:\n{}",
             text
         );
     }

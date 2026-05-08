@@ -105,6 +105,7 @@ mod tests {
             }),
             summary: None,
             custom_title: None,
+            ai_title: None,
             cwd: None,
             git_branch: None,
             version: None,

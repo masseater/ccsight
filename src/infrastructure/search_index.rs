@@ -173,6 +173,14 @@ impl SearchIndex {
         };
 
         let current_files = build_file_map(daily_groups);
+
+        // Empty manifest with non-empty data = corrupt (filtered groups
+        // were saved at some point); rebuild instead of incrementally
+        // re-adding every file every launch.
+        if manifest.files.is_empty() && !current_files.is_empty() {
+            return Self::build(daily_groups);
+        }
+
         if manifest.files == current_files {
             return Self::open_existing(&index_dir);
         }

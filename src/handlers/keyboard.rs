@@ -30,6 +30,20 @@ pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => {
             state.help_scroll = state.help_scroll.saturating_sub(1);
         }
+        KeyCode::PageDown | KeyCode::Char('d') => {
+            state.help_scroll = state.help_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp | KeyCode::Char('u') => {
+            state.help_scroll = state.help_scroll.saturating_sub(10);
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.help_scroll = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            // Draw clamps `help_scroll` against the actual content height,
+            // so a saturating-large value here lands on the last page.
+            state.help_scroll = u16::MAX;
+        }
         _ => {}
     }
 }
@@ -315,6 +329,17 @@ pub(crate) fn handle_conversation_key(
                 KeyCode::Backspace => {
                     pane.search_input.delete_back();
                     ui::update_pane_search_matches(pane);
+                    pane.search_current = 0;
+                    if let Some(&first) = pane.search_matches.first() {
+                        pane.scroll = first;
+                        if let Some(msg_idx) = pane
+                            .message_lines
+                            .iter()
+                            .rposition(|&(start, _)| start <= first)
+                        {
+                            pane.selected_message = msg_idx;
+                        }
+                    }
                 }
                 KeyCode::Left => {
                     pane.search_input.move_left();
@@ -331,6 +356,17 @@ pub(crate) fn handle_conversation_key(
                 KeyCode::Char(c) => {
                     pane.search_input.insert_char(c);
                     ui::update_pane_search_matches(pane);
+                    pane.search_current = 0;
+                    if let Some(&first) = pane.search_matches.first() {
+                        pane.scroll = first;
+                        if let Some(msg_idx) = pane
+                            .message_lines
+                            .iter()
+                            .rposition(|&(start, _)| start <= first)
+                        {
+                            pane.selected_message = msg_idx;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -533,6 +569,24 @@ pub(crate) fn handle_conversation_key(
             state.active_pane_index = None;
             if state.panes.len() == 1 {
                 preview_conversation_in_pane(state);
+            }
+        }
+        KeyCode::Char('C') => {
+            // Open the currently-selected session in a new side-by-side pane
+            // (mirrors the default-mode handler so multi-pane is reachable
+            // without escaping the conversation view first).
+            let no_loading = state.panes.iter().all(|p| !p.loading);
+            if no_loading
+                && state.panes.len() < MAX_PANES
+                && let Some(group) = state.daily_groups.get(state.selected_day)
+            {
+                let sessions: Vec<_> = group.user_sessions().collect();
+                if let Some(session) = sessions.get(state.selected_session) {
+                    state
+                        .panes
+                        .push(ConversationPane::load_from(&session.file_path));
+                    state.active_pane_index = Some(state.panes.len() - 1);
+                }
             }
         }
         KeyCode::BackTab
@@ -742,19 +796,10 @@ pub(crate) fn handle_conversation_key(
                 && let Some(msg) = pane.messages.get(msg_idx)
             {
                 let content = ui::extract_message_text(msg);
-                match arboard::Clipboard::new() {
-                    Ok(mut clipboard) => {
-                        if clipboard.set_text(&content).is_ok() {
-                            let len = content.chars().count();
-                            state.toast_message = Some(format!("Copied ({len} chars)"));
-                            state.toast_time = Some(std::time::Instant::now());
-                        }
-                    }
-                    Err(_) => {
-                        state.toast_message = Some("Clipboard unavailable".to_string());
-                        state.toast_time = Some(std::time::Instant::now());
-                    }
-                }
+                let len = content.chars().count();
+                state.toast_message = Some(format!("Copied ({len} chars)"));
+                state.toast_time = Some(std::time::Instant::now());
+                crate::handlers::tasks::spawn_clipboard_write(content);
             }
         }
         KeyCode::Char('i') => {
@@ -1183,6 +1228,22 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             if *scroll + 1 < max_items {
                 *scroll += 1;
             }
+        }
+        KeyCode::PageUp | KeyCode::Char('u') => {
+            let scroll = &mut state.dashboard_scroll[state.dashboard_panel];
+            *scroll = scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown | KeyCode::Char('d') => {
+            let max_items = crate::dashboard_max_items(state);
+            let scroll = &mut state.dashboard_scroll[state.dashboard_panel];
+            *scroll = scroll.saturating_add(10).min(max_items.saturating_sub(1));
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            state.dashboard_scroll[state.dashboard_panel] = 0;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            let max_items = crate::dashboard_max_items(state);
+            state.dashboard_scroll[state.dashboard_panel] = max_items.saturating_sub(1);
         }
         KeyCode::Char(c @ '1'..='4') if state.dashboard_panel == 3 => {
             state.tools_detail_section = (c as u8 - b'1') as usize;

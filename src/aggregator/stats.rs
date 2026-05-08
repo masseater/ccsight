@@ -160,6 +160,7 @@ struct FileStats {
     last_timestamp: Option<DateTime<Utc>>,
     summary: Option<String>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
     model: Option<String>,
     is_subagent: bool,
     daily_stats: HashMap<NaiveDate, DailyStats>,
@@ -312,6 +313,7 @@ impl StatsAggregator {
                     last_timestamp: file_stats.last_timestamp,
                     summary: file_stats.summary.clone(),
                     custom_title: file_stats.custom_title.clone(),
+                    ai_title: file_stats.ai_title.clone(),
                     model: file_stats.model,
                     is_subagent: file_stats.is_subagent,
                     daily_stats: daily_stats_cached,
@@ -514,6 +516,11 @@ impl StatsAggregator {
             // the cached value matches what the grouper would resolve.
             .or_else(|| crate::infrastructure::resolve_cowork_title(file));
 
+        file_stats.ai_title = entries
+            .iter()
+            .rfind(|e| e.entry_type == EntryType::AiTitle)
+            .and_then(|e| e.ai_title.clone());
+
         file_stats.model = super::extract_session_model(entries);
 
         for entry in entries {
@@ -678,16 +685,28 @@ impl StatsAggregator {
                         *stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
                         *file_stats.tool_usage.entry(key.clone()).or_insert(0) += 1;
 
-                        let lang = Self::extract_language_from_tool_input(name, input);
-                        if let Some(lang) = lang {
-                            *stats.language_usage.entry(lang.to_string()).or_insert(0) += 1;
+                        let exts = Self::extract_extensions_from_tool_input(name, input);
+                        // Per-extension language attribution keeps language_usage in
+                        // step with extension_usage when one tool call resolves to
+                        // multiple extensions (e.g. a glob like `*.{md,mdx}`).
+                        // Special filenames without an extension (Dockerfile,
+                        // Makefile, etc.) fall through to the language-only path.
+                        let mut langs: Vec<&'static str> = exts
+                            .iter()
+                            .map(|ext| crate::aggregator::language::for_extension(ext))
+                            .collect();
+                        if exts.is_empty()
+                            && let Some(l) = Self::extract_language_from_tool_input(name, input)
+                        {
+                            langs.push(l);
+                        }
+                        for lang in &langs {
+                            *stats.language_usage.entry((*lang).to_string()).or_insert(0) += 1;
                             *file_stats
                                 .language_usage
-                                .entry(lang.to_string())
+                                .entry((*lang).to_string())
                                 .or_insert(0) += 1;
                         }
-
-                        let exts = Self::extract_extensions_from_tool_input(name, input);
                         for ext in &exts {
                             *stats.extension_usage.entry(ext.clone()).or_insert(0) += 1;
                             *file_stats.extension_usage.entry(ext.clone()).or_insert(0) += 1;
@@ -696,8 +715,8 @@ impl StatsAggregator {
                         if let Some(date) = daily_date
                             && let Some(d) = file_stats.daily_stats.get_mut(&date) {
                                 *d.tool_usage.entry(key).or_insert(0) += 1;
-                                if let Some(lang) = lang {
-                                    *d.language_usage.entry(lang.to_string()).or_insert(0) += 1;
+                                for lang in &langs {
+                                    *d.language_usage.entry((*lang).to_string()).or_insert(0) += 1;
                                 }
                                 for ext in exts {
                                     *d.extension_usage.entry(ext).or_insert(0) += 1;

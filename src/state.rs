@@ -258,6 +258,61 @@ mod period_filter_tests {
     }
 }
 
+#[cfg(test)]
+mod project_label_tests {
+    use super::*;
+    use crate::aggregator::DailyGroup;
+    use crate::test_helpers::helpers::make_session;
+
+    fn state_with_projects(names: &[&str]) -> AppState {
+        let sessions: Vec<_> = names.iter()
+            .map(|n| make_session(n, None, Some("main")))
+            .collect();
+        let mut state = AppState::new_initial(0);
+        state.original_daily_groups = vec![DailyGroup {
+            date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            sessions,
+        }];
+        state.rebuild_project_list();
+        state
+    }
+
+    #[test]
+    fn label_disambiguates_colliding_basenames() {
+        let state = state_with_projects(&[
+            "/work/dev/foo",
+            "/other/area/foo",
+        ]);
+        assert_eq!(state.project_label("/work/dev/foo"), "foo (dev)");
+        assert_eq!(state.project_label("/other/area/foo"), "foo (area)");
+    }
+
+    #[test]
+    fn label_uses_basename_only_when_unique() {
+        let state = state_with_projects(&["/work/dev/alpha", "/work/dev/beta"]);
+        assert_eq!(state.project_label("/work/dev/alpha"), "alpha");
+        assert_eq!(state.project_label("/work/dev/beta"), "beta");
+    }
+
+    #[test]
+    fn label_falls_back_for_unknown_path() {
+        let state = state_with_projects(&["/work/dev/known"]);
+        assert_eq!(state.project_label("/never/seen/path"), "path");
+    }
+
+    #[test]
+    fn label_handles_three_way_collision() {
+        let state = state_with_projects(&[
+            "/a/x/tmp",
+            "/b/y/tmp",
+            "/c/z/tmp",
+        ]);
+        assert_eq!(state.project_label("/a/x/tmp"), "tmp (x)");
+        assert_eq!(state.project_label("/b/y/tmp"), "tmp (y)");
+        assert_eq!(state.project_label("/c/z/tmp"), "tmp (z)");
+    }
+}
+
 #[derive(Clone)]
 pub enum SummaryType {
     Session(Box<crate::aggregator::SessionInfo>),
@@ -435,6 +490,10 @@ pub struct AppState {
         usize,
     )>,
     pub last_data_update: Option<std::time::Instant>,
+    /// When the last successful tantivy build/incremental update finished.
+    /// Throttles `start_index_build` so an actively-growing session JSONL
+    /// doesn't keep the indexing indicator lit on every reload.
+    pub last_index_build: Option<std::time::Instant>,
     pub data_reload_task: Option<mpsc::Receiver<LoadResult>>,
     pub data_limit: usize,
     pub animation_frame: usize,
@@ -489,6 +548,10 @@ pub struct AppState {
     pub project_popup_selected: usize,
     pub project_popup_scroll: usize,
     pub project_list: Vec<(String, u64, NaiveDate)>,
+    /// Pre-computed disambiguated display labels keyed by full project_name.
+    /// Built alongside `project_list` so render paths can append a `(parent)`
+    /// suffix on basename collision without re-scanning `project_list` per call.
+    pub project_labels: std::collections::HashMap<String, String>,
     pub original_daily_groups: Vec<DailyGroup>,
     pub original_daily_costs: Vec<(NaiveDate, f64)>,
     pub original_stats: Stats,
@@ -565,6 +628,7 @@ impl AppState {
             updating_session: None,
             updating_task: None,
             last_data_update: None,
+            last_index_build: None,
             data_reload_task: None,
             data_limit,
             animation_frame: 0,
@@ -609,6 +673,7 @@ impl AppState {
             project_popup_selected: 0,
             project_popup_scroll: 0,
             project_list: Vec::new(),
+            project_labels: std::collections::HashMap::new(),
             original_daily_groups: Vec::new(),
             original_daily_costs: Vec::new(),
             original_stats: crate::aggregator::Stats::default(),
@@ -645,7 +710,7 @@ impl AppState {
         self.file_count = data.file_count;
         self.cache_stats = Some(data.cache_stats);
         self.last_data_update = Some(std::time::Instant::now());
-        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.daily_groups);
+        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.original_daily_groups);
         self.configured_resources = crate::infrastructure::discover_configured_resources();
         self.tool_last_used = crate::aggregator::compute_tool_last_used(&self.daily_groups);
         self.rebuild_project_list();
@@ -718,13 +783,14 @@ impl AppState {
             }
             self.daily_groups = groups;
 
-            if has_project {
+            if has_project || has_pinned {
+                // Recompute from the filtered `daily_groups` because both
+                // filters retain only a subset of sessions per day; using
+                // `original_daily_costs` filtered by date range only would
+                // sum every session that day even when most don't match.
                 let calculator = CostCalculator::global();
                 let mut date_cost: std::collections::HashMap<NaiveDate, f64> =
                     std::collections::HashMap::new();
-                // Costs include subagent contributions so the project-filtered
-                // daily total matches Overview semantics (subagent cost is real
-                // Anthropic spend tied to that day).
                 for group in &self.daily_groups {
                     for session in &group.sessions {
                         for (model, tokens) in &session.day_tokens_by_model {
@@ -775,12 +841,9 @@ impl AppState {
             self.rebuild_filtered_stats();
         }
 
-        // Recompute MCP per-server status against the CURRENT day set on
-        // BOTH paths (reset and filtered). Putting this inside the `else`
-        // branch alone caused 7d → All to leave `mcp_status` pinned to the
-        // previous filter's window — the legend showed "19 stale" against
-        // unfiltered totals.
-        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.daily_groups);
+        // Compute against unfiltered groups so "stale (>30d)" stays a
+        // wall-clock predicate regardless of the active period filter.
+        self.mcp_status = crate::infrastructure::compute_mcp_status(&self.original_daily_groups);
 
         if self.selected_day >= self.daily_groups.len() {
             self.selected_day = self.daily_groups.len().saturating_sub(1);
@@ -870,9 +933,17 @@ impl AppState {
         }
 
         // tool_error/success counts and branch_stats are file-level aggregates
-        // not available per-session, so we use unfiltered values as approximation
-        stats.tool_error_count = self.original_stats.tool_error_count;
-        stats.tool_success_count = self.original_stats.tool_success_count;
+        // not available per-session, so we use unfiltered values as
+        // approximation. When the filter resolves to zero sessions, the
+        // unfiltered numbers would render against an empty view; zero them so
+        // the success-rate row stays consistent with the rest of the metrics.
+        if self.daily_groups.is_empty() {
+            stats.tool_error_count = 0;
+            stats.tool_success_count = 0;
+        } else {
+            stats.tool_error_count = self.original_stats.tool_error_count;
+            stats.tool_success_count = self.original_stats.tool_success_count;
+        }
         stats.branch_stats = self.original_stats.branch_stats.clone();
 
         self.stats = stats;
@@ -902,6 +973,48 @@ impl AppState {
             .map(|(name, (tokens, date))| (name, tokens, date))
             .collect();
         list.sort_by_key(|x| std::cmp::Reverse(x.1));
+
+        // Pre-compute disambiguated labels: when two projects share a basename,
+        // append the parent dir so panels can tell them apart.
+        let mut basename_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (name, _, _) in &list {
+            let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+            *basename_counts.entry(basename).or_insert(0) += 1;
+        }
+        self.project_labels = list
+            .iter()
+            .map(|(name, _, _)| {
+                let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+                let label = if basename_counts.get(basename).copied().unwrap_or(0) <= 1 {
+                    basename.to_string()
+                } else {
+                    let parent = name
+                        .rsplit_once('/')
+                        .map_or("", |(p, _)| p)
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("");
+                    if parent.is_empty() {
+                        basename.to_string()
+                    } else {
+                        format!("{basename} ({parent})")
+                    }
+                };
+                (name.clone(), label)
+            })
+            .collect();
+
         self.project_list = list;
+    }
+
+    /// Display label for a project, disambiguated against other projects that
+    /// share the same basename. Falls back to `shorten_project` for names not
+    /// yet in `project_labels` (e.g. session created mid-frame before reload).
+    pub fn project_label(&self, name: &str) -> String {
+        self.project_labels
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| crate::ui::shorten_project(name).to_string())
     }
 }

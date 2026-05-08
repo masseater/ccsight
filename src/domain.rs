@@ -25,6 +25,9 @@ pub struct LogEntry {
     #[serde(rename = "customTitle", default)]
     pub custom_title: Option<String>,
 
+    #[serde(rename = "aiTitle", default)]
+    pub ai_title: Option<String>,
+
     #[serde(default)]
     pub cwd: Option<String>,
 
@@ -51,6 +54,7 @@ pub enum EntryType {
     Assistant,
     Summary,
     CustomTitle,
+    AiTitle,
     System,
     FileHistorySnapshot,
     QueueOperation,

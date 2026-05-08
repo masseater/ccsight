@@ -529,7 +529,7 @@ impl CcsightServer {
             results_json.push(serde_json::json!({
                 "date": group.date.to_string(),
                 "project": session.project_name,
-                "summary": session.summary.as_deref().or(session.custom_title.as_deref()),
+                "summary": session.ai_title.as_deref().or(session.custom_title.as_deref()).or(session.summary.as_deref()),
                 "snippet": result.snippet,
                 "match_type": match_type,
                 "tokens": session.work_tokens(),

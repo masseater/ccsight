@@ -265,7 +265,10 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
                 state.tools_detail_section = section_idx;
                 state.show_dashboard_detail = true;
                 state.dashboard_scroll[3] = 0;
-                if section_idx == 1 {
+                // Tools tab is section 0 — reset the MCP cursor on entry so
+                // a stale value from the prior popup view doesn't push the
+                // cursor past the visible server list.
+                if section_idx == 0 {
                     state.mcp_selected_server = 0;
                     state.mcp_selected_tool = None;
                 }
@@ -576,7 +579,19 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
                     if up {
                         pane.scroll = pane.scroll.saturating_sub(SCROLL_LINES);
                     } else {
-                        pane.scroll += SCROLL_LINES;
+                        // Bound against the rendered cache when present so a
+                        // burst of scroll-down events can't drive `scroll`
+                        // past the actual content (the draw clamp would
+                        // recover it, but `selected_message` below is
+                        // computed before the next draw and would land on
+                        // the last message spuriously).
+                        let max_scroll = pane
+                            .rendered
+                            .as_ref()
+                            .map_or(usize::MAX, |(lines, _, _, _)| {
+                                lines.len().saturating_sub(area.height as usize)
+                            });
+                        pane.scroll = pane.scroll.saturating_add(SCROLL_LINES).min(max_scroll);
                     }
                     if !pane.message_lines.is_empty() {
                         let msg_idx = if up {

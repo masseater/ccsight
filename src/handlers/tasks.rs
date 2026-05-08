@@ -14,6 +14,24 @@ use crate::aggregator::{DailyGroup, SessionInfo};
 use crate::state::SummaryType;
 use crate::{summary, AppState};
 
+/// Write `text` to the system clipboard on a detached background thread.
+///
+/// `arboard::Clipboard::new()` and `set_text()` are synchronous and may block
+/// for several seconds on macOS when the NSPasteboard is contended (other
+/// apps clipboard activity, AppKit pasteboard daemon stalls). Running them
+/// on the event loop thread freezes the entire UI for that duration, and
+/// because `EnableMouseCapture` is still in effect, the surrounding terminal
+/// (e.g. a zellij tab hosting ccsight) loses mouse input until ccsight is
+/// killed. Detaching the write keeps the loop responsive; failure is
+/// swallowed silently because the optimistic toast has already been shown.
+pub(crate) fn spawn_clipboard_write(text: String) {
+    thread::spawn(move || {
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(&text);
+        }
+    });
+}
+
 /// Spawn an AI session-summary task (generate or regenerate) and stash the
 /// receiver in `state.summary_task`. Also flips the `generating_summary` /
 /// `show_summary` / `summary_type` UI flags so the popup is shown immediately.

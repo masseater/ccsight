@@ -82,6 +82,22 @@ rg '^# [0-9]+\.' scripts/lint.sh   # current rule list
 
 Add new rules by copying an existing block and bumping the number.
 
+**When to add a lint rule** — only patterns likely to recur. Use these gates:
+
+- *Plausible regression*: a future contributor (or AI) would naturally reach
+  for the wrong pattern (it autocompletes, it's the obvious helper, etc.).
+- *Silent failure*: the wrong pattern doesn't produce a compile/test error,
+  and the bug surfaces only later — wrong number on a rare popup, broken
+  visual at a rare width, regression after some other change.
+- *Single canonical pattern*: there's one right way to do it that's
+  expressible as a substring / regex check.
+- *Low false-positive rate*: legitimate exceptions are few and easily
+  allowlisted.
+
+If a pattern fails any gate (one-shot mistake, compiler/test catches it,
+many legitimate variants, or noisy in practice), prefer a doc comment next
+to the canonical site or trust review — don't add a lint.
+
 **Not lint-enforceable** — these live as doc comments next to the code they
 govern, so they're seen at the moment of violation:
 
@@ -95,24 +111,35 @@ govern, so they're seen at the moment of violation:
 - AppState init parity — every `AppState { ... }` literal lists every field.
 - Real-world identifier shapes — fully covered by lint #16 / #17 / #21.
 
+## Commits
+
+Match the existing voice — skim `git log --oneline -30` before writing one.
+
+Subject only — no bullet body. Lowercase, no period, target ~80 chars (up
+to ~100 OK). Optional area prefix (`fix:`, `theme:`, `docs:`, `lint #N:`,
+or a feature/file context like `Tools popup:`). Join multiple small
+changes with `;` `+` `,`. Pitch at the *what changed* level — concrete
+enough that a reader can imagine the diff, but no internal field names,
+version numbers, or implementation details that age out.
+
+Always include a `Co-Authored-By` trailer for Claude-assisted commits; omit only for pure-human commits.
+
 ## Comments
 
 Comments explain invariants, not history. Don't write incidents, prior bug
-numbers, captured numbers, or "earlier this was X" into comments — the file
-will outlive the incident and the comment will lie. The same applies to test
-docstrings, commit-message-flavored doc comments, and `// Why:` blocks.
+numbers, captured numbers (percentages, $ amounts, K/M magnitudes,
+versions, dates), or "earlier this was X" — the file outlives the
+incident and the comment turns into a lie. Same for `e.g.`-style examples
+that quote real values: they read as illustrations but date as snapshots.
 
-- ❌ `// Earlier bug: foo screen showed Xx and bar screen Yx for the same row.`
-- ❌ `// (regression in vA.B.C where two surfaces disagreed on the count.)`
-- ❌ `// User reported data loss on YYYY-MM-DD around HH:MM.`
-- ✅ `// Avg is over all months so this panel and the detail popup show the
-       same delta for the same row regardless of the visible window size.`
-- ✅ `// Number is a session count, not a call count — different from the
-       sibling panel that shares the same labels.`
+- ❌ `// regression in vA.B.C where two surfaces disagreed on the count.`
+- ❌ `// e.g. "94%" once crushed the bars to "0–1%".`
+- ✅ `// Truncating mid-number drops the K/M suffix and reads much smaller.`
 
-State the rule and why it matters in terms a future reader can verify against
-the code in front of them. If the "why" is a past incident, that belongs in
-the commit message or PR description.
+State the rule in terms a future reader can verify against the code in
+front of them. Past incidents and captured values go in the commit message
+or PR description. Test docstrings inside `mod tests` are exempt — they
+describe fixture arithmetic that is part of the assertion contract.
 
 ## Tests — three layers
 
