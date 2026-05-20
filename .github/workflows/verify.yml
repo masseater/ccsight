@@ -3,6 +3,9 @@ name: Verify
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     strategy:
@@ -13,7 +16,25 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-      - run: cargo test
-      - run: cargo clippy -- -D warnings
+        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev shellcheck tmux
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+        # tmux is pre-installed on GitHub's macOS runners
+      - run: cargo test --locked
+      - run: cargo clippy --locked -- -D warnings
+      # Release build catches release-only issues (link errors, conditional
+      # compilation gated on `cfg(not(debug_assertions))`, etc.) that the
+      # test pass — which uses debug build — would otherwise miss.
+      - run: cargo build --locked --release
       - run: bash scripts/lint.sh
+      - run: shellcheck --severity=warning scripts/*.sh scripts/hooks/*
+      # Headless TUI launch + first-frame capture. Catches regressions
+      # that compile clean but panic during initial render (popup geometry
+      # errors, theme constant typos, etc.).
+      - run: bash scripts/smoke-ci.sh
+      # Security advisories for the dependency tree. Uses the maintained
+      # RustSec action; fails the build when any RUSTSEC-* applies.
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

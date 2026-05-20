@@ -11,7 +11,12 @@ use crate::domain::LogEntry;
 // These can be overridden via environment variables if needed
 // Validated ranges: file_size [1MB, 2GB], line_size [1KB, 100MB], entries [100, 1M]
 
-const DEFAULT_MAX_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500MB
+// Large session JSONLs (~hundreds of MB) appear in normal heavy use,
+// so the default must accommodate them or token totals silently drop
+// the entries from over-cap files. Streaming parse keeps memory bounded
+// by `max_line_size` regardless of file size, so raising the cap costs
+// only parse time, not RAM.
+const DEFAULT_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB
 const MIN_MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
 const MAX_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB
 
@@ -27,21 +32,27 @@ fn max_file_size() -> u64 {
     std::env::var("CCSIGHT_MAX_FILE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .map_or(DEFAULT_MAX_FILE_SIZE, |v: u64| v.clamp(MIN_MAX_FILE_SIZE, MAX_MAX_FILE_SIZE))
+        .map_or(DEFAULT_MAX_FILE_SIZE, |v: u64| {
+            v.clamp(MIN_MAX_FILE_SIZE, MAX_MAX_FILE_SIZE)
+        })
 }
 
 fn max_line_size() -> usize {
     std::env::var("CCSIGHT_MAX_LINE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .map_or(DEFAULT_MAX_LINE_SIZE, |v: usize| v.clamp(MIN_MAX_LINE_SIZE, MAX_MAX_LINE_SIZE))
+        .map_or(DEFAULT_MAX_LINE_SIZE, |v: usize| {
+            v.clamp(MIN_MAX_LINE_SIZE, MAX_MAX_LINE_SIZE)
+        })
 }
 
 fn max_entries() -> usize {
     std::env::var("CCSIGHT_MAX_ENTRIES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .map_or(DEFAULT_MAX_ENTRIES, |v: usize| v.clamp(MIN_MAX_ENTRIES, MAX_MAX_ENTRIES))
+        .map_or(DEFAULT_MAX_ENTRIES, |v: usize| {
+            v.clamp(MIN_MAX_ENTRIES, MAX_MAX_ENTRIES)
+        })
 }
 
 pub struct JsonlParser;
@@ -115,6 +126,10 @@ impl JsonlParser {
         Ok(entries)
     }
 
+    pub fn entry_hash(entry: &LogEntry) -> Option<String> {
+        Self::create_dedup_hash(entry)
+    }
+
     fn create_dedup_hash(entry: &LogEntry) -> Option<String> {
         let request_id = entry.request_id.as_ref()?;
         let message_id = entry.message.as_ref()?.id.as_ref()?;
@@ -164,7 +179,9 @@ mod tests {
 
         let entries = JsonlParser::parse_file(&path).unwrap();
         assert_eq!(entries.len(), 1);
-        let ts = entries[0].timestamp.expect("timestamp filled from _audit_timestamp");
+        let ts = entries[0]
+            .timestamp
+            .expect("timestamp filled from _audit_timestamp");
         assert_eq!(ts.to_rfc3339(), "2026-04-27T01:23:45+00:00");
 
         let _ = std::fs::remove_dir_all(&dir);

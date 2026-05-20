@@ -9,9 +9,7 @@ use crate::aggregator::{DailyGroup, SessionInfo};
 
 /// Aggregate per-month cost (key = "YYYY-MM") from `state.daily_costs`.
 /// Used by both the compact Insights panel and its detail popup.
-pub(crate) fn aggregate_monthly_costs(
-    daily_costs: &[(NaiveDate, f64)],
-) -> BTreeMap<String, f64> {
+pub(crate) fn aggregate_monthly_costs(daily_costs: &[(NaiveDate, f64)]) -> BTreeMap<String, f64> {
     let mut map = BTreeMap::new();
     for (date, cost) in daily_costs {
         let key = format!("{}-{:02}", date.year(), date.month());
@@ -22,9 +20,7 @@ pub(crate) fn aggregate_monthly_costs(
 
 /// Aggregate per-month work-token totals (key = "YYYY-MM"), excluding subagent
 /// sessions to match the cost path's accounting. Used by the Monthly detail popup.
-pub(crate) fn aggregate_monthly_tokens(
-    daily_groups: &[DailyGroup],
-) -> BTreeMap<String, u64> {
+pub(crate) fn aggregate_monthly_tokens(daily_groups: &[DailyGroup]) -> BTreeMap<String, u64> {
     let mut map = BTreeMap::new();
     for group in daily_groups {
         let key = format!("{}-{:02}", group.date.year(), group.date.month());
@@ -59,11 +55,7 @@ pub(crate) fn aggregate_weekday_avg(
     // `tokens/day` accounting, so all `K/day` values agree.
     let mut work: HashMap<Weekday, u64> = HashMap::new();
     for group in daily_groups {
-        let tokens: u64 = group
-            .sessions
-            .iter()
-            .map(SessionInfo::work_tokens)
-            .sum();
+        let tokens: u64 = group.sessions.iter().map(SessionInfo::work_tokens).sum();
         *work.entry(group.date.weekday()).or_insert(0) += tokens;
     }
     let mut avg = HashMap::with_capacity(7);

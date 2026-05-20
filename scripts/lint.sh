@@ -36,6 +36,13 @@
 #   21  Generic placeholder `command:` literals (mirrors #16 for command prefix)
 #   22  Saturating sub on inner/popup height too (extends #5 beyond `area.*`)
 #   23  No captured numeric values in comments (per CLAUDE.md "Comments")
+#   24  Use state.project_label() in render paths
+#   25  No literal calendar dates (use offsets or `// lint-ok: date-literal`)
+#   26  `try_recv()` must use `match` with Disconnected arm
+#   27  No `from_timestamp(0, 0).unwrap()` — use UNIX_EPOCH
+#   28  Shell commands via `format!` must use `posix_shell_quote`
+#   29  Atomic tmp+rename must `sync_all` before rename
+#   30  HashMap-sourced single-key sort needs `.then_with(...)` tiebreaker
 
 set -e
 
@@ -641,6 +648,142 @@ for fname in 'src/ui/dashboard.rs src/ui/insights.rs src/ui/mod.rs'.split():
 if [ -n "$SHORTEN_DIRECT" ]; then
     echo "ERROR: Direct shorten_project() in render path (use state.project_label() so two projects with the same basename stay distinguishable):"
     echo "$SHORTEN_DIRECT"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 25. Literal calendar dates in source (per "no captured values" rule).
+# Production code MUST NOT call `chrono::Local::now()` / `Utc::now()` outside
+# the single top-level draw / event-loop entry point; date-dependent helpers
+# take `today: NaiveDate` (or equivalent) as a parameter so they are pure
+# functions of their input. Tests then supply a fixed date and stay
+# deterministic across runs, timezones, and calendar boundaries.
+#
+# Reading the clock inside tests via `chrono::Local::now()` is BANNED — it
+# couples the test to wall-clock state and silently changes behaviour at
+# DST / month / year edges. Use a literal date with the `// lint-ok:
+# date-literal` marker; the marker doubles as documentation that the value
+# is an intentional, hermetic fixture.
+DATE_LITERALS=$(python3 -c "
+import os
+import re
+
+# Match any ISO date substring 'YYYY-MM-DD' OR from_ymd[_opt](YEAR, ...).
+# The substring form catches timestamps in test JSON like 'YYYY-MM-DDTHH:MM:SSZ'
+# and bare dates in comments, not just quoted-string literals.
+pat = re.compile(r'(\b20[0-9]{2}-[01][0-9]-[0-3][0-9]\b)|(from_ymd(_opt)?\s*\(\s*20[0-9]{2}\b)')
+
+for root, dirs, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        try:
+            with open(path) as f:
+                content = f.read()
+        except FileNotFoundError:
+            continue
+        for i, line in enumerate(content.splitlines()):
+            if not pat.search(line):
+                continue
+            # Format-spec strings (\"%Y-%m-%d\") are not literal dates.
+            if '%Y-%m-%d' in line:
+                continue
+            # Per-line opt-out marker.
+            if 'lint-ok: date-literal' in line:
+                continue
+            print(f'  {path}:L{i+1}: {line.strip()}')
+" 2>/dev/null || true)
+if [ -n "$DATE_LITERALS" ]; then
+    echo "ERROR: Literal calendar dates in source (use chrono::Local::now() + offsets or add '// lint-ok: date-literal' for genuinely fixed parser fixtures):"
+    echo "$DATE_LITERALS"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 26. `let Ok(...) = rx.try_recv()` (background-task receivers).
+# Holds an mpsc::Receiver via `let Ok(x) = ...` silently swallows the
+# `Disconnected` arm — if the spawned thread panics before sending, the
+# receiver stays in state forever and the task never re-spawns. Use
+# `match rx.try_recv()` with all three arms explicit. Allowed inside
+# `search_task` / `conversation_load_task` etc. where the task is
+# legitimately one-shot AND the slot is overwritten on the next user
+# action; mark the line with `// lint-ok: one-shot-task`.
+TRY_RECV_LET_OK=$(grep -rn 'let Ok(.*) = .*\.try_recv()' src/main.rs src/handlers/ 2>/dev/null | \
+    grep -v 'lint-ok: one-shot-task' || true)
+if [ -n "$TRY_RECV_LET_OK" ]; then
+    echo "ERROR: \`let Ok(...) = rx.try_recv()\` swallows \`Disconnected\` (Live polling / data reload / index build all freeze if the worker thread panics). Use \`match rx.try_recv()\` with three arms, or add \`// lint-ok: one-shot-task\` for receivers that are intentionally fire-and-forget:"
+    echo "$TRY_RECV_LET_OK"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 27. `DateTime::from_timestamp(0, 0).unwrap()` — old chrono API.
+# Use `DateTime::<Utc>::UNIX_EPOCH` (chrono ≥ 0.4.26): infallible, no
+# `unwrap`, no risk of silent breakage when chrono's API shifts.
+FROM_TIMESTAMP_ZERO=$(grep -rn 'from_timestamp(0, 0)\.unwrap()' src/ 2>/dev/null || true)
+if [ -n "$FROM_TIMESTAMP_ZERO" ]; then
+    echo "ERROR: \`DateTime::from_timestamp(0, 0).unwrap()\` — replace with \`DateTime::<Utc>::UNIX_EPOCH\`:"
+    echo "$FROM_TIMESTAMP_ZERO"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 28. Shell command strings must route through `posix_shell_quote`.
+# Building a shell command via `format!("cd {} && ...")` from user-derived
+# data (cwd, session_id read from JSON on disk) is a clipboard injection
+# vector. The single quoting helper lives in `src/handlers/keyboard.rs`.
+SHELL_FORMAT=$(grep -rn 'format!("cd {' src/ 2>/dev/null | \
+    grep -v 'posix_shell_quote' | grep -v 'lint-ok: shell-quote' | \
+    grep -v 'src/shell.rs' || true)
+if [ -n "$SHELL_FORMAT" ]; then
+    echo "ERROR: shell command built via \`format!\` without \`posix_shell_quote\` — clipboard injection risk:"
+    echo "$SHELL_FORMAT"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 29. Atomic file writes (`tmp + rename`) must flush before rename.
+# Writing the tmp via `fs::write` and renaming on success is the standard
+# atomic pattern, but the data isn't durable across a power loss until
+# `sync_all` is called. Enforce sync by checking that any function
+# performing `fs::rename(&tmp, &path)` also references `sync_all`. The
+# allowlist `lint-ok: best-effort-tmp` covers genuinely transient writes
+# (e.g. lock files that get recreated).
+RENAME_NO_FSYNC=$(python3 -c "
+import re, os
+pat_rename = re.compile(r'fs::rename\(.*tmp.*,.*path')
+pat_sync = re.compile(r'sync_all')
+for root, dirs, files in os.walk('src/infrastructure'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            content = f.read()
+        if 'lint-ok: best-effort-tmp' in content:
+            continue
+        if pat_rename.search(content) and not pat_sync.search(content):
+            print(f'  {path}: fs::rename(tmp, path) without sync_all elsewhere in file')
+" 2>/dev/null || true)
+if [ -n "$RENAME_NO_FSYNC" ]; then
+    echo "ERROR: tmp+rename atomic write without \`sync_all\` — data not durable on power loss. Call \`f.sync_all()\` before rename (see cache.rs::save), or annotate with \`// lint-ok: best-effort-tmp\`:"
+    echo "$RENAME_NO_FSYNC"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 30. Single-key sort on HashMap-sourced collections (non-deterministic ties).
+# Sorting a Vec by a single value (e.g. `sort_by(|a, b| b.1.cmp(a.1))` or
+# `sort_by_key(|t| Reverse(t.1))`) is non-deterministic for tied values
+# when the source is a HashMap — HashMap iteration order is randomized
+# per instance, so two items with the same count shuffle between frames
+# in the UI. Always add a tiebreaker (typically alphabetical on name)
+# via `.then_with(|| a.0.cmp(b.0))` so the final order is stable.
+# Allowlist `// lint-ok: deterministic-source` for cases sourced from a
+# Vec / BTreeMap (already ordered) or where the values are unique.
+NONDET_SORT=$(grep -rn 'sort_by(|a, b| b\.1\.cmp(a\.1));' src/ 2>/dev/null | \
+    grep -v 'then_with' | grep -v 'lint-ok: deterministic-source' || true)
+NONDET_SORT_KEY=$(grep -rn 'sort_by_key(|.| std::cmp::Reverse(.\.1))' src/ 2>/dev/null | \
+    grep -v 'then_with' | grep -v 'lint-ok: deterministic-source' || true)
+if [ -n "$NONDET_SORT$NONDET_SORT_KEY" ]; then
+    echo "ERROR: single-key sort without tiebreaker. If the source is a HashMap, tied values shuffle between frames. Add \`.then_with(|| a.0.cmp(b.0))\` for stable ordering, or annotate with \`// lint-ok: deterministic-source\`:"
+    [ -n "$NONDET_SORT" ] && echo "$NONDET_SORT"
+    [ -n "$NONDET_SORT_KEY" ] && echo "$NONDET_SORT_KEY"
     ERRORS=$((ERRORS + 1))
 fi
 

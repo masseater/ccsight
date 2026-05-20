@@ -5,6 +5,7 @@ A Rust TUI for viewing Claude Code session logs with statistics, cost analysis, 
 ## Features
 
 - **Dashboard**: Costs, tokens, projects, models, tools, languages, heatmap, hourly patterns
+- **Live**: Currently-running and recently-paused sessions with status glyphs, copy-resume command, snapshot recovery so you can find what you had open after a host reboot
 - **Daily View**: Day-by-day sessions with activity graph, breakdown, conversation viewer
 - **Insights**: Metrics, today vs average, weekly/monthly trends with detail popups
 - **Conversation**: Multi-pane browsing with syntax highlighting, search, copy
@@ -105,11 +106,14 @@ Reads inputs from these locations:
   undocumented and may change between releases; if a future update breaks it,
   individual sessions just stop appearing rather than crashing the TUI.
 
-State written by ccsight (cache + index are removed by `--clear-cache`; pins are kept):
+State written by ccsight (cache + index are removed by `--clear-cache`; pins
+and the live snapshot are kept):
 
 - `~/.ccsight/cache.json` — parsed-session JSON cache (incremental)
 - `~/.ccsight/index/` — tantivy full-text index segments
 - `~/.ccsight/pins.json` — pinned-session list
+- `~/.ccsight/live_snapshot.json` — record of sessions seen alive, used by the
+  Live tab to flag "I had this open before the reboot" entries with a `⟳` glyph
 
 Pre-1.1 versions wrote to `~/.cache/ccsight/` and `~/.config/ccsight/`; ccsight
 migrates those automatically on first launch.

@@ -8,15 +8,15 @@ use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
-    Field, IndexRecordOption, OwnedValue, Schema, TextFieldIndexing, TextOptions, STORED, STRING,
+    Field, IndexRecordOption, OwnedValue, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
-use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
 
 use crate::aggregator::DailyGroup;
 use crate::domain::{EntryType, Role};
 use crate::parser::JsonlParser;
-use crate::search::{extract_snippet, SearchMatchType, SearchResult};
+use crate::search::{SearchMatchType, SearchResult, extract_snippet};
 
 const INDEX_VERSION: u32 = 5;
 const TOKENIZER_NAME: &str = "ngram23";
@@ -92,11 +92,7 @@ fn build_file_map(daily_groups: &[DailyGroup]) -> HashMap<String, u64> {
         .collect()
 }
 
-fn parse_session(
-    session_path: &Path,
-    day_idx: usize,
-    session_idx: usize,
-) -> Vec<ParsedDoc> {
+fn parse_session(session_path: &Path, day_idx: usize, session_idx: usize) -> Vec<ParsedDoc> {
     let Ok(entries) = JsonlParser::parse_file(session_path) else {
         return Vec::new();
     };
@@ -206,9 +202,7 @@ impl SearchIndex {
         let tasks = collect_tasks(daily_groups);
         let parsed: Vec<ParsedDoc> = tasks
             .par_iter()
-            .flat_map(|(day_idx, session_idx, path)| {
-                parse_session(path, *day_idx, *session_idx)
-            })
+            .flat_map(|(day_idx, session_idx, path)| parse_session(path, *day_idx, *session_idx))
             .collect();
 
         write_docs(&writer, &fields, &parsed)?;
@@ -294,7 +288,10 @@ impl SearchIndex {
                     .filter(|s| !s.is_subagent)
                     .enumerate()
                     .map(move |(session_idx, s)| {
-                        (s.file_path.to_string_lossy().to_string(), (day_idx, session_idx))
+                        (
+                            s.file_path.to_string_lossy().to_string(),
+                            (day_idx, session_idx),
+                        )
                     })
             })
             .collect();
@@ -309,9 +306,7 @@ impl SearchIndex {
 
         let parsed: Vec<ParsedDoc> = add_tasks
             .par_iter()
-            .flat_map(|(day_idx, session_idx, path)| {
-                parse_session(path, *day_idx, *session_idx)
-            })
+            .flat_map(|(day_idx, session_idx, path)| parse_session(path, *day_idx, *session_idx))
             .collect();
 
         write_docs(&writer, &fields, &parsed)?;
@@ -345,9 +340,14 @@ impl SearchIndex {
         };
 
         let searcher = self.reader.searcher();
-        let Ok(top_docs) =
+        // tantivy 0.26 occasionally panics inside `phrase_scorer` when the
+        // query is mutated rapidly (e.g., a user editing the search box). The
+        // panic kills the TUI, so we catch it here and treat it as "no
+        // results" — the next keystroke will issue a fresh query.
+        let search_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             searcher.search(&query, &TopDocs::with_limit(limit).order_by_score())
-        else {
+        }));
+        let Ok(Ok(top_docs)) = search_result else {
             return Vec::new();
         };
 

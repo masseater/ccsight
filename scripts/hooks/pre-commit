@@ -32,4 +32,29 @@ if ! bash scripts/lint.sh; then
     exit 1
 fi
 
+# Optional: shellcheck on tracked scripts. `--severity=warning` skips the
+# stylistic infos (SC2086 word-splitting where intended, SC2012 `ls`-vs-
+# `find` etc.) and keeps only likely-bug-level findings (the kind that
+# bit us with sed's `\n` non-handling on macOS earlier).
+if command -v shellcheck >/dev/null 2>&1; then
+    echo "[pre-commit] shellcheck --severity=warning scripts/*.sh scripts/hooks/* ..."
+    if ! shellcheck --severity=warning scripts/*.sh scripts/hooks/* 2>&1; then
+        echo "[pre-commit] FAILED: shellcheck reported warning-level issues."
+        exit 1
+    fi
+else
+    echo "[pre-commit] shellcheck not installed — skipped. Install via 'brew install shellcheck' (macOS) or 'apt install shellcheck' (Linux) to catch real bash bugs locally."
+fi
+
+# Optional: cargo-audit (security advisories for dependencies).
+if command -v cargo-audit >/dev/null 2>&1; then
+    echo "[pre-commit] cargo audit ..."
+    if ! cargo audit --quiet 2>&1; then
+        echo "[pre-commit] FAILED: cargo-audit found vulnerable dependencies."
+        exit 1
+    fi
+else
+    echo "[pre-commit] cargo-audit not installed — skipped. Install via 'cargo install cargo-audit' to catch dependency CVEs locally (CI runs it regardless)."
+fi
+
 echo "[pre-commit] OK"

@@ -37,6 +37,10 @@ pub fn pins_path() -> Result<PathBuf> {
     Ok(state_root()?.join("pins.json"))
 }
 
+pub fn live_snapshot_path() -> Result<PathBuf> {
+    Ok(state_root()?.join("live_snapshot.json"))
+}
+
 /// One-shot migration from the pre-1.1 split paths. Idempotent: safe to call
 /// every startup. Renames `~/.cache/ccsight/{cache.json,index/}` and
 /// `~/.config/ccsight/pins.json` into `~/.ccsight/`. If the new path already
@@ -59,10 +63,7 @@ pub fn migrate_legacy_state_dirs() {
             home.join(".cache/ccsight/cache.json"),
             new_root.join("cache.json"),
         ),
-        (
-            home.join(".cache/ccsight/index"),
-            new_root.join("index"),
-        ),
+        (home.join(".cache/ccsight/index"), new_root.join("index")),
         (
             home.join(".config/ccsight/pins.json"),
             new_root.join("pins.json"),

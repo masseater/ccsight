@@ -51,8 +51,8 @@ pub fn compute_tool_last_used(
         for session in &group.sessions {
             let ts = session.day_last_timestamp;
             for tool in session.day_tool_usage.keys() {
-                let skip_for_subagent = session.is_subagent
-                    && matches!(classify_tool(tool), ToolCategory::Mcp { .. });
+                let skip_for_subagent =
+                    session.is_subagent && matches!(classify_tool(tool), ToolCategory::Mcp { .. });
                 if skip_for_subagent {
                     continue;
                 }
@@ -75,13 +75,10 @@ pub(crate) fn is_real_model(model: &str) -> bool {
 /// Walks entries in reverse so that mid-session model switches (e.g. `/model opus` after
 /// starting on Sonnet) are reflected in the displayed badge — the latest model wins.
 pub(crate) fn extract_session_model(entries: &[crate::domain::LogEntry]) -> Option<String> {
-    entries
-        .iter()
-        .rev()
-        .find_map(|e| {
-            let m = e.message.as_ref()?.model.as_ref()?;
-            is_real_model(m).then(|| m.clone())
-        })
+    entries.iter().rev().find_map(|e| {
+        let m = e.message.as_ref()?.model.as_ref()?;
+        is_real_model(m).then(|| m.clone())
+    })
 }
 
 #[cfg(test)]
@@ -171,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_compute_tool_last_used_picks_max_per_tool() {
-        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(); // lint-ok: date-literal
         let groups = vec![group_with(
             date,
             vec![
@@ -191,7 +188,7 @@ mod tests {
         // Built-in tools (Bash, Read, TodoWrite, …) used inside subagent sessions
         // count toward last_used — otherwise tools heavily used by Claude Code's
         // general-purpose subagents look stale even when active "today".
-        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(); // lint-ok: date-literal
         let groups = vec![group_with(
             date,
             vec![
@@ -207,7 +204,7 @@ mod tests {
     fn test_compute_tool_last_used_skips_subagents_for_mcp() {
         // MCP servers stay subagent-excluded to avoid the double-count problem
         // (a parent session already attributes the nested MCP call once).
-        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(); // lint-ok: date-literal
         let groups = vec![group_with(
             date,
             vec![

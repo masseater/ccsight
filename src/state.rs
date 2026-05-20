@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 use chrono::NaiveDate;
 use ratatui::style::Style;
@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 
 use crate::aggregator::{CacheStats, CostCalculator, DailyGroup, Stats, TokenStats};
 use crate::infrastructure::{RetentionWarning, SearchIndex};
-use crate::{pins, search, ConversationMessage};
+use crate::{ConversationMessage, pins, search};
 
 /// Canonical input-field type. Every text entry surface (search box, filter,
 /// custom date) MUST use this rather than a raw `String + usize` cursor pair.
@@ -23,7 +23,9 @@ pub struct TextInput {
 
 impl TextInput {
     pub fn insert_char(&mut self, c: char) {
-        let byte_pos = self.text.char_indices()
+        let byte_pos = self
+            .text
+            .char_indices()
             .nth(self.cursor)
             .map_or(self.text.len(), |(i, _)| i);
         self.text.insert(byte_pos, c);
@@ -33,7 +35,9 @@ impl TextInput {
     pub fn delete_back(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            let byte_pos = self.text.char_indices()
+            let byte_pos = self
+                .text
+                .char_indices()
                 .nth(self.cursor)
                 .map_or(self.text.len(), |(i, _)| i);
             self.text.remove(byte_pos);
@@ -70,14 +74,29 @@ impl TextInput {
         self.text = text;
     }
 
-    pub fn render_spans(&self, prefix: &str, style: Style, cursor_style: Style) -> Vec<Span<'static>> {
-        let byte_cursor = self.text.char_indices()
+    pub fn render_spans(
+        &self,
+        prefix: &str,
+        style: Style,
+        cursor_style: Style,
+    ) -> Vec<Span<'static>> {
+        let byte_cursor = self
+            .text
+            .char_indices()
             .nth(self.cursor)
             .map_or(self.text.len(), |(i, _)| i);
         let (before, after) = self.text.split_at(byte_cursor);
         let cursor_char_len = after.chars().next().map_or(0, char::len_utf8);
-        let cursor_char = if after.is_empty() { " " } else { &after[..cursor_char_len] };
-        let rest = if after.is_empty() { "" } else { &after[cursor_char_len..] };
+        let cursor_char = if after.is_empty() {
+            " "
+        } else {
+            &after[..cursor_char_len]
+        };
+        let rest = if after.is_empty() {
+            ""
+        } else {
+            &after[cursor_char_len..]
+        };
         vec![
             Span::styled(prefix.to_string(), style),
             Span::styled(before.to_string(), style),
@@ -92,6 +111,10 @@ pub enum Tab {
     Dashboard,
     Daily,
     Insights,
+    /// Currently-running and recently-paused Claude Code sessions.
+    /// Sourced from `~/.claude/sessions/<pid>.json` (active) and
+    /// `~/.claude/projects/**/*.jsonl` mtime (recently paused).
+    Live,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,6 +122,9 @@ pub enum ConvListMode {
     Day,
     Pinned,
     All,
+    /// Conv view was opened from the Live tab — left list shows live
+    /// sessions (active + paused) and j/k navigates among them.
+    Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +242,10 @@ impl PeriodFilter {
                     } else {
                         NaiveDate::from_ymd_opt(year, month + 1, 1)?
                     };
-                    Some(PeriodFilter::Custom(first, Some(next - chrono::Duration::days(1))))
+                    Some(PeriodFilter::Custom(
+                        first,
+                        Some(next - chrono::Duration::days(1)),
+                    ))
                 }
                 _ => None,
             }
@@ -232,10 +261,10 @@ mod period_filter_tests {
     fn test_parse_custom_year_only() {
         match PeriodFilter::parse_custom("2025") {
             Some(PeriodFilter::Custom(s, Some(e))) => {
-                assert_eq!(s, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
-                assert_eq!(e, NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
+                assert_eq!(s, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()); // lint-ok: date-literal
+                assert_eq!(e, NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()); // lint-ok: date-literal
             }
-            other => panic!("expected Custom(2025-01-01, 2025-12-31), got {other:?}"),
+            other => panic!("expected Custom(2025-01-01, 2025-12-31), got {other:?}"), // lint-ok: date-literal
         }
     }
 
@@ -243,8 +272,8 @@ mod period_filter_tests {
     fn test_parse_custom_year_month() {
         match PeriodFilter::parse_custom("2026-02") {
             Some(PeriodFilter::Custom(s, Some(e))) => {
-                assert_eq!(s, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
-                assert_eq!(e, NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
+                assert_eq!(s, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()); // lint-ok: date-literal
+                assert_eq!(e, NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()); // lint-ok: date-literal
             }
             other => panic!("expected Custom for 2026-02, got {other:?}"),
         }
@@ -254,7 +283,7 @@ mod period_filter_tests {
     fn test_parse_custom_invalid() {
         assert!(PeriodFilter::parse_custom("abc").is_none());
         assert!(PeriodFilter::parse_custom("2025-13").is_none());
-        assert!(PeriodFilter::parse_custom("2025-02-30").is_none());
+        assert!(PeriodFilter::parse_custom("2025-02-30").is_none()); // lint-ok: date-literal
     }
 }
 
@@ -265,12 +294,13 @@ mod project_label_tests {
     use crate::test_helpers::helpers::make_session;
 
     fn state_with_projects(names: &[&str]) -> AppState {
-        let sessions: Vec<_> = names.iter()
+        let sessions: Vec<_> = names
+            .iter()
             .map(|n| make_session(n, None, Some("main")))
             .collect();
         let mut state = AppState::new_initial(0);
         state.original_daily_groups = vec![DailyGroup {
-            date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(), // lint-ok: date-literal
             sessions,
         }];
         state.rebuild_project_list();
@@ -279,10 +309,7 @@ mod project_label_tests {
 
     #[test]
     fn label_disambiguates_colliding_basenames() {
-        let state = state_with_projects(&[
-            "/work/dev/foo",
-            "/other/area/foo",
-        ]);
+        let state = state_with_projects(&["/work/dev/foo", "/other/area/foo"]);
         assert_eq!(state.project_label("/work/dev/foo"), "foo (dev)");
         assert_eq!(state.project_label("/other/area/foo"), "foo (area)");
     }
@@ -302,11 +329,7 @@ mod project_label_tests {
 
     #[test]
     fn label_handles_three_way_collision() {
-        let state = state_with_projects(&[
-            "/a/x/tmp",
-            "/b/y/tmp",
-            "/c/z/tmp",
-        ]);
+        let state = state_with_projects(&["/a/x/tmp", "/b/y/tmp", "/c/z/tmp"]);
         assert_eq!(state.project_label("/a/x/tmp"), "tmp (x)");
         assert_eq!(state.project_label("/b/y/tmp"), "tmp (y)");
         assert_eq!(state.project_label("/c/z/tmp"), "tmp (z)");
@@ -329,7 +352,12 @@ pub struct ConversationPane {
     pub messages: Vec<ConversationMessage>,
     pub scroll: usize,
     pub message_lines: Vec<(usize, usize)>,
-    pub rendered: Option<(Vec<Line<'static>>, Vec<(usize, usize)>, Vec<bool>, Option<usize>)>,
+    pub rendered: Option<(
+        Vec<Line<'static>>,
+        Vec<(usize, usize)>,
+        Vec<bool>,
+        Option<usize>,
+    )>,
     pub file_path: Option<PathBuf>,
     pub last_modified: Option<std::time::SystemTime>,
     pub reload_check: Option<std::time::Instant>,
@@ -343,6 +371,9 @@ pub struct ConversationPane {
     pub search_matches: Vec<usize>,
     pub search_current: usize,
     pub search_saved_scroll: Option<(usize, usize)>,
+    // Last viewport height seen by the draw function. Used by j/k to scroll
+    // inside a tall message when no next/prev message exists.
+    pub last_visible_height: Option<usize>,
 }
 
 impl ConversationPane {
@@ -354,9 +385,7 @@ impl ConversationPane {
         pane.loading = true;
         pane.scroll = usize::MAX;
         pane.file_path = Some(file_path.to_path_buf());
-        pane.last_modified = std::fs::metadata(file_path)
-            .and_then(|m| m.modified())
-            .ok();
+        pane.last_modified = std::fs::metadata(file_path).and_then(|m| m.modified()).ok();
         pane
     }
 
@@ -377,6 +406,7 @@ impl ConversationPane {
         self.search_input.clear();
         self.search_matches.clear();
         self.search_current = 0;
+        self.last_visible_height = None;
         self.search_saved_scroll = None;
     }
 }
@@ -395,7 +425,6 @@ pub struct LoadedData {
 
 pub(crate) type LoadResult = Result<LoadedData, String>;
 
-#[allow(clippy::type_complexity)]
 pub struct AppState {
     pub needs_draw: bool,
     pub tab: Tab,
@@ -411,7 +440,41 @@ pub struct AppState {
     pub selected_day: usize,
     pub selected_session: usize,
     pub show_detail: bool,
+    /// When set, `draw_detail_popup` renders this session instead of the
+    /// daily-filter-driven `(selected_day, selected_session)` pair. Used by
+    /// the Live tab so detail can be inspected even when the session is
+    /// outside the active period/project filter.
+    pub session_detail_override: Option<crate::aggregator::SessionInfo>,
+    /// Live process metadata (PID, status, version) to append to the session
+    /// detail popup. Set alongside `session_detail_override` when the popup
+    /// is opened from the Live tab.
+    pub session_detail_live_extra: Option<(u32, String, String)>,
     pub show_help: bool,
+    /// Live sessions tab data — populated by `live_sessions_task` poller.
+    pub live_active: Vec<crate::infrastructure::live_sessions::LiveSession>,
+    pub live_paused: Vec<crate::infrastructure::live_sessions::LiveSession>,
+    pub live_selected: usize,
+    pub live_scroll: usize,
+    pub live_sessions_task: Option<
+        mpsc::Receiver<(
+            Vec<crate::infrastructure::live_sessions::LiveSession>,
+            Vec<crate::infrastructure::live_sessions::LiveSession>,
+        )>,
+    >,
+    pub live_last_update: Option<std::time::Instant>,
+    /// UTC time at which the current ccsight process started. Used by the
+    /// live snapshot polling thread to distinguish "previously alive,
+    /// inherited from a prior run" (entries with `last_seen < app_start_time`
+    /// → `⟳` candidates) from "alive then closed mid-run" (entries stamped
+    /// during this run → ordinary `⏸`). Set once at app boot and never
+    /// mutated afterwards.
+    pub app_start_time: chrono::DateTime<chrono::Utc>,
+    /// Per-project drilldown popup. Opened from the Projects detail popup
+    /// (panel 1) via Enter on the focused row. `project_detail_path` is the
+    /// raw project_name (matching `SessionInfo::project_name` for lookup).
+    pub show_project_detail: bool,
+    pub project_detail_path: String,
+    pub project_detail_scroll: usize,
     pub help_scroll: u16,
     pub show_conversation: bool,
     pub show_summary: bool,
@@ -429,7 +492,20 @@ pub struct AppState {
     pub cache_stats: Option<CacheStats>,
     pub dashboard_panel: usize,
     pub dashboard_scroll: [usize; 7],
+    /// Edge-triggered scroll offset for dashboard detail popups that have a
+    /// cursor concept (currently panel 1 / Projects). For panels without a
+    /// cursor, the equivalent scroll lives in `dashboard_scroll` directly
+    /// (where j/k just moves the viewport). For panels WITH a cursor, j/k
+    /// moves `dashboard_scroll` (= cursor) and `dashboard_viewport` adjusts
+    /// only when the cursor leaves the visible window — same pattern as the
+    /// MCP server detail and Vim's `scrolloff`.
+    pub dashboard_viewport: [usize; 7],
     pub show_dashboard_detail: bool,
+    /// Daily Activity detail popup (panel 5) view toggle: `false` = per-day
+    /// bars (the historical default), `true` = ISO-week aggregation. Toggled
+    /// by `w` inside the popup; persisted for the session so reopening keeps
+    /// the chosen mode.
+    pub activity_view_weekly: bool,
     /// Active section in Tools detail popup: 0=Tools (Built-in + MCP),
     /// 1=Skills, 2=Commands, 3=Subagents. Tools merges Built-in and MCP since
     /// both are tools the assistant calls; Subagents are dispatcher-tier meta-
@@ -495,6 +571,10 @@ pub struct AppState {
     /// doesn't keep the indexing indicator lit on every reload.
     pub last_index_build: Option<std::time::Instant>,
     pub data_reload_task: Option<mpsc::Receiver<LoadResult>>,
+    /// Result of the most recent `spawn_clipboard_write`. The main loop
+    /// polls this so a failure (no display server, no clipboard daemon)
+    /// can overwrite the optimistic "Copied" toast with an error message.
+    pub clipboard_task: Option<mpsc::Receiver<Result<(), String>>>,
     pub data_limit: usize,
     pub animation_frame: usize,
     pub retention_warning: Option<RetentionWarning>,
@@ -522,14 +602,27 @@ pub struct AppState {
     /// `(server_index, area)` where the index matches the sorted server list position.
     /// Clicking a recorded area toggles expansion and moves the cursor to that server.
     pub mcp_server_row_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Click areas for project rows in the Projects detail popup (Dashboard
+    /// panel 1). `(project_index, area)` where index is the sorted projects
+    /// list position. Click selects the row; second click (or Enter) opens
+    /// the per-project detail popup.
+    pub project_detail_row_areas: Vec<(usize, ratatui::layout::Rect)>,
     pub pane_areas: Vec<ratatui::layout::Rect>,
     pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
     pub insights_panel_areas: Vec<ratatui::layout::Rect>,
     pub session_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
+    /// Live-tab row hit-test data. `(inner_rect, scroll, active_count)` so
+    /// `handle_mouse_click` can translate row coords into a session index
+    /// across the two-section (Active / Paused) layout.
+    pub live_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
     pub breakdown_panel_area: Option<ratatui::layout::Rect>,
     pub summary_popup_area: Option<ratatui::layout::Rect>,
     pub active_popup_area: Option<ratatui::layout::Rect>,
     pub daily_header_area: Option<ratatui::layout::Rect>,
+    // Tab-bar trigger Rects. Populated by `draw_tabs` only, which is skipped
+    // in conv view — `draw()` MUST reset these before rendering the conv
+    // layout, otherwise stale Rects from the previous frame shadow widgets
+    // placed at the same coords (e.g. per-pane `[i]` buttons).
     pub filter_popup_area_trigger: Option<ratatui::layout::Rect>,
     pub project_popup_area_trigger: Option<ratatui::layout::Rect>,
     pub pin_view_trigger: Option<ratatui::layout::Rect>,
@@ -581,8 +674,20 @@ impl AppState {
             selected_day: 0,
             selected_session: 0,
             show_detail: false,
+            session_detail_override: None,
+            session_detail_live_extra: None,
             show_help: false,
             help_scroll: 0,
+            live_active: Vec::new(),
+            live_paused: Vec::new(),
+            live_selected: 0,
+            live_scroll: 0,
+            live_sessions_task: None,
+            live_last_update: None,
+            app_start_time: chrono::Utc::now(),
+            show_project_detail: false,
+            project_detail_path: String::new(),
+            project_detail_scroll: 0,
             show_conversation: false,
             show_summary: false,
             summary_content: String::new(),
@@ -599,6 +704,8 @@ impl AppState {
             cache_stats: None,
             dashboard_panel: 0,
             dashboard_scroll: [0; 7],
+            dashboard_viewport: [0; 7],
+            activity_view_weekly: false,
             tools_detail_section: 0,
             mcp_expanded_servers: std::collections::HashSet::new(),
             mcp_selected_server: 0,
@@ -630,6 +737,7 @@ impl AppState {
             last_data_update: None,
             last_index_build: None,
             data_reload_task: None,
+            clipboard_task: None,
             data_limit,
             animation_frame: 0,
             retention_warning: crate::infrastructure::check_cleanup_period(),
@@ -647,10 +755,12 @@ impl AppState {
             tools_detail_tab_areas: Vec::new(),
             tools_panel_category_areas: Vec::new(),
             mcp_server_row_areas: Vec::new(),
+            project_detail_row_areas: Vec::new(),
             pane_areas: Vec::new(),
             dashboard_panel_areas: Vec::new(),
             insights_panel_areas: Vec::new(),
             session_list_area: None,
+            live_list_area: None,
             breakdown_panel_area: None,
             summary_popup_area: None,
             active_popup_area: None,
@@ -773,11 +883,7 @@ impl AppState {
                     .into_iter()
                     .filter_map(|mut g| {
                         g.sessions.retain(|s| &s.project_name == project);
-                        if g.sessions.is_empty() {
-                            None
-                        } else {
-                            Some(g)
-                        }
+                        if g.sessions.is_empty() { None } else { Some(g) }
                     })
                     .collect();
             }
@@ -972,7 +1078,10 @@ impl AppState {
             .into_iter()
             .map(|(name, (tokens, date))| (name, tokens, date))
             .collect();
-        list.sort_by_key(|x| std::cmp::Reverse(x.1));
+        // Tiebreaker on name keeps tied-token projects stable across
+        // rebuilds; source is a HashMap so unordered tied values would
+        // otherwise shuffle.
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Pre-compute disambiguated labels: when two projects share a basename,
         // append the parent dir so panels can tell them apart.

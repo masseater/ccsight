@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{EntryType, LogEntry, Usage};
 use crate::infrastructure::{
-    get_file_modified_secs, get_file_size, Cache, CachedDailyStats, CachedFileStats,
-    CachedTokenStats,
+    Cache, CachedDailyStats, CachedFileStats, CachedTokenStats, get_file_modified_secs,
+    get_file_size,
 };
 use crate::parser::JsonlParser;
 
@@ -107,8 +107,20 @@ pub struct ProjectStats {
 pub struct TokenStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Sum of 5m + 1h cache writes. Kept as a single field so existing UI /
+    /// MCP / aggregation code that reads "cache creation tokens" stays
+    /// correct. Cost math uses the per-TTL split below.
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// 5-minute TTL portion of `cache_creation_tokens`. Billed at 1.25x
+    /// base input. Default 0 lets old cache files deserialize cleanly.
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    /// 1-hour TTL portion of `cache_creation_tokens`. Billed at 2x base
+    /// input. Claude subscription users (Pro/Max/Team) get this TTL by
+    /// default, so on real data this is typically the larger half.
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
 }
 
 impl TokenStats {
@@ -125,6 +137,15 @@ impl TokenStats {
         self.output_tokens += usage.output_tokens;
         self.cache_creation_tokens += usage.cache_creation_input_tokens;
         self.cache_read_tokens += usage.cache_read_input_tokens;
+        if let Some(ref cc) = usage.cache_creation {
+            self.cache_creation_5m_tokens += cc.ephemeral_5m_input_tokens;
+            self.cache_creation_1h_tokens += cc.ephemeral_1h_input_tokens;
+        } else {
+            // JSONL without the structured `cache_creation` breakdown:
+            // treat the flat aggregate as 5m TTL (the Anthropic API
+            // default). Build flag, not a time question.
+            self.cache_creation_5m_tokens += usage.cache_creation_input_tokens;
+        }
     }
 }
 
@@ -136,6 +157,8 @@ struct DailyStats {
     last_timestamp: Option<DateTime<Utc>>,
     input_tokens: u64,
     output_tokens: u64,
+    user_msgs: u64,
+    assistant_msgs: u64,
     tokens_by_model: HashMap<String, TokenStats>,
     hourly_activity: HashMap<u8, u64>,
     hourly_work_activity: HashMap<u8, u64>,
@@ -149,7 +172,13 @@ struct FileStats {
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_tokens: u64,
+    cache_creation_5m_tokens: u64,
+    cache_creation_1h_tokens: u64,
     cache_read_tokens: u64,
+    /// Hashes that this file uniquely contributed (i.e. were NOT already in
+    /// the global_seen set when this file was parsed). Saved to cache so
+    /// next run's pre-load can rebuild global_seen without re-parsing.
+    unique_hashes: Vec<String>,
     tool_usage: HashMap<String, usize>,
     model_usage: HashMap<String, usize>,
     model_tokens: HashMap<String, TokenStats>,
@@ -161,6 +190,8 @@ struct FileStats {
     summary: Option<String>,
     custom_title: Option<String>,
     ai_title: Option<String>,
+    last_user_message: Option<String>,
+    first_user_message: Option<String>,
     model: Option<String>,
     is_subagent: bool,
     daily_stats: HashMap<NaiveDate, DailyStats>,
@@ -196,8 +227,7 @@ impl StatsAggregator {
         // Collect MCP servers touched in this session-day. Using a local set so a session
         // that hits two tools from the same server increments `mcp_server_sessions` only
         // once.
-        let mut servers_seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut servers_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for key in keys {
             if key.starts_with("skill:") {
                 used_skill = true;
@@ -230,7 +260,6 @@ impl StatsAggregator {
         }
     }
 
-
     pub fn aggregate_with_shared_cache(files: &[PathBuf], mut cache: Cache) -> (Stats, CacheStats) {
         let mut stats = Stats::default();
 
@@ -239,14 +268,35 @@ impl StatsAggregator {
             parsed_files: 0,
         };
 
+        // Pre-load global-dedup set from cache. Mirrors the grouping.rs
+        // pass: same (msg_id, requestId) across multiple JSONLs must bill
+        // once. Restrict pre-load to STILL-VALID cache entries — a stale
+        // entry's hashes belong to a file that is about to be re-parsed
+        // and must be free to re-credit them.
+        let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for file in files {
             if cache.is_valid(file)
-                && let Some(cached) = cache.get(file) {
-                    let project_name = cached.project_name.clone();
-                    Self::merge_cached_stats(&mut stats, cached, &project_name);
-                    cache_stats.cached_files += 1;
-                    continue;
+                && let Some(cached) = cache.get(file)
+            {
+                for h in &cached.unique_hashes {
+                    global_seen.insert(h.clone());
                 }
+            }
+        }
+
+        // Sorted iteration for deterministic hash attribution across runs.
+        let mut sorted_files: Vec<&PathBuf> = files.iter().collect();
+        sorted_files.sort();
+
+        for file in &sorted_files {
+            if cache.is_valid(file)
+                && let Some(cached) = cache.get(file)
+            {
+                let project_name = cached.project_name.clone();
+                Self::merge_cached_stats(&mut stats, cached, &project_name);
+                cache_stats.cached_files += 1;
+                continue;
+            }
 
             if let Ok(entries) = JsonlParser::parse_file(file) {
                 // For Cowork audit.jsonl the in-stream `cwd` is meaningless
@@ -258,8 +308,13 @@ impl StatsAggregator {
                     file,
                     Self::extract_project_name_from_entries(&entries),
                 );
-                let file_stats =
-                    Self::aggregate_file_entries(&mut stats, &entries, &project_name, file);
+                let file_stats = Self::aggregate_file_entries(
+                    &mut stats,
+                    &entries,
+                    &project_name,
+                    file,
+                    &mut global_seen,
+                );
 
                 let model_tokens_cached: HashMap<String, CachedTokenStats> = file_stats
                     .model_tokens
@@ -289,6 +344,8 @@ impl StatsAggregator {
                                 tool_usage: ds.tool_usage,
                                 language_usage: ds.language_usage,
                                 extension_usage: ds.extension_usage,
+                                user_msgs: ds.user_msgs,
+                                assistant_msgs: ds.assistant_msgs,
                             },
                         )
                     })
@@ -301,7 +358,10 @@ impl StatsAggregator {
                     input_tokens: file_stats.input_tokens,
                     output_tokens: file_stats.output_tokens,
                     cache_creation_tokens: file_stats.cache_creation_tokens,
+                    cache_creation_5m_tokens: file_stats.cache_creation_5m_tokens,
+                    cache_creation_1h_tokens: file_stats.cache_creation_1h_tokens,
                     cache_read_tokens: file_stats.cache_read_tokens,
+                    unique_hashes: file_stats.unique_hashes,
                     tool_usage: file_stats.tool_usage,
                     model_usage: file_stats.model_usage,
                     model_tokens: model_tokens_cached,
@@ -314,6 +374,8 @@ impl StatsAggregator {
                     summary: file_stats.summary.clone(),
                     custom_title: file_stats.custom_title.clone(),
                     ai_title: file_stats.ai_title.clone(),
+                    last_user_message: file_stats.last_user_message.clone(),
+                    first_user_message: file_stats.first_user_message.clone(),
                     model: file_stats.model,
                     is_subagent: file_stats.is_subagent,
                     daily_stats: daily_stats_cached,
@@ -349,6 +411,8 @@ impl StatsAggregator {
         stats.total_tokens.output_tokens += cached.output_tokens;
         stats.total_tokens.cache_creation_tokens += cached.cache_creation_tokens;
         stats.total_tokens.cache_read_tokens += cached.cache_read_tokens;
+        stats.total_tokens.cache_creation_5m_tokens += cached.cache_creation_5m_tokens;
+        stats.total_tokens.cache_creation_1h_tokens += cached.cache_creation_1h_tokens;
 
         for (tool, count) in &cached.tool_usage {
             *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
@@ -373,6 +437,8 @@ impl StatsAggregator {
             model_stats.output_tokens += cached_ts.output_tokens;
             model_stats.cache_creation_tokens += cached_ts.cache_creation_tokens;
             model_stats.cache_read_tokens += cached_ts.cache_read_tokens;
+            model_stats.cache_creation_5m_tokens += cached_ts.cache_creation_5m_tokens;
+            model_stats.cache_creation_1h_tokens += cached_ts.cache_creation_1h_tokens;
         }
 
         let session_tokens = cached.input_tokens
@@ -381,7 +447,12 @@ impl StatsAggregator {
             + cached.cache_read_tokens;
         let session_work_tokens = cached.input_tokens + cached.output_tokens;
 
-        if let Some(name) = project_name {
+        // Subagent sessions are excluded so the Projects panel's count /
+        // tokens reads as "user-driven activity" — matching the cost number
+        // (computed via `user_sessions()`) and the filtered-rebuild path.
+        if let Some(name) = project_name
+            && !cached.is_subagent
+        {
             let project = stats.project_stats.entry(name.clone()).or_default();
             project.sessions += 1;
             project.tokens += session_tokens;
@@ -443,13 +514,15 @@ impl StatsAggregator {
                     branch_stats.total_duration_mins += duration;
                 }
                 if let Some(ts) = cached.first_timestamp
-                    && (branch_stats.first_seen.is_none() || Some(ts) < branch_stats.first_seen) {
-                        branch_stats.first_seen = Some(ts);
-                    }
+                    && (branch_stats.first_seen.is_none() || Some(ts) < branch_stats.first_seen)
+                {
+                    branch_stats.first_seen = Some(ts);
+                }
                 if let Some(ts) = cached.last_timestamp
-                    && (branch_stats.last_seen.is_none() || Some(ts) > branch_stats.last_seen) {
-                        branch_stats.last_seen = Some(ts);
-                    }
+                    && (branch_stats.last_seen.is_none() || Some(ts) > branch_stats.last_seen)
+                {
+                    branch_stats.last_seen = Some(ts);
+                }
             }
         }
     }
@@ -459,6 +532,7 @@ impl StatsAggregator {
         entries: &[LogEntry],
         project_name: &Option<String>,
         file: &Path,
+        global_seen: &mut std::collections::HashSet<String>,
     ) -> FileStats {
         let mut file_stats = FileStats::default();
 
@@ -494,7 +568,9 @@ impl StatsAggregator {
                 entries
                     .iter()
                     .rev()
-                    .filter(|e| e.entry_type == EntryType::User || e.entry_type == EntryType::System)
+                    .filter(|e| {
+                        e.entry_type == EntryType::User || e.entry_type == EntryType::System
+                    })
                     .find_map(|e| {
                         let text = e.message.as_ref()?.content.extract_text();
                         let text = text.trim();
@@ -521,9 +597,43 @@ impl StatsAggregator {
             .rfind(|e| e.entry_type == EntryType::AiTitle)
             .and_then(|e| e.ai_title.clone());
 
+        file_stats.last_user_message =
+            crate::aggregator::grouping::extract_last_user_message_for_cache(entries);
+        file_stats.first_user_message =
+            crate::aggregator::grouping::extract_first_user_message_for_cache(entries);
+
         file_stats.model = super::extract_session_model(entries);
 
         for entry in entries {
+            // Decide once per entry whether its tokens are already credited
+            // to another file (global dedup). The two sub-aggregations
+            // below (per-day daily_stats / global stats) both consult this
+            // single decision — without sharing, one branch could skip
+            // while the other adds, producing the divergence between TUI
+            // Overview (uses global stats) and CLI --daily (reads
+            // daily_stats via the grouper).
+            let skip_tokens = if entry.entry_type == EntryType::Assistant
+                && entry
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.usage.as_ref())
+                    .is_some()
+            {
+                match crate::parser::JsonlParser::entry_hash(entry) {
+                    Some(hash) => {
+                        if !global_seen.insert(hash.clone()) {
+                            true
+                        } else {
+                            file_stats.unique_hashes.push(hash);
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+
             if let Some(ts) = entry.timestamp {
                 let date = ts.with_timezone(&Local).date_naive();
                 let daily = file_stats.daily_stats.entry(date).or_default();
@@ -537,61 +647,91 @@ impl StatsAggregator {
 
                 if entry.entry_type == EntryType::Assistant
                     && let Some(ref message) = entry.message
-                        && let Some(ref usage) = message.usage {
-                            let model_key = message
-                                .model
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            if !super::is_real_model(&model_key) {
-                                continue;
-                            }
-                            daily.input_tokens += usage.input_tokens;
-                            daily.output_tokens += usage.output_tokens;
+                    && let Some(ref usage) = message.usage
+                {
+                    let model_key = message
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    // Filter synthetic / empty-model entries from the
+                    // entry stream entirely. `continue` skips Block B
+                    // below too, preserving the prior semantics that
+                    // these never reach model_usage / tool_usage.
+                    if !super::is_real_model(&model_key) {
+                        continue;
+                    }
+                    // Deduped entries: token math skipped here, but
+                    // Block B's tool/model_usage still runs.
+                    if !skip_tokens {
+                        daily.input_tokens += usage.input_tokens;
+                        daily.output_tokens += usage.output_tokens;
 
-                            let daily_model = daily.tokens_by_model.entry(model_key).or_default();
-                            daily_model.input_tokens += usage.input_tokens;
-                            daily_model.output_tokens += usage.output_tokens;
-                            daily_model.cache_creation_tokens += usage.cache_creation_input_tokens;
-                            daily_model.cache_read_tokens += usage.cache_read_input_tokens;
+                        let daily_model = daily.tokens_by_model.entry(model_key).or_default();
+                        daily_model.add(usage);
 
-                            let local_ts = ts.with_timezone(&Local);
-                            let hour = local_ts.hour() as u8;
-                            let weekday = local_ts.weekday().num_days_from_monday() as u8;
-                            let tokens = usage.input_tokens
-                                + usage.output_tokens
-                                + usage.cache_creation_input_tokens
-                                + usage.cache_read_input_tokens;
-                            let work_tokens = usage.input_tokens + usage.output_tokens;
+                        let local_ts = ts.with_timezone(&Local);
+                        let hour = local_ts.hour() as u8;
+                        let weekday = local_ts.weekday().num_days_from_monday() as u8;
+                        let tokens = usage.input_tokens
+                            + usage.output_tokens
+                            + usage.cache_creation_input_tokens
+                            + usage.cache_read_input_tokens;
+                        let work_tokens = usage.input_tokens + usage.output_tokens;
 
-                            *daily.hourly_activity.entry(hour).or_insert(0) += tokens;
-                            *daily.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
-                            *file_stats.hourly_activity.entry(hour).or_insert(0) += tokens;
-                            *file_stats.hourly_work_activity.entry(hour).or_insert(0) +=
-                                work_tokens;
-                            *file_stats.weekday_activity.entry(weekday).or_insert(0) += tokens;
-                            *file_stats.weekday_work_activity.entry(weekday).or_insert(0) +=
-                                work_tokens;
-                            *stats.hourly_activity.entry(hour).or_insert(0) += tokens;
-                            *stats.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
-                            *stats
-                                .weekday_activity
-                                .entry(local_ts.weekday())
-                                .or_insert(0) += tokens;
-                            *stats
-                                .weekday_work_activity
-                                .entry(local_ts.weekday())
-                                .or_insert(0) += work_tokens;
-                        }
+                        *daily.hourly_activity.entry(hour).or_insert(0) += tokens;
+                        *daily.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
+                        *file_stats.hourly_activity.entry(hour).or_insert(0) += tokens;
+                        *file_stats.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
+                        *file_stats.weekday_activity.entry(weekday).or_insert(0) += tokens;
+                        *file_stats.weekday_work_activity.entry(weekday).or_insert(0) +=
+                            work_tokens;
+                        *stats.hourly_activity.entry(hour).or_insert(0) += tokens;
+                        *stats.hourly_work_activity.entry(hour).or_insert(0) += work_tokens;
+                        *stats
+                            .weekday_activity
+                            .entry(local_ts.weekday())
+                            .or_insert(0) += tokens;
+                        *stats
+                            .weekday_work_activity
+                            .entry(local_ts.weekday())
+                            .or_insert(0) += work_tokens;
+                    }
+                }
             }
 
             if let Some(ref message) = entry.message {
                 if entry.entry_type == EntryType::Assistant {
                     if let Some(ref usage) = message.usage {
+                        if skip_tokens {
+                            // tool_usage / model_usage still need this
+                            // entry, but token totals must not double-count.
+                            if let Some(ref model) = message.model {
+                                *stats.model_usage.entry(model.clone()).or_insert(0) += 1;
+                                *file_stats.model_usage.entry(model.clone()).or_insert(0) += 1;
+                            }
+                            let daily_date = entry
+                                .timestamp
+                                .map(|ts| ts.with_timezone(&Local).date_naive());
+                            Self::count_tool_usage_with_file_stats(
+                                stats,
+                                &mut file_stats,
+                                daily_date,
+                                message,
+                            );
+                            continue;
+                        }
                         stats.total_tokens.add(usage);
                         file_stats.input_tokens += usage.input_tokens;
                         file_stats.output_tokens += usage.output_tokens;
                         file_stats.cache_creation_tokens += usage.cache_creation_input_tokens;
                         file_stats.cache_read_tokens += usage.cache_read_input_tokens;
+                        if let Some(ref cc) = usage.cache_creation {
+                            file_stats.cache_creation_5m_tokens += cc.ephemeral_5m_input_tokens;
+                            file_stats.cache_creation_1h_tokens += cc.ephemeral_1h_input_tokens;
+                        } else {
+                            file_stats.cache_creation_5m_tokens +=
+                                usage.cache_creation_input_tokens;
+                        }
 
                         if let Some(ref model) = message.model {
                             let model_stats = stats.model_tokens.entry(model.clone()).or_default();
@@ -621,7 +761,12 @@ impl StatsAggregator {
             + file_stats.cache_read_tokens;
         let session_work_tokens = file_stats.input_tokens + file_stats.output_tokens;
 
-        if let Some(name) = project_name {
+        // See the matching merge_cached_stats block: subagent sessions are
+        // excluded so `project_stats` stays consistent with the filtered-
+        // rebuild path and with how cost is computed downstream.
+        if let Some(name) = project_name
+            && !file_stats.is_subagent
+        {
             let project = stats.project_stats.entry(name.clone()).or_default();
             project.sessions += 1;
             project.tokens += session_tokens;
@@ -664,6 +809,11 @@ impl StatsAggregator {
         // user messages for `<command-name>/foo</command-name>` and bump the
         // `command:foo` key so commands show up in tool_usage stats.
         if matches!(message.role, crate::domain::Role::User) {
+            if let Some(date) = daily_date
+                && let Some(d) = file_stats.daily_stats.get_mut(&date)
+            {
+                d.user_msgs += 1;
+            }
             let text = message.content.extract_text();
             for cmd in extract_command_names(&text) {
                 let key = format!("command:{cmd}");
@@ -675,6 +825,11 @@ impl StatsAggregator {
                     *d.tool_usage.entry(key).or_insert(0) += 1;
                 }
             }
+        } else if matches!(message.role, crate::domain::Role::Assistant)
+            && let Some(date) = daily_date
+            && let Some(d) = file_stats.daily_stats.get_mut(&date)
+        {
+            d.assistant_msgs += 1;
         }
 
         if let MessageContent::Blocks(ref blocks) = message.content {
@@ -713,15 +868,16 @@ impl StatsAggregator {
                         }
 
                         if let Some(date) = daily_date
-                            && let Some(d) = file_stats.daily_stats.get_mut(&date) {
-                                *d.tool_usage.entry(key).or_insert(0) += 1;
-                                for lang in &langs {
-                                    *d.language_usage.entry((*lang).to_string()).or_insert(0) += 1;
-                                }
-                                for ext in exts {
-                                    *d.extension_usage.entry(ext).or_insert(0) += 1;
-                                }
+                            && let Some(d) = file_stats.daily_stats.get_mut(&date)
+                        {
+                            *d.tool_usage.entry(key).or_insert(0) += 1;
+                            for lang in &langs {
+                                *d.language_usage.entry((*lang).to_string()).or_insert(0) += 1;
                             }
+                            for ext in exts {
+                                *d.extension_usage.entry(ext).or_insert(0) += 1;
+                            }
+                        }
                     }
                     ContentBlock::ToolResult { is_error, .. } => {
                         if *is_error {
@@ -770,7 +926,6 @@ impl StatsAggregator {
         }
     }
 
-
     pub(crate) fn extract_extensions_from_tool_input(
         tool_name: &str,
         input: &serde_json::Value,
@@ -812,7 +967,8 @@ impl StatsAggregator {
 
     fn extract_session_date(entries: &[LogEntry]) -> Option<NaiveDate> {
         entries
-            .iter().find_map(|e| e.timestamp)
+            .iter()
+            .find_map(|e| e.timestamp)
             .map(|ts| ts.with_timezone(&Local).date_naive())
     }
 }
@@ -828,6 +984,8 @@ mod tests {
             output_tokens: 500,
             cache_creation_tokens: 200,
             cache_read_tokens: 300,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         assert_eq!(stats.work_tokens(), 1500);
     }
@@ -839,6 +997,8 @@ mod tests {
             output_tokens: 500,
             cache_creation_tokens: 200,
             cache_read_tokens: 300,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         assert_eq!(stats.all_tokens(), 2000);
     }
@@ -850,6 +1010,8 @@ mod tests {
             output_tokens: 500,
             cache_creation_tokens: 200,
             cache_read_tokens: 300,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let cache_tokens = stats.cache_creation_tokens + stats.cache_read_tokens;
         assert_eq!(stats.all_tokens(), stats.work_tokens() + cache_tokens);
@@ -864,6 +1026,7 @@ mod tests {
             cache_creation_input_tokens: 20,
             cache_read_input_tokens: 30,
             service_tier: None,
+            cache_creation: None,
         };
         stats.add(&usage);
 
@@ -883,6 +1046,7 @@ mod tests {
             cache_creation_input_tokens: 20,
             cache_read_input_tokens: 30,
             service_tier: None,
+            cache_creation: None,
         };
         let usage2 = Usage {
             input_tokens: 200,
@@ -890,6 +1054,7 @@ mod tests {
             cache_creation_input_tokens: 40,
             cache_read_input_tokens: 60,
             service_tier: None,
+            cache_creation: None,
         };
         stats.add(&usage1);
         stats.add(&usage2);
@@ -1218,10 +1383,7 @@ mod tests {
     fn test_add_session_adoption_mcp_prefix_match() {
         // Both standard `mcp__server__tool` and plugin `mcp__plugin_*` are detected.
         let mut stats = Stats::default();
-        let day_keys = keys(&[
-            "mcp__server1__action",
-            "mcp__plugin_orgA_serverB__action",
-        ]);
+        let day_keys = keys(&["mcp__server1__action", "mcp__plugin_orgA_serverB__action"]);
         StatsAggregator::add_session_adoption(&mut stats, day_keys.iter());
 
         assert_eq!(stats.sessions_using_mcp, 1);

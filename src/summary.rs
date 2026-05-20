@@ -16,37 +16,43 @@ fn detect_user_language() -> String {
     return CACHED.get_or_init(detect_user_language_inner).clone();
 
     fn detect_user_language_inner() -> String {
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        let settings_path = home.join(".claude").join("settings.json");
-        if let Ok(content) = std::fs::read_to_string(&settings_path)
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let settings_path = home.join(".claude").join("settings.json");
+            if let Ok(content) = std::fs::read_to_string(&settings_path)
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
                 && let Some(lang) = json.get("language").and_then(|v| v.as_str())
-                    && !lang.is_empty() {
-                        return lang.to_string();
-                    }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("defaults")
-            .args(["read", "NSGlobalDomain", "AppleLanguages"])
-            .output()
+                && !lang.is_empty()
+            {
+                return lang.to_string();
+            }
+        }
+        #[cfg(target_os = "macos")]
         {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                let trimmed = line.trim().trim_matches(|c| c == '"' || c == ',');
-                if !trimmed.is_empty() && !trimmed.starts_with('(') && !trimmed.starts_with(')') {
-                    return trimmed.to_string();
+            if let Ok(output) = std::process::Command::new("defaults")
+                .args(["read", "NSGlobalDomain", "AppleLanguages"])
+                .output()
+            {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    let trimmed = line.trim().trim_matches(|c| c == '"' || c == ',');
+                    if !trimmed.is_empty() && !trimmed.starts_with('(') && !trimmed.starts_with(')')
+                    {
+                        return trimmed.to_string();
+                    }
                 }
             }
         }
-    }
-    std::env::var("LANG")
-        .ok()
-        .and_then(|lang| {
-            let code = lang.split('.').next()?;
-            if code.is_empty() { None } else { Some(code.to_string()) }
-        })
-        .unwrap_or_else(|| "en_US".to_string())
+        std::env::var("LANG")
+            .ok()
+            .and_then(|lang| {
+                let code = lang.split('.').next()?;
+                if code.is_empty() {
+                    None
+                } else {
+                    Some(code.to_string())
+                }
+            })
+            .unwrap_or_else(|| "en_US".to_string())
     }
 }
 
@@ -65,9 +71,10 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
 
     if use_cache
         && let Ok(cache) = Cache::load()
-            && let Some(cached) = cache.get_day_summary(&group.date) {
-                return format!("(cached)\n\n{cached}");
-            }
+        && let Some(cached) = cache.get_day_summary(&group.date)
+    {
+        return format!("(cached)\n\n{cached}");
+    }
 
     let sessions: Vec<_> = group.user_sessions().collect();
     if sessions.is_empty() {
@@ -115,7 +122,11 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
         let session_cost: f64 = session
             .day_tokens_by_model
             .iter()
-            .map(|(model, tokens)| calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0))
+            .map(|(model, tokens)| {
+                calculator
+                    .calculate_cost(tokens, Some(model))
+                    .unwrap_or(0.0)
+            })
             .sum();
         total_cost += session_cost;
 
@@ -133,14 +144,10 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
             *lang_counts.entry(lang.clone()).or_default() += count;
         }
 
-        if earliest_start.is_none()
-            || Some(session.day_first_timestamp) < earliest_start
-        {
+        if earliest_start.is_none() || Some(session.day_first_timestamp) < earliest_start {
             earliest_start = Some(session.day_first_timestamp);
         }
-        if latest_end.is_none()
-            || Some(session.day_last_timestamp) > latest_end
-        {
+        if latest_end.is_none() || Some(session.day_last_timestamp) > latest_end {
             latest_end = Some(session.day_last_timestamp);
         }
     }
@@ -212,7 +219,8 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
             branch
         ));
 
-        let (requests, files, tools) = extract_session_details_for_date(&session.file_path, Some(group.date));
+        let (requests, files, tools) =
+            extract_session_details_for_date(&session.file_path, Some(group.date));
 
         if !requests.is_empty() {
             context.push_str("- User requests:\n");
@@ -239,7 +247,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
 
         if !tools.is_empty() {
             let mut sorted_tools: Vec<_> = tools.iter().collect();
-            sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
+            sorted_tools.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             let top_tools: Vec<_> = sorted_tools
                 .iter()
                 .take(5)
@@ -251,7 +259,11 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
 
     context.push_str("\n## Cost by Project:\n");
     let mut sorted_projects: Vec<_> = project_metrics.iter().collect();
-    sorted_projects.sort_by(|a, b| b.1 .2.partial_cmp(&a.1 .2).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_projects.sort_by(|a, b| {
+        b.1.2
+            .partial_cmp(&a.1.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for (name, (sess, tokens, cost)) in &sorted_projects {
         let short = crate::ui::shorten_project(name);
         context.push_str(&format!(
@@ -267,15 +279,23 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
         hours.sort_by_key(|&(h, _)| *h);
         let peak_hour = hours.iter().max_by_key(|&(_, t)| **t).map(|(h, _)| **h);
         for (hour, tokens) in &hours {
-            let peak = if peak_hour == Some(**hour) { " (peak)" } else { "" };
-            context.push_str(&format!("- {:02}: {}{peak}\n", hour, crate::format_number(**tokens)));
+            let peak = if peak_hour == Some(**hour) {
+                " (peak)"
+            } else {
+                ""
+            };
+            context.push_str(&format!(
+                "- {:02}: {}{peak}\n",
+                hour,
+                crate::format_number(**tokens)
+            ));
         }
     }
 
     if !lang_counts.is_empty() {
         context.push_str("\n## Languages:\n");
         let mut langs: Vec<_> = lang_counts.iter().collect();
-        langs.sort_by(|a, b| b.1.cmp(a.1));
+        langs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (lang, count) in langs.iter().take(10) {
             context.push_str(&format!("- {lang}: {count}\n"));
         }
@@ -284,7 +304,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
     if !all_tools.is_empty() {
         context.push_str("\n## Tool Usage:\n");
         let mut sorted_tools: Vec<_> = all_tools.iter().collect();
-        sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
+        sorted_tools.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (tool, count) in sorted_tools.iter().take(15) {
             context.push_str(&format!("- {tool}: {count}x\n"));
         }
@@ -368,11 +388,13 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
         Err(e) => format!("Failed to run claude: {e}"),
     };
 
-    if !result.starts_with("Error") && !result.starts_with("Failed")
-        && let Ok(mut cache) = Cache::load() {
-            cache.set_day_summary(&group.date, result.clone());
-            let _ = cache.save();
-        }
+    if !result.starts_with("Error")
+        && !result.starts_with("Failed")
+        && let Ok(mut cache) = Cache::load()
+    {
+        cache.set_day_summary(&group.date, result.clone());
+        let _ = cache.save();
+    }
 
     result
 }
@@ -433,12 +455,13 @@ pub fn extract_session_details_for_date(
                 *tool_counts.entry(tool_name.clone()).or_insert(0) += 1;
 
                 if let Some(path) = file_path
-                    && matches!(tool_name.as_str(), "Edit" | "Write" | "Read") {
-                        let short_path = path.split('/').next_back().unwrap_or(&path).to_string();
-                        if !files_modified.contains(&short_path) {
-                            files_modified.push(short_path);
-                        }
+                    && matches!(tool_name.as_str(), "Edit" | "Write" | "Read")
+                {
+                    let short_path = path.split('/').next_back().unwrap_or(&path).to_string();
+                    if !files_modified.contains(&short_path) {
+                        files_modified.push(short_path);
                     }
+                }
             }
         }
     }
@@ -521,7 +544,10 @@ mod tests {
         ]);
 
         let (requests, _files, _tools) = extract_session_details(tmp.path());
-        assert!(requests.is_empty(), "short messages (<=10 chars) should be skipped");
+        assert!(
+            requests.is_empty(),
+            "short messages (<=10 chars) should be skipped"
+        );
     }
 
     #[test]
@@ -577,7 +603,7 @@ mod tests {
             }),
         ]);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(); // lint-ok: date-literal
         let (requests, _files, _tools) = extract_session_details_for_date(tmp.path(), Some(date));
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("first day"));
@@ -658,9 +684,10 @@ fn generate_session_summary_internal(
 
     if use_cache
         && let Ok(cache) = Cache::load()
-            && let Some(cached) = cache.get_session_summary(&cache_key) {
-                return format!("(cached)\n\n{cached}");
-            }
+        && let Some(cached) = cache.get_session_summary(&cache_key)
+    {
+        return format!("(cached)\n\n{cached}");
+    }
 
     let (user_requests, files_modified, tool_counts) =
         extract_session_details_for_date(&session.file_path, filter_date);
@@ -698,7 +725,7 @@ fn generate_session_summary_internal(
     if !tool_counts.is_empty() {
         context.push_str("\n## Tools Used:\n");
         let mut sorted_tools: Vec<_> = tool_counts.iter().collect();
-        sorted_tools.sort_by(|a, b| b.1.cmp(a.1));
+        sorted_tools.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         for (tool, count) in sorted_tools.iter().take(10) {
             context.push_str(&format!("- {tool}: {count}x\n"));
         }
@@ -753,11 +780,13 @@ fn generate_session_summary_internal(
         Err(e) => format!("Failed to run claude: {e}"),
     };
 
-    if !result.starts_with("Error") && !result.starts_with("Failed")
-        && let Ok(mut cache) = Cache::load() {
-            cache.set_session_summary(&cache_key, result.clone());
-            let _ = cache.save();
-        }
+    if !result.starts_with("Error")
+        && !result.starts_with("Failed")
+        && let Ok(mut cache) = Cache::load()
+    {
+        cache.set_session_summary(&cache_key, result.clone());
+        let _ = cache.save();
+    }
 
     result
 }
@@ -887,8 +916,8 @@ pub(crate) fn update_jsonl_summary(
         .open(file_path)
         .map_err(|e| format!("Failed to open file for append: {e}"))?;
 
-    let json_str = serde_json::to_string(&new_entry)
-        .map_err(|e| format!("JSON serialization error: {e}"))?;
+    let json_str =
+        serde_json::to_string(&new_entry).map_err(|e| format!("JSON serialization error: {e}"))?;
     writeln!(file, "{json_str}").map_err(|e| format!("Write error: {e}"))?;
 
     Ok(())

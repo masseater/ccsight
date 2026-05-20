@@ -12,7 +12,7 @@ use std::thread;
 
 use crate::aggregator::{DailyGroup, SessionInfo};
 use crate::state::SummaryType;
-use crate::{summary, AppState};
+use crate::{AppState, summary};
 
 /// Write `text` to the system clipboard on a detached background thread.
 ///
@@ -22,32 +22,33 @@ use crate::{summary, AppState};
 /// on the event loop thread freezes the entire UI for that duration, and
 /// because `EnableMouseCapture` is still in effect, the surrounding terminal
 /// (e.g. a zellij tab hosting ccsight) loses mouse input until ccsight is
-/// killed. Detaching the write keeps the loop responsive; failure is
-/// swallowed silently because the optimistic toast has already been shown.
-pub(crate) fn spawn_clipboard_write(text: String) {
+/// killed. Detaching the write keeps the loop responsive.
+///
+/// Returns a `Receiver<Result<(), String>>` so the caller can poll the
+/// outcome and overwrite the optimistic "Copied" toast with an error
+/// message if the clipboard handle couldn't be acquired or `set_text`
+/// failed (e.g. headless / no display server / clipboard daemon down).
+pub(crate) fn spawn_clipboard_write(text: String) -> mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(&text);
-        }
+        let result = match arboard::Clipboard::new() {
+            Ok(mut clipboard) => clipboard.set_text(&text).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(result);
     });
+    rx
 }
 
 /// Spawn an AI session-summary task (generate or regenerate) and stash the
 /// receiver in `state.summary_task`. Also flips the `generating_summary` /
 /// `show_summary` / `summary_type` UI flags so the popup is shown immediately.
-pub(crate) fn start_session_summary(
-    state: &mut AppState,
-    session: SessionInfo,
-    regenerate: bool,
-) {
+pub(crate) fn start_session_summary(state: &mut AppState, session: SessionInfo, regenerate: bool) {
     state.generating_summary = true;
     state.show_summary = true;
     state.show_detail = false;
     state.summary_type = Some(SummaryType::Session(Box::new(session.clone())));
-    let summary_date = state
-        .daily_groups
-        .get(state.selected_day)
-        .map(|g| g.date);
+    let summary_date = state.daily_groups.get(state.selected_day).map(|g| g.date);
     let (tx, rx) = mpsc::channel();
     state.summary_task = Some(rx);
     thread::spawn(move || {
@@ -62,11 +63,7 @@ pub(crate) fn start_session_summary(
 
 /// Spawn an AI day-summary task (generate or regenerate). Same UI-flag side
 /// effects as [`start_session_summary`] but for `SummaryType::Day`.
-pub(crate) fn start_day_summary(
-    state: &mut AppState,
-    group: DailyGroup,
-    regenerate: bool,
-) {
+pub(crate) fn start_day_summary(state: &mut AppState, group: DailyGroup, regenerate: bool) {
     state.generating_summary = true;
     state.show_summary = true;
     state.show_detail = false;

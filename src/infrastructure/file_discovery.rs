@@ -52,8 +52,13 @@ impl FileDiscovery {
 
         let claude_projects = home.join(".claude/projects");
 
+        // `**/*.jsonl` (globstar) reaches sessions nested under per-project
+        // subdirs — Claude Code stores subagent transcripts at
+        // `~/.claude/projects/<project>/<session>/subagents/agent-*.jsonl`.
+        // A single-level `*/*.jsonl` pattern silently skips them, which
+        // can materially undercount tokens / cost for heavy subagent users.
         let mut files: Vec<PathBuf> = if claude_projects.exists() {
-            let pattern = claude_projects.join("*/*.jsonl");
+            let pattern = claude_projects.join("**/*.jsonl");
             let pattern_str = pattern.to_string_lossy();
             glob(&pattern_str)?
                 .filter_map(std::result::Result::ok)

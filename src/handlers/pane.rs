@@ -7,7 +7,7 @@ use std::sync::mpsc;
 
 use crate::aggregator::DailyGroup;
 use crate::state::{ConvListMode, ConversationPane, MAX_PANES};
-use crate::{ui, AppState, ConversationMessage};
+use crate::{AppState, ConversationMessage, ui};
 
 pub(crate) fn spawn_load_conversation(
     file_path: &std::path::Path,
@@ -24,9 +24,7 @@ pub(crate) fn spawn_load_conversation(
 /// Owned clone of the user-session currently highlighted in the Daily tab —
 /// the value most "summary" / "regen" key bindings need. Returns `None` if
 /// the selection points outside the visible (subagent-filtered) list.
-pub(crate) fn current_selected_session(
-    state: &AppState,
-) -> Option<crate::aggregator::SessionInfo> {
+pub(crate) fn current_selected_session(state: &AppState) -> Option<crate::aggregator::SessionInfo> {
     state
         .daily_groups
         .get(state.selected_day)
@@ -65,6 +63,17 @@ pub(crate) fn get_conv_session_file(state: &AppState, idx: usize) -> Option<std:
             .flat_map(DailyGroup::user_sessions)
             .nth(idx)
             .map(|s| s.file_path.clone()),
+        ConvListMode::Live => {
+            // Same active+paused order as the Live tab's list.
+            if idx < state.live_active.len() {
+                state.live_active[idx].jsonl_path.clone()
+            } else {
+                state
+                    .live_paused
+                    .get(idx - state.live_active.len())
+                    .and_then(|s| s.jsonl_path.clone())
+            }
+        }
     }
 }
 
@@ -80,6 +89,7 @@ pub(crate) fn get_conv_session_count(state: &AppState) -> usize {
             .iter()
             .flat_map(DailyGroup::user_sessions)
             .count(),
+        ConvListMode::Live => crate::live_visible_count(state),
     }
 }
 

@@ -194,8 +194,26 @@ pub struct Usage {
     #[serde(default, rename = "cache_read_input_tokens")]
     pub cache_read_input_tokens: u64,
 
+    /// Per-TTL breakdown of `cache_creation_input_tokens`. Claude Code writes
+    /// this object on every recent JSONL entry. `ephemeral_1h_input_tokens`
+    /// is billed at 2x base input (vs `5m` at 1.25x), so missing this split
+    /// silently undercounts cost for subscription users (who default to 1h
+    /// TTL per Anthropic's `ENABLE_PROMPT_CACHING_1H` doc). When absent (very
+    /// old JSONL), callers fall back to the flat field at 5m rate.
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreationBreakdown>,
+
     #[serde(default)]
     pub service_tier: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct CacheCreationBreakdown {
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u64,
+
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u64,
 }
 
 #[cfg(test)]

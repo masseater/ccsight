@@ -55,6 +55,11 @@ tantivy = "0.26"
 # Parallel processing
 rayon = "1"
 
+[dev-dependencies]
+# Property-based testing for security-sensitive pure functions
+# (posix_shell_quote, user-message wrapper detection, etc.).
+proptest = "1"
+
 [lints.rust]
 unsafe_code = "forbid"
 
@@ -71,6 +76,14 @@ rc_buffer = "deny"
 implicit_clone = "deny"
 
 # Warn - should fix (code quality)
+# Catch unfinished/forgotten work that would otherwise reach release.
+# `todo!()` / `unimplemented!()` panic at runtime; `dbg!()` floods stderr
+# (forbidden in a TUI — see lint #20). All three are zero false-positive:
+# legitimate uses in this codebase don't exist.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
 uninlined_format_args = "warn"
 redundant_closure_for_method_calls = "warn"
 filter_map_next = "warn"

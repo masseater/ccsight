@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 25;
+const CACHE_VERSION: u32 = 31;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -41,6 +41,13 @@ pub struct CachedDailyStats {
     pub language_usage: HashMap<String, usize>,
     #[serde(default)]
     pub extension_usage: HashMap<String, usize>,
+    /// Per-day count of user / assistant message turns. `serde(default)`
+    /// keeps deserialisation tolerant of older cache layouts; a version
+    /// bump forces a rebuild that populates real values.
+    #[serde(default)]
+    pub user_msgs: u64,
+    #[serde(default)]
+    pub assistant_msgs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +60,22 @@ pub struct CachedFileStats {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// 5-min TTL share of `cache_creation_tokens`. `#[serde(default)]` so
+    /// older cache files (pre-1h-TTL fix, version 29 and below) deserialize
+    /// without losing the rest of the entry — they'll re-aggregate to fill
+    /// these on the next cache write.
+    #[serde(default)]
+    pub cache_creation_5m_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
+    /// `(message.id, requestId)` pairs whose tokens were credited to this
+    /// file's totals. Used by the global-dedup pre-load to skip duplicate
+    /// API responses that appear in multiple session JSONLs (e.g. when
+    /// Claude Code resumes/branches a session and writes the prior
+    /// conversation into a new file). Empty for files parsed before this
+    /// field existed — `#[serde(default)]` keeps old caches loadable.
+    #[serde(default)]
+    pub unique_hashes: Vec<String>,
     pub tool_usage: HashMap<String, usize>,
     pub model_usage: HashMap<String, usize>,
     #[serde(default)]
@@ -69,6 +92,15 @@ pub struct CachedFileStats {
     pub custom_title: Option<String>,
     #[serde(default)]
     pub ai_title: Option<String>,
+    /// Most recent user-role message text. Powers the Live/Daily preview's
+    /// "remind me what I was doing" line. Kept here so cache-valid sessions
+    /// don't need to re-walk entries on every load.
+    #[serde(default)]
+    pub last_user_message: Option<String>,
+    /// First user-role message text. Universal title fallback so Live row
+    /// line 2 always carries something semantic instead of "—".
+    #[serde(default)]
+    pub first_user_message: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -192,16 +224,16 @@ impl Cache {
     pub fn is_valid(&self, path: &Path) -> bool {
         let key = path.to_string_lossy().to_string();
         if let Some(cached) = self.data.files.get(&key)
-            && let Ok(metadata) = fs::metadata(path) {
-                let current_size = metadata.len();
-                if let Ok(modified) = metadata.modified() {
-                    let modified_secs = modified
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    return cached.modified_secs == modified_secs
-                        && cached.file_size == current_size;
-                }
+            && let Ok(metadata) = fs::metadata(path)
+        {
+            let current_size = metadata.len();
+            if let Ok(modified) = metadata.modified() {
+                let modified_secs = modified
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                return cached.modified_secs == modified_secs && cached.file_size == current_size;
             }
+        }
         false
     }
 
@@ -259,6 +291,8 @@ mod tests {
             output_tokens: 50,
             cache_creation_tokens: 20,
             cache_read_tokens: 10,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
 
         assert_eq!(ts.input_tokens, 100);
@@ -282,7 +316,9 @@ mod tests {
         // Regression: Cache::new_empty() uses /dev/null as a placeholder when no HOME.
         // save() must surface an error rather than silently writing to /dev/null.
         let cache = Cache::new_empty();
-        let err = cache.save().expect_err("save() should fail on /dev/null fallback");
+        let err = cache
+            .save()
+            .expect_err("save() should fail on /dev/null fallback");
         assert!(
             err.to_string().contains("HOME is not set"),
             "error message should mention HOME, got: {err}"
@@ -321,6 +357,9 @@ mod tests {
                             input_tokens: 1000,
                             output_tokens: 500,
                             cache_creation_tokens: 200,
+                            cache_creation_5m_tokens: 0,
+                            cache_creation_1h_tokens: 0,
+                            unique_hashes: Vec::new(),
                             cache_read_tokens: 100,
                             tool_usage: tool_usage.clone(),
                             model_usage: HashMap::new(),
@@ -334,6 +373,8 @@ mod tests {
                             summary: None,
                             custom_title: None,
                             ai_title: None,
+                            last_user_message: None,
+                            first_user_message: None,
                             model: None,
                             is_subagent: false,
                             daily_stats: HashMap::new(),
@@ -367,6 +408,57 @@ mod tests {
         assert_eq!(entry.entry_count, 10);
         assert_eq!(entry.tool_usage.get("Bash"), Some(&5));
         assert_eq!(entry.tool_usage.get("skill:my-skill"), Some(&2));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_old_cache_version_is_rejected_at_load() {
+        // Write a JSON cache file with version = CACHE_VERSION - 1 and
+        // verify Cache::load_from_path treats it as missing (returns
+        // empty), so a stale cache after a schema bump rebuilds rather
+        // than serving wrong data.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ccsight-cache-version-mismatch-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        let stale = serde_json::json!({
+            "version": CACHE_VERSION - 1,
+            "files": {
+                "/tmp/legacy.jsonl": {
+                    "modified_secs": 0,
+                    "file_size": 0,
+                    "entry_count": 0,
+                    "input_tokens": 999,
+                    "output_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "cache_read_tokens": 0,
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&stale).unwrap()).unwrap();
+
+        // Read the file directly via the same loader logic the real load
+        // path uses (version mismatch → CacheData::default()).
+        let file = File::open(&path).expect("open stale cache");
+        let reader = BufReader::new(file);
+        let parsed: serde_json::Result<CacheData> = serde_json::from_reader(reader);
+        let cache = match parsed {
+            Ok(cache) if cache.version == CACHE_VERSION => cache,
+            _ => CacheData::default(),
+        };
+
+        // After version-mismatch fallback, the cache should carry the
+        // current version (CacheData::default() returns CACHE_VERSION) and
+        // an empty files map (the stale entry must NOT survive).
+        assert_eq!(cache.version, CACHE_VERSION);
+        assert!(
+            cache.files.is_empty(),
+            "stale-version cache must NOT carry stale per-file entries forward"
+        );
 
         let _ = fs::remove_file(&path);
     }

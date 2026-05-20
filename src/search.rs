@@ -41,12 +41,7 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
     let mut results = Vec::new();
 
     for (day_idx, group) in daily_groups.iter().enumerate() {
-        for (session_idx, session) in group
-            .sessions
-            .iter()
-            .filter(|s| !s.is_subagent)
-            .enumerate()
-        {
+        for (session_idx, session) in group.sessions.iter().filter(|s| !s.is_subagent).enumerate() {
             if session.project_name.to_lowercase().contains(&query_lower) {
                 // The project column is already on line 1, so a snippet that
                 // re-prints the project name would just duplicate it. Set
@@ -62,46 +57,46 @@ pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchRes
             }
 
             if let Some(ref summary) = session.summary
-                && summary.to_lowercase().contains(&query_lower) {
-                    let snippet = extract_snippet(summary, &query_lower, 60);
-                    results.push(SearchResult {
-                        day_idx,
-                        session_idx,
-                        snippet: Some(snippet),
-                        match_type: SearchMatchType::Summary,
-                        session_path: None,
-                    });
-                    continue;
-                }
+                && summary.to_lowercase().contains(&query_lower)
+            {
+                let snippet = extract_snippet(summary, &query_lower, 60);
+                results.push(SearchResult {
+                    day_idx,
+                    session_idx,
+                    snippet: Some(snippet),
+                    match_type: SearchMatchType::Summary,
+                    session_path: None,
+                });
+                continue;
+            }
 
             if let Some(ref branch) = session.git_branch
-                && branch.to_lowercase().contains(&query_lower) {
-                    // Branch column is already on line 1; same rationale as
-                    // ProjectName above.
-                    results.push(SearchResult {
-                        day_idx,
-                        session_idx,
-                        snippet: None,
-                        match_type: SearchMatchType::GitBranch,
-                        session_path: None,
-                    });
-                    continue;
-                }
+                && branch.to_lowercase().contains(&query_lower)
+            {
+                // Branch column is already on line 1; same rationale as
+                // ProjectName above.
+                results.push(SearchResult {
+                    day_idx,
+                    session_idx,
+                    snippet: None,
+                    match_type: SearchMatchType::GitBranch,
+                    session_path: None,
+                });
+                continue;
+            }
 
-            if let Some(session_id) = session
-                .file_path
-                .file_stem()
-                .and_then(|n| n.to_str())
-                && session_id.to_lowercase().contains(&query_lower) {
-                    results.push(SearchResult {
-                        day_idx,
-                        session_idx,
-                        snippet: Some(session_id.to_string()),
-                        match_type: SearchMatchType::SessionId,
-                        session_path: None,
-                    });
-                    continue;
-                }
+            if let Some(session_id) = session.file_path.file_stem().and_then(|n| n.to_str())
+                && session_id.to_lowercase().contains(&query_lower)
+            {
+                results.push(SearchResult {
+                    day_idx,
+                    session_idx,
+                    snippet: Some(session_id.to_string()),
+                    match_type: SearchMatchType::SessionId,
+                    session_path: None,
+                });
+                continue;
+            }
 
             if group
                 .date
@@ -160,19 +155,20 @@ pub fn search_session_content(file_path: &Path, query: &str) -> Option<String> {
 
     for entry in &entries {
         if (entry.entry_type == EntryType::User || entry.entry_type == EntryType::Assistant)
-            && let Some(ref message) = entry.message {
-                let text = message.content.extract_text();
-                let text_lower = text.to_lowercase();
-                if text_lower.contains(&query_lower) {
-                    let role = match message.role {
-                        Role::User => "User",
-                        Role::Assistant => "AI",
-                        _ => "?",
-                    };
-                    let snippet = extract_snippet(&text, query, 50);
-                    return Some(format!("[{role}] {snippet}"));
-                }
+            && let Some(ref message) = entry.message
+        {
+            let text = message.content.extract_text();
+            let text_lower = text.to_lowercase();
+            if text_lower.contains(&query_lower) {
+                let role = match message.role {
+                    Role::User => "User",
+                    Role::Assistant => "AI",
+                    _ => "?",
+                };
+                let snippet = extract_snippet(&text, query, 50);
+                return Some(format!("[{role}] {snippet}"));
             }
+        }
     }
 
     None
@@ -266,18 +262,22 @@ mod tests {
     fn make_groups() -> Vec<DailyGroup> {
         vec![
             make_daily_group(
-                NaiveDate::from_ymd_opt(2026, 2, 24).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 2, 24).unwrap(), // lint-ok: date-literal
                 vec![
                     make_session(
                         "~/projects/app-a",
                         Some("Add project filter feature"),
                         Some("feature/project-filter"),
                     ),
-                    make_session("~/projects/other-app", Some("Fix login bug"), Some("fix/login")),
+                    make_session(
+                        "~/projects/other-app",
+                        Some("Fix login bug"),
+                        Some("fix/login"),
+                    ),
                 ],
             ),
             make_daily_group(
-                NaiveDate::from_ymd_opt(2026, 2, 25).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 2, 25).unwrap(), // lint-ok: date-literal
                 vec![make_session(
                     "~/projects/app-a",
                     Some("Refactor search module"),
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn test_search_by_date() {
         let groups = make_groups();
-        let results = perform_search(&groups, "2026-02-25");
+        let results = perform_search(&groups, "2026-02-25"); // lint-ok: date-literal
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].match_type, SearchMatchType::Date));
         assert_eq!(results[0].day_idx, 1);
@@ -350,15 +350,17 @@ mod tests {
         let groups = make_groups();
         let results = perform_search(&groups, "2026-02");
         assert_eq!(results.len(), 3);
-        assert!(results
-            .iter()
-            .all(|r| matches!(r.match_type, SearchMatchType::Date)));
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.match_type, SearchMatchType::Date))
+        );
     }
 
     #[test]
     fn test_search_priority_project_over_summary() {
         let groups = vec![make_daily_group(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
             vec![make_session(
                 "~/projects/myapp",
                 Some("Working on myapp features"),
@@ -410,23 +412,25 @@ mod tests {
     #[test]
     fn test_search_date_matches_all_sessions_in_day() {
         let groups = make_groups();
-        let results = perform_search(&groups, "2026-02-24");
+        let results = perform_search(&groups, "2026-02-24"); // lint-ok: date-literal
         assert_eq!(
             results.len(),
             2,
             "all sessions in the matching day should be returned"
         );
         assert!(results.iter().all(|r| r.day_idx == 0));
-        assert!(results
-            .iter()
-            .all(|r| matches!(r.match_type, SearchMatchType::Date)));
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.match_type, SearchMatchType::Date))
+        );
     }
 
     #[test]
     fn test_search_summary_snippet_is_reasonable_length() {
         let long_summary = "a".repeat(200) + " target " + &"b".repeat(200);
         let groups = vec![make_daily_group(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
             vec![make_session("~/projects/x", Some(&long_summary), None)],
         )];
         let results = perform_search(&groups, "target");
@@ -442,7 +446,7 @@ mod tests {
     #[test]
     fn test_search_session_idx_skips_subagents() {
         let groups = vec![make_daily_group(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
             vec![
                 {
                     let mut s = make_session("~/projects/sub", None, None);
@@ -463,7 +467,7 @@ mod tests {
     #[test]
     fn test_search_subagent_sessions_excluded() {
         let groups = vec![make_daily_group(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
             vec![{
                 let mut s = make_session("~/projects/agent-task", None, None);
                 s.is_subagent = true;

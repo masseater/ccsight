@@ -58,7 +58,10 @@ pub fn wrap_text_with_continuation(text: &str, max_width: usize) -> (Vec<String>
                     last_break = Some(line_end);
                 }
 
-                if line_end < chars.len() && is_cjk_breakable(chars[line_end]) && !ch.is_whitespace() {
+                if line_end < chars.len()
+                    && is_cjk_breakable(chars[line_end])
+                    && !ch.is_whitespace()
+                {
                     last_break = Some(line_end);
                 }
             }
@@ -105,10 +108,8 @@ pub fn format_number(n: u64) -> String {
         _ => return n.to_string(),
     };
 
-    #[allow(clippy::cast_precision_loss)]
     let v = n as f64 / divisor;
     if v >= 100.0 {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rounded = v.round() as u64;
         format!("{rounded}{suffix}")
     } else if v >= 10.0 {

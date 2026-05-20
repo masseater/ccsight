@@ -195,7 +195,9 @@ mod tests {
         // must return an error rather than silently writing to /dev/null.
         let pins = Pins::empty();
         if pins.data_path.as_os_str() == "/dev/null" {
-            let err = pins.save().expect_err("save() should fail on /dev/null fallback");
+            let err = pins
+                .save()
+                .expect_err("save() should fail on /dev/null fallback");
             assert!(
                 err.to_string().contains("HOME is not set"),
                 "error message should mention HOME, got: {err}"

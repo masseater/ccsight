@@ -94,12 +94,13 @@ fn read_plugin_mcp_servers() -> HashSet<String> {
         })
         .unwrap_or_default();
 
-    let installed: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&installed_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("plugins").cloned())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+    let installed: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&installed_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("plugins").cloned())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
 
     let mut result = HashSet::new();
     for key in &enabled {
@@ -207,7 +208,11 @@ pub fn compute_mcp_status(daily_groups: &[DailyGroup]) -> Vec<McpServerStatus> {
     // Tiebreak on name to keep equal-call servers in a stable order across rebuilds
     // (HashMap iteration order is non-deterministic, so without a tiebreak the UI
     // would shuffle them on every redraw).
-    statuses.sort_by(|a, b| b.total_calls.cmp(&a.total_calls).then_with(|| a.name.cmp(&b.name)));
+    statuses.sort_by(|a, b| {
+        b.total_calls
+            .cmp(&a.total_calls)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     statuses
 }
 
@@ -251,8 +256,8 @@ mod tests {
         // Some plugins inline `mcpServers` in `.claude-plugin/plugin.json`
         // instead of providing a separate `.mcp.json`. Both forms must be
         // honoured (per the official plugins reference).
-        let tmp = std::env::temp_dir()
-            .join(format!("ccsight-plugin-inline-test-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ccsight-plugin-inline-test-{}", std::process::id()));
         std::fs::create_dir_all(tmp.join(".claude-plugin")).unwrap();
         std::fs::write(
             tmp.join(".claude-plugin/plugin.json"),
@@ -312,6 +317,8 @@ mod tests {
                 day_last_timestamp: Utc::now(),
                 day_input_tokens: 0,
                 day_output_tokens: 0,
+                day_user_msgs: 0,
+                day_assistant_msgs: 0,
                 day_tokens_by_model: HashMap::new(),
                 day_hourly_activity: HashMap::new(),
                 day_hourly_work_tokens: HashMap::new(),
@@ -321,6 +328,8 @@ mod tests {
                 summary: None,
                 custom_title: None,
                 ai_title: None,
+                last_user_message: None,
+                first_user_message: None,
                 model: None,
                 is_subagent: false,
                 is_continued: false,

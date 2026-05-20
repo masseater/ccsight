@@ -1,12 +1,20 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCategory {
     BuiltIn,
-    Mcp { server: String },
-    Skill { name: String },
-    Agent { subtype: String },
+    Mcp {
+        server: String,
+    },
+    Skill {
+        name: String,
+    },
+    Agent {
+        subtype: String,
+    },
     /// Slash command — `/clear`, `/model`, or a user-defined `~/.claude/commands/<name>.md`.
     /// Stored under `tool_usage` keys with the `command:<name>` prefix.
-    Command { name: String },
+    Command {
+        name: String,
+    },
 }
 
 pub fn classify_tool(name: &str) -> ToolCategory {

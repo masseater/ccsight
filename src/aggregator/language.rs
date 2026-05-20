@@ -227,7 +227,9 @@ pub fn for_extension(ext: &str) -> &'static str {
         "zig" => "Zig",
 
         // Binary & media
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tiff" | "avif" | "svg" => "Image",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tiff" | "avif" | "svg" => {
+            "Image"
+        }
         "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" => "Audio",
         "mp4" | "webm" | "avi" | "mov" | "mkv" | "flv" => "Video",
         "ttf" | "otf" | "woff" | "woff2" | "eot" => "Font",

@@ -10,6 +10,7 @@ mod mcp;
 mod parser;
 mod pins;
 mod search;
+mod shell;
 mod state;
 mod summary;
 #[cfg(test)]
@@ -23,12 +24,12 @@ pub use conversation::{ConversationBlock, ConversationMessage};
 
 // Re-export pane helpers so callers (and existing fn-pointer dispatch in
 // `handlers::keyboard`) can keep using bare names.
+pub(crate) use handlers::mcp_popup::{adjust_mcp_scroll, collect_mcp_servers, mcp_tool_count};
 pub(crate) use handlers::pane::{
     current_selected_session, current_selected_session_with_index,
     extract_selected_text_from_buffer, get_conv_session_count, get_conv_session_file,
     open_conversation_in_pane, preview_conversation_in_pane, spawn_load_conversation,
 };
-pub(crate) use handlers::mcp_popup::{adjust_mcp_scroll, collect_mcp_servers, mcp_tool_count};
 // `join_conversation_lines` is referenced from `main_tests.rs` only.
 #[cfg(test)]
 pub(crate) use handlers::pane::join_conversation_lines;
@@ -50,8 +51,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-        EnterAlternateScreen, LeaveAlternateScreen,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
     },
 };
 use ratatui::DefaultTerminal;
@@ -99,9 +100,7 @@ pub fn cli_help_lines() -> Vec<(String, String)> {
         } else {
             continue;
         };
-        let help = arg
-            .get_help()
-            .map_or_else(String::new, ToString::to_string);
+        let help = arg.get_help().map_or_else(String::new, ToString::to_string);
         lines.push((flag, help));
     }
     lines
@@ -145,8 +144,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.mcp {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(io::Error::other)?;
+        let rt = tokio::runtime::Runtime::new().map_err(io::Error::other)?;
         rt.block_on(mcp::run_mcp_server(args.limit))
             .map_err(io::Error::other)?;
         return Ok(());
@@ -155,18 +153,33 @@ fn main() -> io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         original_hook(panic_info);
     }));
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
 
     let result = run(terminal, args.limit);
 
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     result
 }
 
@@ -208,7 +221,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             state.needs_draw = false;
         }
 
-        let has_pending = state.loading || state.generating_summary
+        let has_pending = state.loading
+            || state.generating_summary
             || state.toast_time.is_some()
             || state.data_reload_task.is_some()
             || state.summary_task.is_some()
@@ -224,59 +238,160 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         }
 
         if let Some(toast_time) = state.toast_time
-            && toast_time.elapsed() > std::time::Duration::from_secs(2) {
-                state.toast_message = None;
-                state.toast_time = None;
-                state.needs_draw = true;
-            }
+            && toast_time.elapsed() > std::time::Duration::from_secs(2)
+        {
+            state.toast_message = None;
+            state.toast_time = None;
+            state.needs_draw = true;
+        }
 
-        if state.loading
-            && let Ok(result) = rx.try_recv() {
-                match result {
-                    Ok(data) => {
-                        state.apply_loaded_data(data);
-                        state.loading = false;
-                        start_index_build(&mut state);
-                    }
-                    Err(e) => {
-                        state.error = Some(e);
-                        state.loading = false;
-                    }
-                }
-            }
-
-        if let Some(ref reload_rx) = state.data_reload_task
-            && let Ok(result) = reload_rx.try_recv() {
-                state.data_reload_task = None;
-                // Reset the throttle timestamp regardless of outcome so a
-                // transient load failure (filesystem hiccup, partial JSONL)
-                // doesn't immediately re-spawn the loader on the next tick
-                // and turn into a thread storm.
-                state.last_data_update = Some(std::time::Instant::now());
-                if let Ok(data) = result {
+        // Initial-load result. `Disconnected` means the loader thread
+        // panicked before sending — without this branch the `loading` flag
+        // would stay true forever and the spinner would spin indefinitely.
+        if state.loading {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
                     state.apply_loaded_data(data);
+                    state.loading = false;
+                    start_index_build(&mut state);
+                }
+                Ok(Err(e)) => {
+                    state.error = Some(e);
+                    state.loading = false;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    state.error = Some("Initial data load failed (thread panicked)".to_string());
+                    state.loading = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
 
-                    if state.selected_day >= state.daily_groups.len() {
-                        state.selected_day = state.daily_groups.len().saturating_sub(1);
-                    }
-                    if let Some(group) = state.daily_groups.get(state.selected_day) {
-                        let session_count = group.user_sessions().count();
-                        if state.selected_session >= session_count {
-                            state.selected_session = session_count.saturating_sub(1);
+        // Periodic-reload result. `Disconnected` means the reload thread
+        // panicked before sending — without clearing `data_reload_task`,
+        // the `is_some()` guard would block all future reloads.
+        if let Some(ref reload_rx) = state.data_reload_task {
+            let outcome = reload_rx.try_recv();
+            match outcome {
+                Ok(result) => {
+                    state.data_reload_task = None;
+                    // Reset the throttle timestamp regardless of outcome so a
+                    // transient load failure (filesystem hiccup, partial JSONL)
+                    // doesn't immediately re-spawn the loader on the next tick
+                    // and turn into a thread storm.
+                    state.last_data_update = Some(std::time::Instant::now());
+                    if let Ok(data) = result {
+                        state.apply_loaded_data(data);
+
+                        if state.selected_day >= state.daily_groups.len() {
+                            state.selected_day = state.daily_groups.len().saturating_sub(1);
+                        }
+                        if let Some(group) = state.daily_groups.get(state.selected_day) {
+                            let session_count = group.user_sessions().count();
+                            if state.selected_session >= session_count {
+                                state.selected_session = session_count.saturating_sub(1);
+                            }
+                        }
+                        state.search_results.clear();
+                        state.search_selected = 0;
+                        start_index_build(&mut state);
+                        if state.search_mode && !state.search_input.text.is_empty() {
+                            state.search_results = search::perform_search(
+                                &state.daily_groups,
+                                &state.search_input.text,
+                            );
+                            start_content_search(&mut state);
                         }
                     }
-                    state.search_results.clear();
-                    state.search_selected = 0;
-                    start_index_build(&mut state);
-                    if state.search_mode && !state.search_input.text.is_empty() {
-                        state.search_results = search::perform_search(
-                            &state.daily_groups,
-                            &state.search_input.text,
-                        );
-                        start_content_search(&mut state);
-                    }
                 }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    state.data_reload_task = None;
+                    state.last_data_update = Some(std::time::Instant::now());
+                    state.toast_message =
+                        Some("Reload failed (thread panicked); retrying in 30s".to_string());
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+
+        // Live sessions: poll every 5s. Reads ~/.claude/sessions/*.json
+        // (Claude Code's first-party metadata) so no ambiguity; cost is a
+        // dozen ~1KB JSON reads + `kill -0` checks per poll, negligible.
+        // `Disconnected` means the discovery thread panicked — clear the
+        // slot so the next 5s tick re-spawns instead of freezing the panel.
+        if let Some(ref rx) = state.live_sessions_task {
+            match rx.try_recv() {
+                Ok((active, paused)) => {
+                    state.live_active = active;
+                    state.live_paused = paused;
+                    state.live_last_update = Some(std::time::Instant::now());
+                    state.live_sessions_task = None;
+                    state.live_selected = state
+                        .live_selected
+                        .min((state.live_active.len() + state.live_paused.len()).saturating_sub(1));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    state.live_sessions_task = None;
+                    state.live_last_update = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if state.live_sessions_task.is_none() {
+            let should_poll = state
+                .live_last_update
+                .is_none_or(|last| last.elapsed() > std::time::Duration::from_secs(5));
+            if should_poll {
+                let (tx, rx) = mpsc::channel();
+                let app_start_time = state.app_start_time;
+                thread::spawn(move || {
+                    let active = infrastructure::live_sessions::discover_live();
+                    let active_ids: std::collections::HashSet<String> =
+                        active.iter().map(|s| s.session_id.clone()).collect();
+                    let mut paused = infrastructure::live_sessions::discover_recently_paused(
+                        &active_ids,
+                        std::time::Duration::from_secs(24 * 3600),
+                        std::time::SystemTime::now(),
+                    );
+
+                    // Snapshot dance:
+                    // 1. Load prior snapshot (still on disk from prev poll /
+                    //    prev ccsight run).
+                    // 2. Mark `was_recently_live` on paused rows already
+                    //    found via JSONL mtime (24h window). The
+                    //    `app_start_time` filter excludes sessions stamped
+                    //    in the current run so manual mid-run closes don't
+                    //    appear as `⟳`.
+                    // 3. Recover snapshot rows whose JSONL mtime fell
+                    //    outside the 24h window (Friday→Monday case) and
+                    //    append them to paused.
+                    // 4. Sort + mark again so recovered rows land at top.
+                    // 5. Refresh snapshot with current alive set and save.
+                    let mut snapshot = infrastructure::live_snapshot::LiveSnapshot::load();
+                    infrastructure::live_sessions::mark_was_recently_live(
+                        &mut paused,
+                        &snapshot,
+                        app_start_time,
+                    );
+                    let paused_ids: std::collections::HashSet<String> =
+                        paused.iter().map(|s| s.session_id.clone()).collect();
+                    let recovered =
+                        snapshot.recover_missing(&active_ids, &paused_ids, app_start_time);
+                    paused.extend(recovered);
+                    infrastructure::live_sessions::mark_was_recently_live(
+                        &mut paused,
+                        &snapshot,
+                        app_start_time,
+                    );
+                    snapshot.refresh(&active);
+                    snapshot.save();
+
+                    let _ = tx.send((active, paused));
+                });
+                state.live_sessions_task = Some(rx);
+            }
+        }
 
         if !state.loading && state.data_reload_task.is_none() {
             let should_reload = state
@@ -296,33 +411,46 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 
         if let Some((ref rx, ref file_path, day_idx, _session_idx, actual_idx)) =
             state.updating_task
-            && let Ok(result) = rx.try_recv() {
-                let file_path = file_path.clone();
-                state.updating_task = None;
-                state.updating_session = None;
-
-                match result {
-                    Ok(new_summary) => {
-                        if update_jsonl_summary(&file_path, &new_summary).is_ok() {
-                            if let Some(group) = state.daily_groups.get_mut(day_idx)
-                                && let Some(session) = group.sessions.get_mut(actual_idx) {
+        {
+            let outcome = rx.try_recv();
+            match outcome {
+                Ok(result) => {
+                    let file_path = file_path.clone();
+                    state.updating_task = None;
+                    state.updating_session = None;
+                    match result {
+                        Ok(new_summary) => {
+                            if update_jsonl_summary(&file_path, &new_summary).is_ok() {
+                                if let Some(group) = state.daily_groups.get_mut(day_idx)
+                                    && let Some(session) = group.sessions.get_mut(actual_idx)
+                                {
                                     session.summary = Some(new_summary);
                                 }
-                        } else if !state.show_detail {
-                            state.show_summary = true;
-                            state.summary_content = "❌ Failed to write JSONL file".to_string();
-                            state.summary_scroll = 0;
+                            } else if !state.show_detail {
+                                state.show_summary = true;
+                                state.summary_content = "❌ Failed to write JSONL file".to_string();
+                                state.summary_scroll = 0;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        if !state.show_detail {
-                            state.show_summary = true;
-                            state.summary_content = format!("❌ Error: {e}");
-                            state.summary_scroll = 0;
+                        Err(e) => {
+                            if !state.show_detail {
+                                state.show_summary = true;
+                                state.summary_content = format!("❌ Error: {e}");
+                                state.summary_scroll = 0;
+                            }
                         }
                     }
                 }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    state.updating_task = None;
+                    state.updating_session = None;
+                    state.toast_message =
+                        Some("Summary regen failed (thread panicked)".to_string());
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
 
         if state.show_conversation {
             for pane in &mut state.panes {
@@ -334,67 +462,111 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     pane.reload_check = Some(std::time::Instant::now());
                     if let Some(ref file_path) = pane.file_path.clone()
                         && let Ok(metadata) = std::fs::metadata(file_path)
-                            && let Ok(modified) = metadata.modified() {
-                                let needs_reload = pane
-                                    .last_modified
-                                    .is_some_and(|last| modified > last);
-                                if needs_reload && pane.load_task.is_none() {
-                                    if let Some(&(_, msg_idx)) =
-                                        pane.message_lines.get(pane.selected_message)
-                                        && let Some(msg) = pane.messages.get(msg_idx) {
-                                            pane.focused_timestamp = msg.timestamp.clone();
-                                        }
-                                    pane.load_task = Some(spawn_load_conversation(file_path));
-                                    pane.loading = true;
-                                    pane.last_modified = Some(modified);
-                                }
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        let needs_reload = pane.last_modified.is_some_and(|last| modified > last);
+                        if needs_reload && pane.load_task.is_none() {
+                            if let Some(&(_, msg_idx)) =
+                                pane.message_lines.get(pane.selected_message)
+                                && let Some(msg) = pane.messages.get(msg_idx)
+                            {
+                                pane.focused_timestamp = msg.timestamp.clone();
                             }
+                            pane.load_task = Some(spawn_load_conversation(file_path));
+                            pane.loading = true;
+                            pane.last_modified = Some(modified);
+                        }
+                    }
                 }
             }
         }
 
         for pane in &mut state.panes {
-            if let Some(ref rx) = pane.load_task
-                && let Ok(messages) = rx.try_recv() {
-                    let is_reload = !pane.messages.is_empty();
-                    let old_count = pane.message_lines.len();
-                    let was_at_last = old_count > 0 && pane.selected_message >= old_count - 1;
+            if let Some(ref rx) = pane.load_task {
+                match rx.try_recv() {
+                    Ok(messages) => {
+                        let is_reload = !pane.messages.is_empty();
+                        let old_count = pane.message_lines.len();
+                        let was_at_last = old_count > 0 && pane.selected_message >= old_count - 1;
 
-                    pane.messages = messages;
-                    pane.loading = false;
-                    pane.load_task = None;
-                    pane.rendered = None;
+                        pane.messages = messages;
+                        pane.loading = false;
+                        pane.load_task = None;
+                        pane.rendered = None;
 
-                    if is_reload {
-                        if was_at_last {
-                            if let Some(msg) = pane
-                                .messages
-                                .iter()
-                                .rev()
-                                .find(|m| !ui::is_thinking_only_message(m))
-                            {
-                                pane.focused_timestamp = msg.timestamp.clone();
+                        if is_reload {
+                            if was_at_last {
+                                if let Some(msg) = pane
+                                    .messages
+                                    .iter()
+                                    .rev()
+                                    .find(|m| !ui::is_thinking_only_message(m))
+                                {
+                                    pane.focused_timestamp = msg.timestamp.clone();
+                                }
+                                pane.scroll = usize::MAX;
+                                pane.selected_message = usize::MAX;
                             }
+                        } else {
+                            pane.search_matches.clear();
+                            pane.search_current = 0;
+                            pane.search_saved_scroll = None;
                             pane.scroll = usize::MAX;
                             pane.selected_message = usize::MAX;
                         }
-                    } else {
-                        pane.search_matches.clear();
-                        pane.search_current = 0;
-                        pane.search_saved_scroll = None;
-                        pane.scroll = usize::MAX;
-                        pane.selected_message = usize::MAX;
                     }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Loader panicked. Without clearing the flag and
+                        // the rx, the pane would stay "Loading..." forever.
+                        pane.load_task = None;
+                        pane.loading = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
                 }
+            }
         }
 
-        if let Some(ref rx) = state.summary_task
-            && let Ok(content) = rx.try_recv() {
-                state.summary_content = content;
-                state.generating_summary = false;
-                state.summary_scroll = 0;
-                state.summary_task = None;
+        if let Some(ref rx) = state.summary_task {
+            match rx.try_recv() {
+                Ok(content) => {
+                    state.summary_content = content;
+                    state.generating_summary = false;
+                    state.summary_scroll = 0;
+                    state.summary_task = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Summary thread panicked; reset so the user can retry.
+                    state.summary_task = None;
+                    state.generating_summary = false;
+                    state.summary_content = "❌ Summary generation failed".to_string();
+                    state.summary_scroll = 0;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+
+        // Clipboard write outcome — overwrite the optimistic "Copied"
+        // toast with an error if `arboard` couldn't acquire the system
+        // clipboard (no display server, no clipboard daemon, etc.).
+        if let Some(ref clip_rx) = state.clipboard_task {
+            match clip_rx.try_recv() {
+                Ok(Ok(())) => {
+                    state.clipboard_task = None;
+                }
+                Ok(Err(e)) => {
+                    state.clipboard_task = None;
+                    state.toast_message = Some(format!("Clipboard error: {e}"));
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    state.clipboard_task = None;
+                    state.toast_message =
+                        Some("Clipboard write failed (thread panicked)".to_string());
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
 
         if let Some(ref index_rx) = state.index_build_task {
             match index_rx.try_recv() {
@@ -405,28 +577,73 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // Builder failed without sending; clear the flag so the
-                    // top-bar indicator doesn't lie.
+                    // top-bar indicator doesn't lie, and surface a toast so
+                    // the user knows search will be unavailable until the
+                    // next throttled rebuild (~60s).
                     state.index_build_task = None;
                     state.last_index_build = Some(std::time::Instant::now());
+                    if state.search_index.is_none() {
+                        state.toast_message =
+                            Some("Search index build failed; will retry".to_string());
+                        state.toast_time = Some(std::time::Instant::now());
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
 
-        if let Some((ref rx, ref query)) = state.search_task
-            && let Ok(content_results) = rx.try_recv() {
-                if *query == state.search_input.text {
-                    for result in content_results {
-                        if !state.search_results.iter().any(|r| {
-                            r.day_idx == result.day_idx && r.session_idx == result.session_idx
-                        }) {
-                            state.search_results.push(result);
+        if let Some((ref rx, ref query)) = state.search_task {
+            match rx.try_recv() {
+                Ok(content_results) => {
+                    if *query == state.search_input.text {
+                        // Remap tantivy results (carry `session_path`)
+                        // through the current `daily_groups` so any filter
+                        // applied between dispatch and arrival doesn't leak
+                        // stale `(day_idx, session_idx)`. File-content
+                        // fallback already computes indices against the
+                        // current view and leaves `session_path` None.
+                        let path_lookup: std::collections::HashMap<String, (usize, usize)> = state
+                            .daily_groups
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(day_idx, group)| {
+                                group.user_sessions().enumerate().map(
+                                    move |(session_idx, session)| {
+                                        (
+                                            session.file_path.to_string_lossy().into_owned(),
+                                            (day_idx, session_idx),
+                                        )
+                                    },
+                                )
+                            })
+                            .collect();
+                        for mut result in content_results {
+                            if let Some(path) = result.session_path.as_ref() {
+                                let Some(&(day_idx, session_idx)) = path_lookup.get(path) else {
+                                    continue;
+                                };
+                                result.day_idx = day_idx;
+                                result.session_idx = session_idx;
+                            }
+                            if !state.search_results.iter().any(|r| {
+                                r.day_idx == result.day_idx && r.session_idx == result.session_idx
+                            }) {
+                                state.search_results.push(result);
+                            }
                         }
                     }
+                    state.search_task = None;
+                    state.searching = false;
                 }
-                state.search_task = None;
-                state.searching = false;
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Search thread panicked; clear so the spinner stops
+                    // and the next `/` keystroke can start a fresh search.
+                    state.search_task = None;
+                    state.searching = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
 
         if event::poll(Duration::from_millis(50))? {
             let ev = match std::panic::catch_unwind(event::read) {
@@ -447,11 +664,19 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         });
                         if is_double_click {
                             state.last_click_time = None;
-                            handlers::mouse::handle_double_click(&mut state, mouse.column, mouse.row);
+                            handlers::mouse::handle_double_click(
+                                &mut state,
+                                mouse.column,
+                                mouse.row,
+                            );
                         } else {
                             state.last_click_time = Some(now);
                             state.last_click_pos = (mouse.column, mouse.row);
-                            handlers::mouse::handle_mouse_click(&mut state, mouse.column, mouse.row);
+                            handlers::mouse::handle_mouse_click(
+                                &mut state,
+                                mouse.column,
+                                mouse.row,
+                            );
                         }
                     }
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
@@ -460,33 +685,38 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             state.text_selection = Some((sc, sr, mouse.column, mouse.row));
 
                             if state.show_conversation
-                                && let Some(ca) = state.conversation_content_area {
-                                    let mut scrolled = false;
-                                    let scroll_amount = 2;
+                                && let Some(ca) = state.conversation_content_area
+                            {
+                                let mut scrolled = false;
+                                let scroll_amount = 2;
 
-                                    if mouse.row < ca.y {
-                                        let idx = state.active_pane_index.unwrap_or(0);
-                                        if let Some(pane) = state.panes.get_mut(idx)
-                                            && pane.scroll > 0 {
-                                                pane.scroll = pane.scroll.saturating_sub(scroll_amount);
-                                                scrolled = true;
-                                            }
-                                    } else if mouse.row >= ca.y + ca.height {
-                                        let idx = state.active_pane_index.unwrap_or(0);
-                                        if let Some(pane) = state.panes.get_mut(idx)
-                                            && let Some(cached) = pane.rendered.as_ref() {
-                                                let max_scroll = cached.0.len().saturating_sub(ca.height as usize);
-                                                if pane.scroll < max_scroll {
-                                                    pane.scroll = (pane.scroll + scroll_amount).min(max_scroll);
-                                                    scrolled = true;
-                                                }
-                                            }
+                                if mouse.row < ca.y {
+                                    let idx = state.active_pane_index.unwrap_or(0);
+                                    if let Some(pane) = state.panes.get_mut(idx)
+                                        && pane.scroll > 0
+                                    {
+                                        pane.scroll = pane.scroll.saturating_sub(scroll_amount);
+                                        scrolled = true;
                                     }
-
-                                    if scrolled {
-                                        continue;
+                                } else if mouse.row >= ca.y + ca.height {
+                                    let idx = state.active_pane_index.unwrap_or(0);
+                                    if let Some(pane) = state.panes.get_mut(idx)
+                                        && let Some(cached) = pane.rendered.as_ref()
+                                    {
+                                        let max_scroll =
+                                            cached.0.len().saturating_sub(ca.height as usize);
+                                        if pane.scroll < max_scroll {
+                                            pane.scroll =
+                                                (pane.scroll + scroll_amount).min(max_scroll);
+                                            scrolled = true;
+                                        }
                                     }
                                 }
+
+                                if scrolled {
+                                    continue;
+                                }
+                            }
                         }
                     }
                     MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
@@ -510,19 +740,31 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 };
                                 let (wrap_flags, conv_scroll) = if state.show_conversation {
                                     let idx = state.active_pane_index.unwrap_or(0);
-                                    state.panes.get(idx)
-                                        .and_then(|p| p.rendered.as_ref().map(|(_, _, flags, _)| (flags.as_slice(), p.scroll)))
+                                    state
+                                        .panes
+                                        .get(idx)
+                                        .and_then(|p| {
+                                            p.rendered.as_ref().map(|(_, _, flags, _)| {
+                                                (flags.as_slice(), p.scroll)
+                                            })
+                                        })
                                         .map_or((None, 0), |(flags, scroll)| (Some(flags), scroll))
                                 } else {
                                     (None, 0)
                                 };
-                                let text =
-                                    extract_selected_text_from_buffer(sel, buf, conv_area, wrap_flags, conv_scroll);
+                                let text = extract_selected_text_from_buffer(
+                                    sel,
+                                    buf,
+                                    conv_area,
+                                    wrap_flags,
+                                    conv_scroll,
+                                );
                                 if !text.is_empty() {
                                     let len = text.chars().count();
                                     state.toast_message = Some(format!("Copied ({len} chars)"));
                                     state.toast_time = Some(std::time::Instant::now());
-                                    handlers::tasks::spawn_clipboard_write(text);
+                                    state.clipboard_task =
+                                        Some(handlers::tasks::spawn_clipboard_write(text));
                                 }
                             }
                         } else {
@@ -531,11 +773,21 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     }
                     MouseEventKind::ScrollUp => {
                         state.text_selection = None;
-                        handlers::mouse::handle_mouse_scroll(&mut state, mouse.column, mouse.row, true);
+                        handlers::mouse::handle_mouse_scroll(
+                            &mut state,
+                            mouse.column,
+                            mouse.row,
+                            true,
+                        );
                     }
                     MouseEventKind::ScrollDown => {
                         state.text_selection = None;
-                        handlers::mouse::handle_mouse_scroll(&mut state, mouse.column, mouse.row, false);
+                        handlers::mouse::handle_mouse_scroll(
+                            &mut state,
+                            mouse.column,
+                            mouse.row,
+                            false,
+                        );
                     }
                     _ => {}
                 },
@@ -544,10 +796,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         for c in text.chars() {
                             state.search_input.insert_char(c);
                         }
-                        state.search_results = search::perform_search(
-                            &state.daily_groups,
-                            &state.search_input.text,
-                        );
+                        state.search_results =
+                            search::perform_search(&state.daily_groups, &state.search_input.text);
                         state.search_selected = 0;
                         start_content_search(&mut state);
                     } else if state.filter_input_mode {
@@ -576,64 +826,65 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         }
                     }
                 }
-                Event::Key(key)
-                    if key.kind == KeyEventKind::Press => {
-                        use crossterm::event::KeyModifiers;
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            if state.ctrl_c_pressed {
-                                break;
-                            }
-                            state.ctrl_c_pressed = true;
-                            state.toast_message = Some("Press again to quit".to_string());
-                            state.toast_time = Some(std::time::Instant::now());
-                            state.needs_draw = true;
-                            continue;
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    use crossterm::event::KeyModifiers;
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if state.ctrl_c_pressed {
+                            break;
                         }
-                        if key.code != KeyCode::Char('q') {
-                            state.ctrl_c_pressed = false;
-                        }
+                        state.ctrl_c_pressed = true;
+                        state.toast_message = Some("Press again to quit".to_string());
+                        state.toast_time = Some(std::time::Instant::now());
+                        state.needs_draw = true;
+                        continue;
+                    }
+                    if key.code != KeyCode::Char('q') {
+                        state.ctrl_c_pressed = false;
+                    }
 
-                        if state.show_help {
-                            handlers::keyboard::handle_help_key(&mut state, key);
-                        } else if state.show_filter_popup {
-                            handlers::keyboard::handle_filter_popup_key(&mut state, key);
-                        } else if state.show_project_popup {
-                            handlers::keyboard::handle_project_popup_key(&mut state, key);
-                        } else if state.show_summary {
-                            handlers::keyboard::handle_summary_popup_key(&mut state, key);
-                        } else if state.show_conversation {
-                            handlers::keyboard::handle_conversation_key(
-                                &mut state,
-                                key,
-                                preview_conversation_in_pane,
-                                open_conversation_in_pane,
-                                get_conv_session_file,
-                                get_conv_session_count,
-                            );
-                        } else if state.show_detail {
-                            handlers::keyboard::handle_session_detail_key(&mut state, key);
-                        } else if state.search_mode {
-                            handlers::keyboard::handle_search_mode_key(
-                                &mut state,
-                                key,
-                                start_content_search,
-                                open_conversation_in_pane,
-                            );
-                        } else if state.show_dashboard_detail {
-                            handlers::keyboard::handle_dashboard_detail_key(&mut state, key);
-                        } else if state.show_insights_detail {
-                            handlers::keyboard::handle_insights_detail_key(&mut state, key);
-                        } else if handlers::keyboard::handle_default_key(
+                    if state.show_help {
+                        handlers::keyboard::handle_help_key(&mut state, key);
+                    } else if state.show_project_detail {
+                        handlers::keyboard::handle_project_detail_key(&mut state, key);
+                    } else if state.show_filter_popup {
+                        handlers::keyboard::handle_filter_popup_key(&mut state, key);
+                    } else if state.show_project_popup {
+                        handlers::keyboard::handle_project_popup_key(&mut state, key);
+                    } else if state.show_summary {
+                        handlers::keyboard::handle_summary_popup_key(&mut state, key);
+                    } else if state.show_conversation {
+                        handlers::keyboard::handle_conversation_key(
                             &mut state,
                             key,
                             preview_conversation_in_pane,
                             open_conversation_in_pane,
-                        ) {
-                            break;
-                        }
+                            get_conv_session_file,
+                            get_conv_session_count,
+                        );
+                    } else if state.show_detail {
+                        handlers::keyboard::handle_session_detail_key(&mut state, key);
+                    } else if state.search_mode {
+                        handlers::keyboard::handle_search_mode_key(
+                            &mut state,
+                            key,
+                            start_content_search,
+                            open_conversation_in_pane,
+                        );
+                    } else if state.show_dashboard_detail {
+                        handlers::keyboard::handle_dashboard_detail_key(&mut state, key);
+                    } else if state.show_insights_detail {
+                        handlers::keyboard::handle_insights_detail_key(&mut state, key);
+                    } else if handlers::keyboard::handle_default_key(
+                        &mut state,
+                        key,
+                        preview_conversation_in_pane,
+                        open_conversation_in_pane,
+                    ) {
+                        break;
                     }
+                }
                 _ => {}
             }
             state.needs_draw = true;
@@ -657,6 +908,12 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 pub(crate) fn dismiss_overlay(state: &mut AppState) {
     if state.show_help {
         state.show_help = false;
+        return;
+    }
+    if state.show_project_detail {
+        state.show_project_detail = false;
+        state.project_detail_scroll = 0;
+        state.project_detail_path.clear();
         return;
     }
     if state.show_filter_popup {
@@ -695,6 +952,8 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
     }
     if state.show_detail {
         state.show_detail = false;
+        state.session_detail_override = None;
+        state.session_detail_live_extra = None;
         return;
     }
     if state.show_dashboard_detail {
@@ -749,10 +1008,30 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
 
 pub(crate) fn has_blocking_popup(state: &AppState) -> bool {
     state.show_help
+        || state.show_project_detail
         || state.show_summary
         || state.show_detail
         || state.show_dashboard_detail
         || state.show_insights_detail
+}
+
+/// Total visible row count in the Live tab (active + paused). Used by the
+/// j/k navigation to clamp the cursor.
+pub(crate) fn live_visible_count(state: &AppState) -> usize {
+    state.live_active.len() + state.live_paused.len()
+}
+
+/// Resolve the currently-selected Live session (active list first, then
+/// paused). Returns `None` when the list is empty.
+pub(crate) fn live_selected_session(
+    state: &AppState,
+) -> Option<&infrastructure::live_sessions::LiveSession> {
+    let idx = state.live_selected;
+    if idx < state.live_active.len() {
+        state.live_active.get(idx)
+    } else {
+        state.live_paused.get(idx - state.live_active.len())
+    }
 }
 
 pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
@@ -762,24 +1041,37 @@ pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
         2 => state.model_costs.len(),
         3 => crate::ui::dashboard::tool_usage_line_count(state),
         4 => {
-            let known = state.stats.language_usage.iter().filter(|(l, _)| l.as_str() != "Other").count();
-            let other = state.stats.extension_usage.iter().filter(|(ext, _)| {
-                crate::aggregator::language::for_extension(ext) == "Other"
-            }).count();
+            let known = state
+                .stats
+                .language_usage
+                .iter()
+                .filter(|(l, _)| l.as_str() != "Other")
+                .count();
+            let other = state
+                .stats
+                .extension_usage
+                .iter()
+                .filter(|(ext, _)| crate::aggregator::language::for_extension(ext) == "Other")
+                .count();
             known + other
         }
-        5 => state.daily_groups.len(),
+        5 => {
+            if state.activity_view_weekly {
+                crate::ui::dashboard::weekly_activity(state).len()
+            } else {
+                state.daily_groups.len()
+            }
+        }
         6 => 24,
         _ => 0,
     }
 }
 
-
-#[allow(clippy::type_complexity)]
 fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     let files = FileDiscovery::find_jsonl_files_with_limit(limit)?;
     let file_count = files.len();
-    let cache = crate::infrastructure::Cache::load().unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
+    let cache = crate::infrastructure::Cache::load()
+        .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
     let cache_for_grouper = Some(cache.clone());
     let (stats, cache_stats) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
     let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &cache_for_grouper);
@@ -836,39 +1128,21 @@ fn start_content_search(state: &mut AppState) {
     let query = state.search_input.text.clone();
 
     if let Some(ref index) = state.search_index {
-        let results = index.search(&query, 200, 50);
-        // The tantivy index stores positions captured at build time. Once a
-        // project/period filter shrinks `state.daily_groups`, those positions
-        // are stale (they may overshoot or even point at a different
-        // session). Remap each result's `(day_idx, session_idx)` against the
-        // live `daily_groups` using `session_path` as the stable key, and
-        // drop results that aren't represented in the filtered view.
-        let mut path_lookup: std::collections::HashMap<String, (usize, usize)> =
-            std::collections::HashMap::new();
-        for (day_idx, group) in state.daily_groups.iter().enumerate() {
-            for (session_idx, session) in
-                group.user_sessions().enumerate()
-            {
-                path_lookup.insert(session.file_path.to_string_lossy().to_string(), (day_idx, session_idx));
-            }
-        }
-        for mut result in results {
-            let Some(path) = result.session_path.as_ref() else {
-                continue;
-            };
-            let Some(&(day_idx, session_idx)) = path_lookup.get(path) else {
-                continue;
-            };
-            result.day_idx = day_idx;
-            result.session_idx = session_idx;
-            if !state
-                .search_results
-                .iter()
-                .any(|r| r.day_idx == result.day_idx && r.session_idx == result.session_idx)
-            {
-                state.search_results.push(result);
-            }
-        }
+        // Run tantivy search off the UI thread — with a few thousand
+        // sessions a single search can take tens-to-hundreds of ms, and
+        // re-issuing it per keystroke caused the UI to freeze on rapid
+        // editing. The receiver path (`search_task` poll in run loop)
+        // remaps `(day_idx, session_idx)` against the live `daily_groups`
+        // using `session_path` so filter changes between dispatch and
+        // arrival don't yield stale indices.
+        let index = std::sync::Arc::clone(index);
+        let (tx, rx) = mpsc::channel();
+        state.searching = true;
+        state.search_task = Some((rx, query.clone()));
+        std::thread::spawn(move || {
+            let results = index.search(&query, 200, 50);
+            let _ = tx.send(results);
+        });
         return;
     }
 
@@ -940,9 +1214,10 @@ fn start_index_build(state: &mut AppState) {
     // always builds; subsequent reload-driven rebuilds wait at least 60 s
     // so an actively-growing session JSONL doesn't keep the indicator lit.
     if let Some(last) = state.last_index_build
-        && last.elapsed() < std::time::Duration::from_secs(60) {
-            return;
-        }
+        && last.elapsed() < std::time::Duration::from_secs(60)
+    {
+        return;
+    }
 
     // Index unfiltered groups so the manifest covers every session.
     let groups: Vec<DailyGroup> = state.original_daily_groups.clone();
@@ -959,7 +1234,6 @@ fn start_index_build(state: &mut AppState) {
 pub(crate) use text::format_number;
 
 pub(crate) use summary::update_jsonl_summary;
-
 
 #[cfg(test)]
 include!("main_tests.rs");

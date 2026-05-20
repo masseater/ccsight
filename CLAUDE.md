@@ -67,8 +67,11 @@ isn't obvious from the filename.
 | `infrastructure/resource_config.rs` | `discover_configured_resources()` walks `~/.claude/{skills,commands,agents}/` plus enabled plugin paths so the Tools popup can show 0-call rows for installed-but-unused entries. |
 | `infrastructure/cowork_source.rs` | Claude Desktop Cowork audit logs (Anthropic-private format — undocumented, may break between Claude Desktop releases). Discovery is silent on parse failure so per-file errors don't crash the TUI. |
 | `infrastructure/search_index.rs` | tantivy ngram(2,3) index at `~/.ccsight/index/`. `update_or_build()` handles fresh / incremental / reuse. |
-| `infrastructure/state_dir.rs` | Single source of truth for on-disk state paths (`~/.ccsight/{cache.json,index/,pins.json}`). `migrate_legacy_state_dirs()` is called at startup to relocate pre-1.1 paths. |
+| `infrastructure/state_dir.rs` | Single source of truth for on-disk state paths under `~/.ccsight/`. `migrate_legacy_state_dirs()` is called at startup to relocate pre-1.1 paths. |
+| `infrastructure/live_sessions.rs` | Discovers active Claude Code processes via `~/.claude/sessions/<pid>.json` + PID liveness, plus paused sessions via JSONL mtime. `WARM_THRESHOLD_SECS` is the single source of truth shared between the sort tier and the row glyph. |
+| `infrastructure/live_snapshot.rs` | Persists "session_id last seen alive" so that after a host reboot (every Claude Code process killed) `recover_missing()` can bring those rows back into the paused list with the `⟳` glyph. |
 | `handlers/mcp_popup.rs` | Tools-tab cursor row math. Coord origin must match the body slicing in `dashboard.rs::draw_dashboard_detail_popup` (see doc comment). |
+| `shell.rs` | `posix_shell_quote` — the only sanctioned way to embed user-derived strings into `cd ... && claude -r ...` resume commands. Lint #28 enforces. |
 | `state.rs` | `AppState`, `ConversationPane`, `TextInput`. Adding a field is compiler-checked at every `AppState { ... }` literal. |
 | `test_helpers.rs` | `#[cfg(test)]` fixtures. `create_test_state()` returns an `AppState` with deterministic token / cost values. |
 
@@ -110,6 +113,17 @@ govern, so they're seen at the moment of violation:
 **Compiler-enforced** (no rule needed):
 - AppState init parity — every `AppState { ... }` literal lists every field.
 - Real-world identifier shapes — fully covered by lint #16 / #17 / #21.
+
+**Suppressing warnings (`#[allow(...)]`)**: never apply on a guess. Before
+adding `#[allow(dead_code)]` / `#[allow(clippy::...)]` / `#[allow(unused)]`,
+identify *why* the compiler / clippy flagged the symbol — read the macro
+source, the upstream API change, or the surrounding code path. Outcome is
+one of: (a) **remove the symbol** (truly unused after an API migration);
+(b) **wire it up** (actually needed but a usage site is missing);
+(c) **keep `allow` with a code comment** that names the macro / generated
+code / FFI boundary that reads the symbol invisibly to the compiler. Bare
+`#[allow]` without that justification silently buries real bugs (case (a)
+or (b)) under a "looks clean" diff.
 
 ## Commits
 
@@ -175,7 +189,11 @@ the threshold inline (lint #19).
 
 - **Search state**: `[Normal] → / → [Search] → Enter → [Preview] → Esc → [Search] → Esc → [Normal]`. Preview saves tab/position via `search_saved_state`.
 - **Pane search**: VS Code style — Enter/Shift+Enter = next/prev, Esc closes the bar (n/N still work).
-- **Async**: Background threads for data load, summary, index build via `mpsc::channel`. UI must show "Searching..." (not "No results") while a loading flag is set.
+- **Async**: Background threads for data load, summary, index build via `mpsc::channel`. UI must show "Searching..." (not "No results") while a loading flag is set. Every `Receiver` must be polled with `match` covering `Disconnected` — `let Ok(...) = rx.try_recv()` silently swallows worker-thread panics and freezes the task forever (lint #26).
 - **MCP tools** (`mcp.rs`): `stats` (+ per-server `mcp_servers` snapshot), `sessions`, `search`. All share `date_from` / `date_to` (`YYYY-MM-DD`, local timezone).
-- **Costs include subagents**: Overview, Costs panel, and `--daily` CLI all sum over `group.sessions` so totals match. `cost_without_subagents` was renamed `daily_costs_total`.
+- **Costs include subagents**: Overview, Costs panel, and `--daily` CLI all sum over `group.sessions` so totals match.
 - **stderr is forbidden** — writes corrupt the TUI rendering. Lint #20 enforces.
+- **Atomic file writes**: every `tmp + rename` write under `~/.ccsight/` must `sync_all` before the rename, otherwise the data isn't durable across power loss. Lint #29 enforces.
+- **Shell command escaping**: any string composed for the user to paste into a shell (`cd ... && claude -r ...`) must route both interpolations through `crate::shell::posix_shell_quote`. The cwd / session_id come from on-disk JSON. Lint #28 enforces.
+- **Cursor vs viewport**: scrollable lists with a selection (Daily, Live, Projects detail, MCP server detail) decouple the cursor from the viewport — viewport adjusts only when the cursor leaves the visible window (Vim's `scrolloff` pattern). Scroll-only views collapse the two into one value. New panels with a selection cursor must follow the decoupled pattern.
+- **Render-stable sort**: any `Vec` built from a `HashMap` and sorted on a single key produces non-deterministic order for tied values (HashMap iteration is randomized per instance). Always add a tiebreaker (typically alphabetical on name) via `.then_with(|| a.0.cmp(b.0))` so rows don't shuffle between frames. Lint #30 enforces.

@@ -2,8 +2,8 @@
 //! clamping. Used by the keyboard handler (cursor nav) and the popup renderer
 //! (rendered server-list order).
 
-use crate::aggregator::{classify_tool, ToolCategory};
 use crate::AppState;
+use crate::aggregator::{ToolCategory, classify_tool};
 
 /// Synthetic group name for built-in tools when they are rendered alongside MCP
 /// servers in the Tools detail popup (active==0). Treated as a single
@@ -62,9 +62,7 @@ pub(crate) fn mcp_tool_count(state: &AppState, server: &str) -> usize {
         .stats
         .tool_usage
         .keys()
-        .filter(|k| {
-            matches!(classify_tool(k), ToolCategory::Mcp { server: ref s } if s == server)
-        })
+        .filter(|k| matches!(classify_tool(k), ToolCategory::Mcp { server: ref s } if s == server))
         .count()
 }
 
@@ -113,10 +111,7 @@ fn mcp_pre_server_offset(state: &AppState) -> usize {
     // re-implemented the check inline with `> 30` while the legend used `>= 30`,
     // causing off-by-one drift between displays.
     let now = chrono::Utc::now();
-    let any_stale = state
-        .mcp_status
-        .iter()
-        .any(|s| s.is_underutilized(now, 30));
+    let any_stale = state.mcp_status.iter().any(|s| s.is_underutilized(now, 30));
     1 + usize::from(any_stale)
 }
 
@@ -130,9 +125,9 @@ pub(crate) fn adjust_mcp_scroll(state: &mut AppState, servers: &[String]) {
     // Pinned header rows above the scrollable body: blank + Total + tab bar + separator.
     // The summary (and optional legend) lives in body[0..] and scrolls with the rest.
     const HEADER_ROWS: usize = 4;
-    let visible_body = state
-        .active_popup_area
-        .map_or(20, |a| (a.height as usize).saturating_sub(2 + HEADER_ROWS).max(1));
+    let visible_body = state.active_popup_area.map_or(20, |a| {
+        (a.height as usize).saturating_sub(2 + HEADER_ROWS).max(1)
+    });
     // mcp_cursor_row returns server-relative (server 0 = row 0); add the pre-server
     // offset (summary + optional legend) so body_cursor matches the rendered slice.
     let body_cursor = mcp_cursor_row(state, servers) + mcp_pre_server_offset(state);

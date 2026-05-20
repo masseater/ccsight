@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
 use chrono::{Local, NaiveDate};
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 
-use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper};
-use crate::conversation::{load_conversation, ConversationBlock, ConversationMessage};
-use crate::infrastructure::FileDiscovery;
 use crate::PeriodFilter;
+use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper};
+use crate::conversation::{ConversationBlock, ConversationMessage, load_conversation};
+use crate::infrastructure::FileDiscovery;
 
 use std::path::PathBuf;
 
@@ -17,7 +16,6 @@ use std::path::PathBuf;
 pub struct CcsightServer {
     limit: usize,
     fixed_groups: Option<Vec<DailyGroup>>,
-    tool_router: ToolRouter<Self>,
 }
 
 struct LoadedData {
@@ -52,19 +50,29 @@ fn build_loaded_data(daily_groups: Vec<DailyGroup>) -> LoadedData {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct StatsParams {
-    #[schemars(description = "Period filter: \"today\", \"week\", \"month\", \"all\" (default). Ignored when date_from is set.")]
+    #[schemars(
+        description = "Period filter: \"today\", \"week\", \"month\", \"all\" (default). Ignored when date_from is set."
+    )]
     period: Option<String>,
-    #[schemars(description = "Start date for range filter (YYYY-MM-DD). Takes priority over period.")]
+    #[schemars(
+        description = "Start date for range filter (YYYY-MM-DD). Takes priority over period."
+    )]
     date_from: Option<String>,
-    #[schemars(description = "End date for range filter (YYYY-MM-DD). Defaults to today if omitted.")]
+    #[schemars(
+        description = "End date for range filter (YYYY-MM-DD). Defaults to today if omitted."
+    )]
     date_to: Option<String>,
-    #[schemars(description = "Group results by: \"day\" (returns daily breakdown). Omit for totals only. Projects are always included.")]
+    #[schemars(
+        description = "Group results by: \"day\" (returns daily breakdown). Omit for totals only. Projects are always included."
+    )]
     group_by: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SearchParams {
-    #[schemars(description = "Search query. Searches across all session conversations (full-text) and metadata (project name, summary, branch, date).")]
+    #[schemars(
+        description = "Search query. Searches across all session conversations (full-text) and metadata (project name, summary, branch, date)."
+    )]
     query: String,
     #[schemars(description = "Filter by project name (partial match)")]
     project: Option<String>,
@@ -77,16 +85,32 @@ struct SearchParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct LiveSessionsParams {
+    #[schemars(
+        description = "Filter by project name / cwd substring (case-sensitive). Omit for all projects."
+    )]
+    project: Option<String>,
+    #[schemars(
+        description = "Filter by status tier: \"busy\" (process actively responding), \"warm\" (idle, last touched within 30 min), \"idle\" (alive but quiet), \"paused\" (process gone, JSONL within 24h or in snapshot). Omit for all."
+    )]
+    status: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SessionsParams {
     #[schemars(
         description = "Session ID (first 8 chars) to get detail. When set, returns conversation, tool usage, and files touched."
     )]
     session_id: Option<String>,
-    #[schemars(description = "Filter by keyword (matches project, summary, branch, date metadata only). For full-text content search, use 'search' tool.")]
+    #[schemars(
+        description = "Filter by keyword (matches project, summary, branch, date metadata only). For full-text content search, use 'search' tool."
+    )]
     query: Option<String>,
     #[schemars(description = "Filter by project name (partial match)")]
     project: Option<String>,
-    #[schemars(description = "Filter by exact date (YYYY-MM-DD). For ranges, use date_from/date_to instead.")]
+    #[schemars(
+        description = "Filter by exact date (YYYY-MM-DD). For ranges, use date_from/date_to instead."
+    )]
     date: Option<String>,
     #[schemars(description = "Start date for range filter (YYYY-MM-DD)")]
     date_from: Option<String>,
@@ -100,9 +124,13 @@ struct SessionsParams {
         description = "Max conversation entries in session_detail. Default: all. Set 0 to omit conversation entirely."
     )]
     conversation_limit: Option<usize>,
-    #[schemars(description = "Skip first N conversation entries (for pagination). Use with conversation_limit.")]
+    #[schemars(
+        description = "Skip first N conversation entries (for pagination). Use with conversation_limit."
+    )]
     conversation_offset: Option<usize>,
-    #[schemars(description = "Search within conversation. Returns only matching messages with 1 message of context before/after. Each message includes its offset. More useful than conversation_offset for finding specific content.")]
+    #[schemars(
+        description = "Search within conversation. Returns only matching messages with 1 message of context before/after. Each message includes its offset. More useful than conversation_offset for finding specific content."
+    )]
     conversation_query: Option<String>,
     #[schemars(description = "Filter to pinned sessions only")]
     pinned: Option<bool>,
@@ -126,13 +154,15 @@ fn filter_groups_by_date_range(
         .iter()
         .filter(|g| {
             if let Some(s) = start
-                && g.date < s {
-                    return false;
-                }
+                && g.date < s
+            {
+                return false;
+            }
             if let Some(e) = end
-                && g.date > e {
-                    return false;
-                }
+                && g.date > e
+            {
+                return false;
+            }
             true
         })
         .collect()
@@ -144,7 +174,6 @@ impl CcsightServer {
         Self {
             limit,
             fixed_groups: None,
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -153,7 +182,6 @@ impl CcsightServer {
         Self {
             limit: 0,
             fixed_groups: Some(daily_groups),
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -165,7 +193,9 @@ impl CcsightServer {
         }
     }
 
-    #[tool(description = "Get aggregated usage statistics: cost, tokens (input/output/cache), model breakdown, projects, hourly patterns, tool usage, languages. Use group_by=day for daily breakdown. All dates/times are in local timezone.")]
+    #[tool(
+        description = "Get aggregated usage statistics: cost, tokens (input/output/cache), model breakdown, projects, hourly patterns, tool usage, languages. Use group_by=day for daily breakdown. All dates/times are in local timezone."
+    )]
     fn stats(
         &self,
         Parameters(params): Parameters<StatsParams>,
@@ -208,7 +238,9 @@ impl CcsightServer {
             for session in &group.sessions {
                 let mut session_cost = 0.0;
                 for (model, tokens) in &session.day_tokens_by_model {
-                    let cost = calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+                    let cost = calculator
+                        .calculate_cost(tokens, Some(model))
+                        .unwrap_or(0.0);
                     if !calculator.has_pricing(Some(model)) {
                         models_without_pricing
                             .insert(crate::aggregator::normalize_model_name(model));
@@ -394,9 +426,13 @@ impl CcsightServer {
                     })
                     .collect();
             entries.sort_by(|a, b| {
-                a["status"].as_str().cmp(&b["status"].as_str())
+                a["status"]
+                    .as_str()
+                    .cmp(&b["status"].as_str())
                     .then_with(|| {
-                        b["total_calls"].as_u64().unwrap_or(0)
+                        b["total_calls"]
+                            .as_u64()
+                            .unwrap_or(0)
                             .cmp(&a["total_calls"].as_u64().unwrap_or(0))
                     })
                     .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
@@ -448,7 +484,9 @@ impl CcsightServer {
         )]))
     }
 
-    #[tool(description = "Full-text search across all session conversations using tantivy index. Returns matching sessions with snippets. Also searches metadata (project, summary, branch, date). All dates/times are in local timezone.")]
+    #[tool(
+        description = "Full-text search across all session conversations using tantivy index. Returns matching sessions with snippets. Also searches metadata (project, summary, branch, date). All dates/times are in local timezone."
+    )]
     fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -472,8 +510,14 @@ impl CcsightServer {
             }
         }
 
-        let date_from = params.date_from.as_deref().and_then(|d| d.parse::<NaiveDate>().ok());
-        let date_to = params.date_to.as_deref().and_then(|d| d.parse::<NaiveDate>().ok());
+        let date_from = params
+            .date_from
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
+        let date_to = params
+            .date_to
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
 
         let calculator = CostCalculator::global();
         let mut results_json: Vec<serde_json::Value> = Vec::new();
@@ -486,9 +530,15 @@ impl CcsightServer {
                 continue;
             };
             if let Some(from) = date_from
-                && group.date < from { continue; }
+                && group.date < from
+            {
+                continue;
+            }
             if let Some(to) = date_to
-                && group.date > to { continue; }
+                && group.date > to
+            {
+                continue;
+            }
             let Some(session) = group
                 .sessions
                 .iter()
@@ -498,8 +548,12 @@ impl CcsightServer {
                 continue;
             };
             if let Some(ref proj) = params.project
-                && !session.project_name.to_lowercase().contains(&proj.to_lowercase()) {
-                    continue;
+                && !session
+                    .project_name
+                    .to_lowercase()
+                    .contains(&proj.to_lowercase())
+            {
+                continue;
             };
 
             let cost: f64 = session
@@ -550,7 +604,167 @@ impl CcsightServer {
         )]))
     }
 
-    #[tool(description = "List sessions or get session detail. With session_id: returns conversation, tool usage, files touched. Without: lists sessions filtered by query (metadata only: project/summary/branch/date), project, date range, sort. For full-text content search, use 'search' tool instead. All dates/times are in local timezone.")]
+    #[tool(
+        description = "List currently running and recently disconnected Claude Code sessions. Sources: ~/.claude/sessions/<pid>.json (PID liveness verified), ~/.claude/projects/**/*.jsonl mtime (24h window), and ccsight's snapshot of previously-alive session IDs. Each row reports session_id, cwd, project, status tier (busy/warm/idle/paused), age (seconds since last update), pid (0 for paused), today's tokens/cost, model, ai_title, and last user-message preview. Use the `live` tab semantics to find what's open right now or what was running before a reboot. All timestamps local timezone."
+    )]
+    fn live_sessions(
+        &self,
+        Parameters(params): Parameters<LiveSessionsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        use crate::infrastructure::live_sessions::{
+            LiveSession, WARM_THRESHOLD_SECS, discover_live, discover_recently_paused,
+            mark_was_recently_live,
+        };
+        use crate::infrastructure::live_snapshot::LiveSnapshot;
+
+        let active = discover_live();
+        let active_ids: std::collections::HashSet<String> =
+            active.iter().map(|s| s.session_id.clone()).collect();
+        let mut paused = discover_recently_paused(
+            &active_ids,
+            std::time::Duration::from_secs(24 * 3600),
+            std::time::SystemTime::now(),
+        );
+        let snapshot = LiveSnapshot::load();
+        // MCP is a one-shot read; it doesn't observe alive→dead transitions
+        // across its own poll cycles, so use `now` as the horizon. Every
+        // snapshot match qualifies as `⟳` (the previous flag semantics).
+        // Currently-alive sessions are already filtered out of `paused`.
+        let horizon = chrono::Utc::now();
+        mark_was_recently_live(&mut paused, &snapshot, horizon);
+        let paused_ids: std::collections::HashSet<String> =
+            paused.iter().map(|s| s.session_id.clone()).collect();
+        let recovered = snapshot.recover_missing(&active_ids, &paused_ids, horizon);
+        paused.extend(recovered);
+        mark_was_recently_live(&mut paused, &snapshot, horizon);
+
+        // Lookup table from `daily_groups` so we can enrich each live row
+        // with ai_title / last_user_message / tokens / cost / model. Build
+        // once per call (not per row) — this is the same memoization
+        // pattern the TUI Live tab needs.
+        let data = self.load();
+        let calculator = CostCalculator::global();
+        let mut by_path: HashMap<&std::path::Path, &crate::aggregator::SessionInfo> =
+            HashMap::new();
+        for g in &data.daily_groups {
+            for s in &g.sessions {
+                by_path.entry(s.file_path.as_path()).or_insert(s);
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let classify_tier = |s: &LiveSession| -> &'static str {
+            if !s.is_live {
+                "paused"
+            } else if s.status.as_deref() == Some("busy") {
+                "busy"
+            } else {
+                let secs = s
+                    .updated_at
+                    .or(s.jsonl_mtime)
+                    .or(s.started_at)
+                    .map_or(0, |t| (now - t).num_seconds().max(0));
+                if secs < WARM_THRESHOLD_SECS {
+                    "warm"
+                } else {
+                    "idle"
+                }
+            }
+        };
+
+        let want_status = params.status.as_deref();
+        let want_project = params.project.as_deref();
+
+        let project_label = |cwd: &std::path::Path| -> String {
+            cwd.file_name()
+                .and_then(|n| n.to_str())
+                .map_or_else(|| cwd.display().to_string(), str::to_string)
+        };
+
+        let to_row = |s: &LiveSession, tier: &'static str| -> serde_json::Value {
+            let info = s
+                .jsonl_path
+                .as_deref()
+                .and_then(|p| by_path.get(p).copied());
+            let age_secs = s
+                .updated_at
+                .or(s.jsonl_mtime)
+                .or(s.started_at)
+                .map(|t| (now - t).num_seconds().max(0));
+            let tokens: u64 = info.map_or(0, |i| {
+                i.day_tokens_by_model
+                    .values()
+                    .map(crate::aggregator::TokenStats::work_tokens)
+                    .sum()
+            });
+            let cost: f64 = info.map_or(0.0, |i| {
+                i.day_tokens_by_model
+                    .iter()
+                    .map(|(m, t)| calculator.calculate_cost(t, Some(m)).unwrap_or(0.0))
+                    .sum()
+            });
+            let model_normalized = info
+                .and_then(|i| i.model.as_ref())
+                .map(|m| crate::aggregator::normalize_model_name(m));
+            serde_json::json!({
+                "session_id": s.session_id,
+                "cwd": s.cwd.display().to_string(),
+                "project": project_label(&s.cwd),
+                "status": tier,
+                "age_secs": age_secs,
+                "pid": s.pid,
+                "was_recently_live": s.was_recently_live,
+                "tokens": tokens,
+                "cost": cost,
+                "model": model_normalized,
+                "ai_title": info.and_then(|i| i.ai_title.clone()),
+                "last_user_message": info.and_then(|i| i.last_user_message.clone()),
+            })
+        };
+
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for s in &active {
+            let tier = classify_tier(s);
+            if let Some(want) = want_status
+                && want != tier
+            {
+                continue;
+            }
+            if let Some(proj) = want_project
+                && !s.cwd.to_string_lossy().contains(proj)
+            {
+                continue;
+            }
+            rows.push(to_row(s, tier));
+        }
+        for s in &paused {
+            let tier = "paused";
+            if let Some(want) = want_status
+                && want != tier
+            {
+                continue;
+            }
+            if let Some(proj) = want_project
+                && !s.cwd.to_string_lossy().contains(proj)
+            {
+                continue;
+            }
+            rows.push(to_row(s, tier));
+        }
+
+        let output = serde_json::json!({
+            "active_count": active.len(),
+            "paused_count": paused.len(),
+            "sessions": rows,
+        });
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&output).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "List sessions or get session detail. With session_id: returns conversation, tool usage, files touched. Without: lists sessions filtered by query (metadata only: project/summary/branch/date), project, date range, sort. For full-text content search, use 'search' tool instead. All dates/times are in local timezone."
+    )]
     fn sessions(
         &self,
         Parameters(params): Parameters<SessionsParams>,
@@ -572,7 +786,10 @@ impl CcsightServer {
         let calculator = CostCalculator::global();
         let mut sessions_out: Vec<serde_json::Value> = Vec::new();
 
-        let date_exact = params.date.as_deref().and_then(|d| d.parse::<NaiveDate>().ok());
+        let date_exact = params
+            .date
+            .as_deref()
+            .and_then(|d| d.parse::<NaiveDate>().ok());
         let date_from = params
             .date_from
             .as_deref()
@@ -587,13 +804,15 @@ impl CcsightServer {
                 return group_date == exact;
             }
             if let Some(from) = date_from
-                && group_date < from {
-                    return false;
-                }
+                && group_date < from
+            {
+                return false;
+            }
             if let Some(to) = date_to
-                && group_date > to {
-                    return false;
-                }
+                && group_date > to
+            {
+                return false;
+            }
             true
         };
 
@@ -613,13 +832,14 @@ impl CcsightServer {
                         .project_name
                         .to_lowercase()
                         .contains(&project.to_lowercase())
-                    {
-                        return false;
-                    }
+                {
+                    return false;
+                }
                 if let Some(ref p) = pins
-                    && !p.is_pinned(&session.file_path) {
-                        return false;
-                    }
+                    && !p.is_pinned(&session.file_path)
+                {
+                    return false;
+                }
                 true
             };
 
@@ -631,7 +851,8 @@ impl CcsightServer {
                 if !should_include(group, session) {
                     continue;
                 }
-                let mut json = build_session_json(group.date, session, calculator, &data.summary_cache);
+                let mut json =
+                    build_session_json(group.date, session, calculator, &data.summary_cache);
                 let auto = json["summary"]
                     .as_str()
                     .is_some_and(|s| AUTO_PREFIXES.iter().any(|p| s.starts_with(p)));
@@ -742,21 +963,28 @@ impl CcsightServer {
             let limit = conv_limit.unwrap_or(30);
             let mut include = std::collections::BTreeSet::new();
             for &idx in &match_indices {
-                if idx > 0 { include.insert(idx - 1); }
+                if idx > 0 {
+                    include.insert(idx - 1);
+                }
                 include.insert(idx);
-                if idx + 1 < total { include.insert(idx + 1); }
+                if idx + 1 < total {
+                    include.insert(idx + 1);
+                }
             }
 
             let mut result_conv = Vec::new();
             let mut prev_idx: Option<usize> = None;
             for &idx in &include {
-                if result_conv.len() >= limit { break; }
+                if result_conv.len() >= limit {
+                    break;
+                }
                 if let Some(prev) = prev_idx
-                    && idx > prev + 1 {
-                        result_conv.push(serde_json::json!({
-                            "role": "...",
-                            "text": format!("({} entries omitted)", idx - prev - 1),
-                        }));
+                    && idx > prev + 1
+                {
+                    result_conv.push(serde_json::json!({
+                        "role": "...",
+                        "text": format!("({} entries omitted)", idx - prev - 1),
+                    }));
                 }
                 let mut entry = conversation_full[idx].clone();
                 entry["offset"] = serde_json::json!(idx);
@@ -866,10 +1094,10 @@ fn extract_files_touched(messages: &[ConversationMessage]) -> Vec<String> {
                 input_summary,
             } = block
                 && matches!(name.as_str(), "Read" | "Edit" | "Write" | "MultiEdit")
-                    && !input_summary.is_empty()
-                {
-                    files.insert(input_summary.clone());
-                }
+                && !input_summary.is_empty()
+            {
+                files.insert(input_summary.clone());
+            }
         }
     }
     let mut sorted: Vec<String> = files.into_iter().collect();
@@ -877,10 +1105,7 @@ fn extract_files_touched(messages: &[ConversationMessage]) -> Vec<String> {
     sorted
 }
 
-const AUTO_PREFIXES: &[&str] = &[
-    "You are a rule generator",
-    "Generate a git commit message",
-];
+const AUTO_PREFIXES: &[&str] = &["You are a rule generator", "Generate a git commit message"];
 
 fn derive_summary(file_path: &std::path::Path) -> Option<String> {
     use crate::domain::EntryType;
@@ -916,7 +1141,9 @@ fn build_session_json(
     let mut cache_creation = 0u64;
     let mut cache_read = 0u64;
     for (model, tokens) in &session.day_tokens_by_model {
-        cost += calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+        cost += calculator
+            .calculate_cost(tokens, Some(model))
+            .unwrap_or(0.0);
         cache_creation += tokens.cache_creation_tokens;
         cache_read += tokens.cache_read_tokens;
     }
@@ -945,11 +1172,10 @@ fn build_session_json(
         .map(crate::aggregator::normalize_model_name)
         .unwrap_or_default();
 
-    let summary = session.summary.clone().or_else(|| {
-        summary_cache
-            .get(&session.file_path)
-            .and_then(Clone::clone)
-    });
+    let summary = session
+        .summary
+        .clone()
+        .or_else(|| summary_cache.get(&session.file_path).and_then(Clone::clone));
 
     serde_json::json!({
         "session_id": session_id,
@@ -1105,9 +1331,19 @@ mod tests {
             make_daily_group(
                 today,
                 vec![
-                    make_session_with_tokens("~/projects/app-a", 100_000, 50_000, "claude-sonnet-4-20250514"),
+                    make_session_with_tokens(
+                        "~/projects/app-a",
+                        100_000,
+                        50_000,
+                        "claude-sonnet-4-20250514",
+                    ),
                     {
-                        let mut s = make_session_with_tokens("~/projects/other", 50_000, 25_000, "claude-sonnet-4-20250514");
+                        let mut s = make_session_with_tokens(
+                            "~/projects/other",
+                            50_000,
+                            25_000,
+                            "claude-sonnet-4-20250514",
+                        );
                         s.summary = Some("Fix login bug".to_string());
                         s.git_branch = Some("fix/login".to_string());
                         s
@@ -1116,11 +1352,21 @@ mod tests {
             ),
             make_daily_group(
                 yesterday,
-                vec![make_session_with_tokens("~/projects/app-a", 80_000, 40_000, "claude-opus-4-5-20251101")],
+                vec![make_session_with_tokens(
+                    "~/projects/app-a",
+                    80_000,
+                    40_000,
+                    "claude-opus-4-5-20251101",
+                )],
             ),
             make_daily_group(
                 last_week,
-                vec![make_session_with_tokens("~/projects/old-project", 30_000, 10_000, "claude-sonnet-4-20250514")],
+                vec![make_session_with_tokens(
+                    "~/projects/old-project",
+                    30_000,
+                    10_000,
+                    "claude-sonnet-4-20250514",
+                )],
             ),
         ]
     }
@@ -1170,13 +1416,18 @@ mod tests {
 
     #[test]
     fn test_build_session_json_fields() {
-        let session = make_session_with_tokens("~/projects/myapp", 100_000, 50_000, "claude-sonnet-4-20250514");
-        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let session = make_session_with_tokens(
+            "~/projects/myapp",
+            100_000,
+            50_000,
+            "claude-sonnet-4-20250514",
+        );
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let calculator = CostCalculator::global();
 
         let json = build_session_json(date, &session, calculator, &HashMap::new());
 
-        assert_eq!(json["date"], "2026-03-19");
+        assert_eq!(json["date"], "2026-03-19"); // lint-ok: date-literal
         assert_eq!(json["project"], "~/projects/myapp");
         assert_eq!(json["model"], "Sonnet 4");
         assert_eq!(json["tokens"]["input"], 100_000);
@@ -1188,9 +1439,13 @@ mod tests {
 
     #[test]
     fn test_build_session_json_with_summary_and_branch() {
-        let mut session = make_session("~/projects/app", Some("Added MCP support"), Some("feature/mcp"));
+        let mut session = make_session(
+            "~/projects/app",
+            Some("Added MCP support"),
+            Some("feature/mcp"),
+        );
         session.model = Some("claude-sonnet-4-20250514".to_string());
-        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
 
         assert_eq!(json["summary"], "Added MCP support");
@@ -1199,8 +1454,9 @@ mod tests {
 
     #[test]
     fn test_build_session_json_null_optional_fields() {
-        let session = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
-        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let session =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
 
         assert!(json["summary"].is_null());
@@ -1209,9 +1465,10 @@ mod tests {
 
     #[test]
     fn test_build_session_json_session_id_truncated() {
-        let mut session = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        let mut session =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
         session.file_path = std::path::PathBuf::from("/tmp/abcdefghijklmnop.jsonl");
-        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 19).unwrap(); // lint-ok: date-literal
         let json = build_session_json(date, &session, CostCalculator::global(), &HashMap::new());
 
         assert_eq!(json["session_id"].as_str().unwrap().len(), 8);
@@ -1251,13 +1508,17 @@ mod tests {
         let json = call_stats(&server, Some("week"));
 
         assert_eq!(json["period"], "week");
-        assert_eq!(json["total_sessions"], 3, "should include today + yesterday but not last_week");
+        assert_eq!(
+            json["total_sessions"], 3,
+            "should include today + yesterday but not last_week"
+        );
     }
 
     #[test]
     fn test_stats_subagent_cost_included_sessions_excluded() {
         let today = Local::now().date_naive();
-        let mut subagent = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        let mut subagent =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
         subagent.is_subagent = true;
 
         let groups = vec![make_daily_group(
@@ -1270,24 +1531,51 @@ mod tests {
         let server = CcsightServer::from_groups(groups);
         let json = call_stats(&server, None);
 
-        assert_eq!(json["total_sessions"], 1, "session count excludes subagents");
-        assert_eq!(json["tokens"]["input"], 2000, "token counts include subagents");
-        assert!(json["total_cost_usd"].as_f64().unwrap() > 0.0, "cost includes subagents");
+        assert_eq!(
+            json["total_sessions"], 1,
+            "session count excludes subagents"
+        );
+        assert_eq!(
+            json["tokens"]["input"], 2000,
+            "token counts include subagents"
+        );
+        assert!(
+            json["total_cost_usd"].as_f64().unwrap() > 0.0,
+            "cost includes subagents"
+        );
 
-        let single = call_stats(&CcsightServer::from_groups(vec![make_daily_group(
-            today,
-            vec![make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514")],
-        )]), None);
+        let single = call_stats(
+            &CcsightServer::from_groups(vec![make_daily_group(
+                today,
+                vec![make_session_with_tokens(
+                    "~/projects/app",
+                    1000,
+                    500,
+                    "claude-sonnet-4-20250514",
+                )],
+            )]),
+            None,
+        );
         let cost_without = single["total_cost_usd"].as_f64().unwrap();
         let cost_with = json["total_cost_usd"].as_f64().unwrap();
-        assert!(cost_with > cost_without, "cost with subagent should be higher");
+        assert!(
+            cost_with > cost_without,
+            "cost with subagent should be higher"
+        );
     }
 
     #[test]
     fn test_stats_projects_returns_all() {
         let today = Local::now().date_naive();
         let sessions: Vec<_> = (0..8)
-            .map(|i| make_session_with_tokens(&format!("~/projects/project-{i}"), 1000, 500, "claude-sonnet-4-20250514"))
+            .map(|i| {
+                make_session_with_tokens(
+                    &format!("~/projects/project-{i}"),
+                    1000,
+                    500,
+                    "claude-sonnet-4-20250514",
+                )
+            })
             .collect();
         let server = CcsightServer::from_groups(vec![make_daily_group(today, sessions)]);
         let json = call_stats(&server, None);
@@ -1371,8 +1659,18 @@ mod tests {
         let groups = vec![make_daily_group(
             today,
             vec![
-                make_session_with_tokens("~/projects/app", 100_000, 50_000, "claude-opus-4-5-20251101"),
-                make_session_with_tokens("~/projects/app", 100_000, 50_000, "claude-sonnet-4-20250514"),
+                make_session_with_tokens(
+                    "~/projects/app",
+                    100_000,
+                    50_000,
+                    "claude-opus-4-5-20251101",
+                ),
+                make_session_with_tokens(
+                    "~/projects/app",
+                    100_000,
+                    50_000,
+                    "claude-sonnet-4-20250514",
+                ),
             ],
         )];
         let server = CcsightServer::from_groups(groups);
@@ -1388,7 +1686,8 @@ mod tests {
     #[test]
     fn test_stats_hourly_work_tokens() {
         let today = Local::now().date_naive();
-        let mut session = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        let mut session =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
         session.day_hourly_work_tokens.insert(10, 5000);
         session.day_hourly_work_tokens.insert(14, 3000);
 
@@ -1478,7 +1777,8 @@ mod tests {
     #[test]
     fn test_sessions_excludes_subagents() {
         let today = Local::now().date_naive();
-        let mut subagent = make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
+        let mut subagent =
+            make_session_with_tokens("~/projects/app", 1000, 500, "claude-sonnet-4-20250514");
         subagent.is_subagent = true;
 
         let groups = vec![make_daily_group(
@@ -1552,8 +1852,22 @@ mod tests {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
         let groups = vec![
-            make_daily_group(today, vec![make_session("~/projects/app", Some("Fix login today"), None)]),
-            make_daily_group(yesterday, vec![make_session("~/projects/app", Some("Fix login yesterday"), None)]),
+            make_daily_group(
+                today,
+                vec![make_session(
+                    "~/projects/app",
+                    Some("Fix login today"),
+                    None,
+                )],
+            ),
+            make_daily_group(
+                yesterday,
+                vec![make_session(
+                    "~/projects/app",
+                    Some("Fix login yesterday"),
+                    None,
+                )],
+            ),
         ];
         let server = CcsightServer::from_groups(groups);
         let json = call_sessions(&server, Some("login"), None, Some(&today.to_string()), None);
@@ -1621,9 +1935,11 @@ mod tests {
     fn test_session_detail_with_date_filter() {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
-        let mut s1 = make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514");
+        let mut s1 =
+            make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514");
         s1.file_path = std::path::PathBuf::from("/tmp/sameid12-today.jsonl");
-        let mut s2 = make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514");
+        let mut s2 =
+            make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514");
         s2.file_path = std::path::PathBuf::from("/tmp/sameid12-yesterday.jsonl");
 
         let groups = vec![
@@ -1703,7 +2019,10 @@ mod tests {
             tokens: None,
         }];
         let conv = extract_conversation(&messages);
-        assert!(conv.is_empty(), "tool-only assistant messages should be skipped");
+        assert!(
+            conv.is_empty(),
+            "tool-only assistant messages should be skipped"
+        );
     }
 
     #[test]
@@ -1786,11 +2105,31 @@ mod tests {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
         let groups = vec![
-            make_daily_group(today, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
-            make_daily_group(yesterday, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens(
+                    "~/projects/a",
+                    1000,
+                    500,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
+            make_daily_group(
+                yesterday,
+                vec![make_session_with_tokens(
+                    "~/projects/b",
+                    2000,
+                    1000,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
         ];
         let server = CcsightServer::from_groups(groups);
-        let json = call_stats_range(&server, &yesterday.to_string(), Some(&yesterday.to_string()));
+        let json = call_stats_range(
+            &server,
+            &yesterday.to_string(),
+            Some(&yesterday.to_string()),
+        );
 
         assert_eq!(json["period"], "custom");
         assert_eq!(json["total_sessions"], 1);
@@ -1802,8 +2141,24 @@ mod tests {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
         let groups = vec![
-            make_daily_group(today, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
-            make_daily_group(yesterday, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens(
+                    "~/projects/a",
+                    1000,
+                    500,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
+            make_daily_group(
+                yesterday,
+                vec![make_session_with_tokens(
+                    "~/projects/b",
+                    2000,
+                    1000,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
         ];
         let server = CcsightServer::from_groups(groups);
 
@@ -1816,7 +2171,10 @@ mod tests {
         let json = extract_json(&server.stats(Parameters(params)).unwrap());
 
         assert_eq!(json["period"], "custom");
-        assert_eq!(json["total_sessions"], 2, "date_from should override period");
+        assert_eq!(
+            json["total_sessions"], 2,
+            "date_from should override period"
+        );
     }
 
     #[test]
@@ -1824,8 +2182,24 @@ mod tests {
         let today = Local::now().date_naive();
         let old = today - chrono::Duration::days(30);
         let groups = vec![
-            make_daily_group(today, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
-            make_daily_group(old, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens(
+                    "~/projects/a",
+                    1000,
+                    500,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
+            make_daily_group(
+                old,
+                vec![make_session_with_tokens(
+                    "~/projects/b",
+                    2000,
+                    1000,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
         ];
         let server = CcsightServer::from_groups(groups);
         let json = call_stats_range(&server, &today.to_string(), None);
@@ -1841,7 +2215,10 @@ mod tests {
             "timestamp": "2026-03-20T10:00:00Z",
             "message": {"role": "user", "content": "Add MCP server support to the project"}
         })]);
-        assert_eq!(derive_summary(tmp.path()).as_deref(), Some("Add MCP server support to the project"));
+        assert_eq!(
+            derive_summary(tmp.path()).as_deref(),
+            Some("Add MCP server support to the project")
+        );
     }
 
     #[test]
@@ -1859,7 +2236,10 @@ mod tests {
                 "message": {"role": "user", "content": "Fix the login bug"}
             }),
         ]);
-        assert_eq!(derive_summary(tmp.path()).as_deref(), Some("Fix the login bug"));
+        assert_eq!(
+            derive_summary(tmp.path()).as_deref(),
+            Some("Fix the login bug")
+        );
     }
 
     #[test]
@@ -1894,10 +2274,42 @@ mod tests {
         let d2 = today - chrono::Duration::days(2);
         let d3 = today - chrono::Duration::days(1);
         let groups = vec![
-            make_daily_group(d1, vec![make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514")]),
-            make_daily_group(d2, vec![make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514")]),
-            make_daily_group(d3, vec![make_session_with_tokens("~/projects/c", 3000, 1500, "claude-sonnet-4-20250514")]),
-            make_daily_group(today, vec![make_session_with_tokens("~/projects/d", 4000, 2000, "claude-sonnet-4-20250514")]),
+            make_daily_group(
+                d1,
+                vec![make_session_with_tokens(
+                    "~/projects/a",
+                    1000,
+                    500,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
+            make_daily_group(
+                d2,
+                vec![make_session_with_tokens(
+                    "~/projects/b",
+                    2000,
+                    1000,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
+            make_daily_group(
+                d3,
+                vec![make_session_with_tokens(
+                    "~/projects/c",
+                    3000,
+                    1500,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
+            make_daily_group(
+                today,
+                vec![make_session_with_tokens(
+                    "~/projects/d",
+                    4000,
+                    2000,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
         ];
         let server = CcsightServer::from_groups(groups);
         let params = SessionsParams {
@@ -1925,7 +2337,12 @@ mod tests {
             today,
             vec![
                 make_session_with_tokens("~/projects/cheap", 1000, 500, "claude-sonnet-4-20250514"),
-                make_session_with_tokens("~/projects/expensive", 100_000, 50_000, "claude-opus-4-5-20251101"),
+                make_session_with_tokens(
+                    "~/projects/expensive",
+                    100_000,
+                    50_000,
+                    "claude-opus-4-5-20251101",
+                ),
             ],
         )];
         let server = CcsightServer::from_groups(groups);
@@ -1945,7 +2362,9 @@ mod tests {
         };
         let json = extract_json(&server.sessions(Parameters(params)).unwrap());
         let sessions = json["sessions"].as_array().unwrap();
-        assert!(sessions[0]["cost_usd"].as_f64().unwrap() > sessions[1]["cost_usd"].as_f64().unwrap());
+        assert!(
+            sessions[0]["cost_usd"].as_f64().unwrap() > sessions[1]["cost_usd"].as_f64().unwrap()
+        );
     }
 
     #[test]
@@ -1955,7 +2374,12 @@ mod tests {
             today,
             vec![
                 make_session_with_tokens("~/projects/small", 1000, 500, "claude-sonnet-4-20250514"),
-                make_session_with_tokens("~/projects/large", 100_000, 50_000, "claude-sonnet-4-20250514"),
+                make_session_with_tokens(
+                    "~/projects/large",
+                    100_000,
+                    50_000,
+                    "claude-sonnet-4-20250514",
+                ),
             ],
         )];
         let server = CcsightServer::from_groups(groups);
@@ -1975,8 +2399,10 @@ mod tests {
         };
         let json = extract_json(&server.sessions(Parameters(params)).unwrap());
         let sessions = json["sessions"].as_array().unwrap();
-        let t0 = sessions[0]["tokens"]["input"].as_u64().unwrap() + sessions[0]["tokens"]["output"].as_u64().unwrap();
-        let t1 = sessions[1]["tokens"]["input"].as_u64().unwrap() + sessions[1]["tokens"]["output"].as_u64().unwrap();
+        let t0 = sessions[0]["tokens"]["input"].as_u64().unwrap()
+            + sessions[0]["tokens"]["output"].as_u64().unwrap();
+        let t1 = sessions[1]["tokens"]["input"].as_u64().unwrap()
+            + sessions[1]["tokens"]["output"].as_u64().unwrap();
         assert!(t0 > t1);
     }
 
@@ -1987,11 +2413,13 @@ mod tests {
 
         let tmp = TempFile::new("ccsight_truncation.jsonl");
         let entries: Vec<serde_json::Value> = (0..30)
-            .map(|i| serde_json::json!({
-                "type": "user",
-                "timestamp": format!("2026-03-20T10:{i:02}:00Z"),
-                "message": {"role": "user", "content": format!("request {i}")}
-            }))
+            .map(|i| {
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": format!("2026-03-20T10:{i:02}:00Z"),
+                    "message": {"role": "user", "content": format!("request {i}")}
+                })
+            })
             .collect();
         tmp.write_jsonl(&entries);
         session.file_path = tmp.path().to_path_buf();
@@ -2019,7 +2447,10 @@ mod tests {
         let conv = json["conversation"].as_array().unwrap();
         assert!(conv.len() <= 16, "should be head + omission marker + tail");
         assert_eq!(conv[0]["text"].as_str().unwrap(), "request 0");
-        assert!(conv.iter().any(|c| c["role"] == "..."), "should have omission marker");
+        assert!(
+            conv.iter().any(|c| c["role"] == "..."),
+            "should have omission marker"
+        );
         let last = conv.last().unwrap();
         assert_eq!(last["text"].as_str().unwrap(), "request 29");
     }
@@ -2069,13 +2500,27 @@ mod tests {
         let today = Local::now().date_naive();
         let yesterday = today - chrono::Duration::days(1);
         let groups = vec![
-            make_daily_group(today, vec![
-                make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514"),
-                make_session_with_tokens("~/projects/b", 2000, 1000, "claude-sonnet-4-20250514"),
-            ]),
-            make_daily_group(yesterday, vec![
-                make_session_with_tokens("~/projects/c", 3000, 1500, "claude-sonnet-4-20250514"),
-            ]),
+            make_daily_group(
+                today,
+                vec![
+                    make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514"),
+                    make_session_with_tokens(
+                        "~/projects/b",
+                        2000,
+                        1000,
+                        "claude-sonnet-4-20250514",
+                    ),
+                ],
+            ),
+            make_daily_group(
+                yesterday,
+                vec![make_session_with_tokens(
+                    "~/projects/c",
+                    3000,
+                    1500,
+                    "claude-sonnet-4-20250514",
+                )],
+            ),
         ];
         let server = CcsightServer::from_groups(groups);
         let params = StatsParams {
@@ -2104,7 +2549,11 @@ mod tests {
     #[test]
     fn test_sessions_query_matches_metadata_only() {
         let today = Local::now().date_naive();
-        let session = make_session("~/projects/app", Some("Setup database connection pool"), None);
+        let session = make_session(
+            "~/projects/app",
+            Some("Setup database connection pool"),
+            None,
+        );
         let groups = vec![make_daily_group(today, vec![session])];
         let server = CcsightServer::from_groups(groups);
 
@@ -2112,7 +2561,9 @@ mod tests {
         assert_eq!(json["count"], 1, "should find session by summary metadata");
 
         let json2 = call_sessions(&server, Some("nonexistent_xyz"), None, None, None);
-        assert_eq!(json2["count"], 0, "should not match content that is only in conversation");
+        assert_eq!(
+            json2["count"], 0,
+            "should not match content that is only in conversation"
+        );
     }
-
 }

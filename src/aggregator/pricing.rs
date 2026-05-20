@@ -1,6 +1,14 @@
-// Pricing: https://platform.claude.com/docs/en/docs/about-claude/pricing
-// Cache pricing uses 5-minute TTL rates (1.25x input). Claude Code uses 5m cache by default.
-// 1-hour TTL (2x input) exists but JSONL entries don't include TTL metadata, so we can't distinguish.
+// Pricing: https://platform.claude.com/docs/en/about-claude/pricing
+//
+// Cache writes are billed differently by TTL: 5m = 1.25x base input, 1h = 2x.
+// Claude Code's JSONL emits `message.usage.cache_creation` as a structured
+// `{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}` object, so callers
+// can apply each rate. Subscription users default to 1h TTL automatically
+// (per code.claude.com/docs/en/agent-sdk/cost-tracking), so the 1h rate
+// dominates real-world cost — assuming everything is 5m undercounts by ~57%.
+// 200k tiered pricing (Sonnet 4 1M beta, Aug 2025) is no longer in effect —
+// current 1M models (Opus 4.6/4.7, Sonnet 4.6) bill at standard pricing per
+// the official "Long context pricing" section.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -22,18 +30,19 @@ pub fn normalize_model_name(model: &str) -> String {
             let after = &model[pos + prefix.len()..];
             let major_str: String = after.chars().take_while(char::is_ascii_digit).collect();
             if let Ok(major) = major_str.parse::<u32>()
-                && major_str.len() <= 2 {
-                    let rest = &after[major_str.len()..];
-                    if let Some(rest) = rest.strip_prefix('-') {
-                        let minor_str: String =
-                            rest.chars().take_while(char::is_ascii_digit).collect();
-                        if minor_str.len() <= 2
-                            && let Ok(minor) = minor_str.parse::<u32>() {
-                                return format!("{display} {major}.{minor}");
-                            }
+                && major_str.len() <= 2
+            {
+                let rest = &after[major_str.len()..];
+                if let Some(rest) = rest.strip_prefix('-') {
+                    let minor_str: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    if minor_str.len() <= 2
+                        && let Ok(minor) = minor_str.parse::<u32>()
+                    {
+                        return format!("{display} {major}.{minor}");
                     }
-                    return format!("{display} {major}");
                 }
+                return format!("{display} {major}");
+            }
         }
 
         if let Some(pos) = model.find(family) {
@@ -69,8 +78,13 @@ pub fn normalize_model_name(model: &str) -> String {
 pub struct ModelPricing {
     pub input_cost_per_mtok: f64,
     pub output_cost_per_mtok: f64,
-    pub cache_write_cost_per_mtok: f64, // 5-minute TTL (1.25x input)
-    pub cache_read_cost_per_mtok: f64,  // 0.1x input
+    /// 5-minute TTL cache write rate = 1.25x base input. API key auth and
+    /// Bedrock / Vertex / Foundry default to this TTL.
+    pub cache_write_5m_cost_per_mtok: f64,
+    /// 1-hour TTL cache write rate = 2x base input. Subscription users
+    /// (Pro/Max/Team via Claude Code) get this TTL automatically.
+    pub cache_write_1h_cost_per_mtok: f64,
+    pub cache_read_cost_per_mtok: f64, // 0.1x input
 }
 
 pub struct CostCalculator {
@@ -92,156 +106,173 @@ impl CostCalculator {
     pub fn new() -> Self {
         let mut pricing = HashMap::new();
 
-        // Claude Opus 4.7: $5/$25 per MTok (same as Opus 4.6, official rates pending)
+        // Per-model rates from platform.claude.com/docs/en/about-claude/pricing.
+        // 5m cache write = base × 1.25; 1h cache write = base × 2.0; cache read = base × 0.10.
+
+        // Claude Opus 4.7: base $5 input / $25 output (placeholder == 4.6 until official rates ship)
         pricing.insert(
             "claude-opus-4-7".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 5.0,
                 output_cost_per_mtok: 25.0,
-                cache_write_cost_per_mtok: 6.25,
+                cache_write_5m_cost_per_mtok: 6.25,
+                cache_write_1h_cost_per_mtok: 10.0,
                 cache_read_cost_per_mtok: 0.50,
             },
         );
 
-        // Claude Opus 4.6: $5/$25 per MTok
+        // Claude Opus 4.6: base $5 / $25
         pricing.insert(
             "claude-opus-4-6".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 5.0,
                 output_cost_per_mtok: 25.0,
-                cache_write_cost_per_mtok: 6.25,
+                cache_write_5m_cost_per_mtok: 6.25,
+                cache_write_1h_cost_per_mtok: 10.0,
                 cache_read_cost_per_mtok: 0.50,
             },
         );
 
-        // Claude Opus 4.5: $5/$25 per MTok
+        // Claude Opus 4.5: base $5 / $25
         pricing.insert(
             "claude-opus-4-5".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 5.0,
                 output_cost_per_mtok: 25.0,
-                cache_write_cost_per_mtok: 6.25,
+                cache_write_5m_cost_per_mtok: 6.25,
+                cache_write_1h_cost_per_mtok: 10.0,
                 cache_read_cost_per_mtok: 0.50,
             },
         );
 
-        // Claude Opus 4.1: $15/$75 per MTok
+        // Claude Opus 4.1: base $15 / $75
         pricing.insert(
             "claude-opus-4-1".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 15.0,
                 output_cost_per_mtok: 75.0,
-                cache_write_cost_per_mtok: 18.75,
+                cache_write_5m_cost_per_mtok: 18.75,
+                cache_write_1h_cost_per_mtok: 30.0,
                 cache_read_cost_per_mtok: 1.50,
             },
         );
 
-        // Claude Opus 4: $15/$75 per MTok
+        // Claude Opus 4 (deprecated): base $15 / $75
         pricing.insert(
             "claude-opus-4".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 15.0,
                 output_cost_per_mtok: 75.0,
-                cache_write_cost_per_mtok: 18.75,
+                cache_write_5m_cost_per_mtok: 18.75,
+                cache_write_1h_cost_per_mtok: 30.0,
                 cache_read_cost_per_mtok: 1.50,
             },
         );
 
-        // Claude Sonnet 4.6: $3/$15 per MTok
+        // Claude Sonnet 4.6: base $3 / $15
         pricing.insert(
             "claude-sonnet-4-6".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 3.0,
                 output_cost_per_mtok: 15.0,
-                cache_write_cost_per_mtok: 3.75,
+                cache_write_5m_cost_per_mtok: 3.75,
+                cache_write_1h_cost_per_mtok: 6.0,
                 cache_read_cost_per_mtok: 0.30,
             },
         );
 
-        // Claude Sonnet 4.5: $3/$15 per MTok
+        // Claude Sonnet 4.5: base $3 / $15
         pricing.insert(
             "claude-sonnet-4-5".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 3.0,
                 output_cost_per_mtok: 15.0,
-                cache_write_cost_per_mtok: 3.75,
+                cache_write_5m_cost_per_mtok: 3.75,
+                cache_write_1h_cost_per_mtok: 6.0,
                 cache_read_cost_per_mtok: 0.30,
             },
         );
 
-        // Claude Sonnet 4: $3/$15 per MTok
+        // Claude Sonnet 4 (deprecated): base $3 / $15
         pricing.insert(
             "claude-sonnet-4".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 3.0,
                 output_cost_per_mtok: 15.0,
-                cache_write_cost_per_mtok: 3.75,
+                cache_write_5m_cost_per_mtok: 3.75,
+                cache_write_1h_cost_per_mtok: 6.0,
                 cache_read_cost_per_mtok: 0.30,
             },
         );
 
-        // Claude Sonnet 3.7 (deprecated): $3/$15 per MTok
+        // Claude Sonnet 3.7 (deprecated): base $3 / $15
         pricing.insert(
             "claude-3-7-sonnet".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 3.0,
                 output_cost_per_mtok: 15.0,
-                cache_write_cost_per_mtok: 3.75,
+                cache_write_5m_cost_per_mtok: 3.75,
+                cache_write_1h_cost_per_mtok: 6.0,
                 cache_read_cost_per_mtok: 0.30,
             },
         );
 
-        // Claude Sonnet 3.5 (legacy): $3/$15 per MTok
+        // Claude Sonnet 3.5 (legacy): base $3 / $15
         pricing.insert(
             "claude-3-5-sonnet".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 3.0,
                 output_cost_per_mtok: 15.0,
-                cache_write_cost_per_mtok: 3.75,
+                cache_write_5m_cost_per_mtok: 3.75,
+                cache_write_1h_cost_per_mtok: 6.0,
                 cache_read_cost_per_mtok: 0.30,
             },
         );
 
-        // Claude Opus 3 (deprecated): $15/$75 per MTok
+        // Claude Opus 3 (deprecated): base $15 / $75
         pricing.insert(
             "claude-3-opus".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 15.0,
                 output_cost_per_mtok: 75.0,
-                cache_write_cost_per_mtok: 18.75,
+                cache_write_5m_cost_per_mtok: 18.75,
+                cache_write_1h_cost_per_mtok: 30.0,
                 cache_read_cost_per_mtok: 1.50,
             },
         );
 
-        // Claude Haiku 4.5: $1/$5 per MTok
+        // Claude Haiku 4.5: base $1 / $5
         pricing.insert(
             "claude-haiku-4-5".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 1.0,
                 output_cost_per_mtok: 5.0,
-                cache_write_cost_per_mtok: 1.25,
+                cache_write_5m_cost_per_mtok: 1.25,
+                cache_write_1h_cost_per_mtok: 2.0,
                 cache_read_cost_per_mtok: 0.10,
             },
         );
 
-        // Claude Haiku 3.5: $0.80/$4 per MTok
+        // Claude Haiku 3.5: base $0.80 / $4
         pricing.insert(
             "claude-3-5-haiku".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 0.80,
                 output_cost_per_mtok: 4.0,
-                cache_write_cost_per_mtok: 1.0,
+                cache_write_5m_cost_per_mtok: 1.0,
+                cache_write_1h_cost_per_mtok: 1.60,
                 cache_read_cost_per_mtok: 0.08,
             },
         );
 
-        // Claude Haiku 3: $0.25/$1.25 per MTok
+        // Claude Haiku 3 (legacy): base $0.25 / $1.25 (1h rate inferred 2x base)
         pricing.insert(
             "claude-3-haiku".to_string(),
             ModelPricing {
                 input_cost_per_mtok: 0.25,
                 output_cost_per_mtok: 1.25,
-                cache_write_cost_per_mtok: 0.30,
+                cache_write_5m_cost_per_mtok: 0.30,
+                cache_write_1h_cost_per_mtok: 0.50,
                 cache_read_cost_per_mtok: 0.03,
             },
         );
@@ -261,12 +292,19 @@ impl CostCalculator {
 
         let input_cost = tokens.input_tokens as f64 / million * pricing.input_cost_per_mtok;
         let output_cost = tokens.output_tokens as f64 / million * pricing.output_cost_per_mtok;
-        let cache_write_cost =
-            tokens.cache_creation_tokens as f64 / million * pricing.cache_write_cost_per_mtok;
+        // Apply per-TTL rates from the structured `cache_creation` breakdown.
+        // For entries that pre-date the structured field, the aggregator's
+        // `TokenStats::add` routes all flat cache writes into the 5m bucket,
+        // which matches Anthropic's API key default — so this branch is
+        // already correct for legacy data.
+        let cache_5m_cost =
+            tokens.cache_creation_5m_tokens as f64 / million * pricing.cache_write_5m_cost_per_mtok;
+        let cache_1h_cost =
+            tokens.cache_creation_1h_tokens as f64 / million * pricing.cache_write_1h_cost_per_mtok;
         let cache_read_cost =
             tokens.cache_read_tokens as f64 / million * pricing.cache_read_cost_per_mtok;
 
-        Some(input_cost + output_cost + cache_write_cost + cache_read_cost)
+        Some(input_cost + output_cost + cache_5m_cost + cache_1h_cost + cache_read_cost)
     }
 
     pub fn get_pricing_by_display_name(&self, display_name: &str) -> Option<&ModelPricing> {
@@ -289,9 +327,10 @@ impl CostCalculator {
         let mut result = std::collections::HashSet::new();
         for model in model_tokens.keys() {
             if !self.has_pricing(Some(model))
-                && let Some(simplified) = Self::simplify_model_name(model) {
-                    result.insert(simplified);
-                }
+                && let Some(simplified) = Self::simplify_model_name(model)
+            {
+                result.insert(simplified);
+            }
         }
         result
     }
@@ -326,6 +365,8 @@ impl CostCalculator {
                 entry.output_tokens += tokens.output_tokens;
                 entry.cache_creation_tokens += tokens.cache_creation_tokens;
                 entry.cache_read_tokens += tokens.cache_read_tokens;
+                entry.cache_creation_5m_tokens += tokens.cache_creation_5m_tokens;
+                entry.cache_creation_1h_tokens += tokens.cache_creation_1h_tokens;
             }
         }
 
@@ -402,11 +443,15 @@ mod tests {
         // pricing entry and cost would silently fall through to $0.
         let calculator = CostCalculator::new();
         assert!(
-            calculator.get_pricing(Some("claude-opus-4-7[1m]")).is_some(),
+            calculator
+                .get_pricing(Some("claude-opus-4-7[1m]"))
+                .is_some(),
             "[1m] context-window suffix should match the base opus-4-7 pricing"
         );
         assert!(
-            calculator.get_pricing(Some("claude-sonnet-4-6[1m]")).is_some(),
+            calculator
+                .get_pricing(Some("claude-sonnet-4-6[1m]"))
+                .is_some(),
             "[1m] suffix should also work for other families"
         );
     }
@@ -422,13 +467,17 @@ mod tests {
             "should not fall back to claude-sonnet-4"
         );
         // "claude-sonnet-4-6" with date suffix should match
-        assert!(calculator
-            .get_pricing(Some("claude-sonnet-4-6-20260101"))
-            .is_some());
+        assert!(
+            calculator
+                .get_pricing(Some("claude-sonnet-4-6-20260101"))
+                .is_some()
+        );
         // "claude-sonnet-4" with date suffix should still match
-        assert!(calculator
-            .get_pricing(Some("claude-sonnet-4-20250514"))
-            .is_some());
+        assert!(
+            calculator
+                .get_pricing(Some("claude-sonnet-4-20250514"))
+                .is_some()
+        );
     }
 
     #[test]
@@ -455,6 +504,8 @@ mod tests {
             output_tokens: 1_000_000,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let cost = calculator.calculate_cost(&tokens, Some("unknown-model"));
         assert_eq!(cost, None);
@@ -468,6 +519,8 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let cost = calculator.calculate_cost(&tokens, None);
         assert_eq!(cost, None);
@@ -481,6 +534,8 @@ mod tests {
             output_tokens: 100_000,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4"))
@@ -514,6 +569,8 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4"))
@@ -534,12 +591,15 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 50_000,
             cache_read_tokens: 25_000,
+            // 50K all 5m TTL — matches Anthropic's API key default.
+            cache_creation_5m_tokens: 50_000,
+            cache_creation_1h_tokens: 0,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-sonnet-4"))
             .unwrap();
         // input: 100K @ $3/M = $0.30 (input_tokens is already non-cached per API spec)
-        // cache_write: 50K @ $3.75/M = $0.1875
+        // cache_write (5m): 50K @ $3.75/M = $0.1875
         // cache_read: 25K @ $0.30/M = $0.0075
         // Total: ~$0.495
         assert!(
@@ -550,6 +610,101 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_cost_1h_cache_write_is_2x_base() {
+        // Subscription users (Claude Pro/Max/Team via Claude Code) default
+        // to 1h TTL. The 1h rate is 2x base input — `cache_write_1h` for
+        // Sonnet 4.6 = $6/MTok (base $3 × 2).
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 1_000_000,
+        };
+        let cost = calculator
+            .calculate_cost(&tokens, Some("claude-sonnet-4-6"))
+            .unwrap();
+        assert!(
+            (cost - 6.0).abs() < 0.01,
+            "1h cache for Sonnet 4.6 should be $6/MTok, got ${:.4}",
+            cost
+        );
+    }
+
+    #[test]
+    fn test_calculate_cost_mixed_5m_and_1h_cache_writes() {
+        // Realistic Claude Code workload: most cache writes are 1h, a few
+        // are 5m. The two buckets should be billed at their own rates and
+        // summed independently — not merged at a single average rate.
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 1_100_000,
+            cache_read_tokens: 0,
+            cache_creation_5m_tokens: 100_000,
+            cache_creation_1h_tokens: 1_000_000,
+        };
+        let cost = calculator
+            .calculate_cost(&tokens, Some("claude-sonnet-4-6"))
+            .unwrap();
+        // 5m: 100K @ $3.75/M = $0.375
+        // 1h: 1M  @ $6.00/M = $6.000
+        // Total: $6.375
+        assert!(
+            (cost - 6.375).abs() < 0.01,
+            "mixed 5m+1h cache cost should be $6.375 for Sonnet 4.6, got ${:.4}",
+            cost
+        );
+    }
+
+    #[test]
+    fn test_token_stats_add_routes_structured_cache_creation() {
+        // Verify the aggregator splits 5m and 1h into separate fields when
+        // the structured `cache_creation` object is present (modern JSONL).
+        use crate::domain::{CacheCreationBreakdown, Usage};
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 30_000,
+            cache_read_input_tokens: 0,
+            cache_creation: Some(CacheCreationBreakdown {
+                ephemeral_5m_input_tokens: 10_000,
+                ephemeral_1h_input_tokens: 20_000,
+            }),
+            service_tier: None,
+        };
+        let mut stats = TokenStats::default();
+        stats.add(&usage);
+        assert_eq!(stats.cache_creation_5m_tokens, 10_000);
+        assert_eq!(stats.cache_creation_1h_tokens, 20_000);
+        assert_eq!(stats.cache_creation_tokens, 30_000);
+    }
+
+    #[test]
+    fn test_token_stats_add_falls_back_to_flat_as_5m_when_no_structured() {
+        // Legacy JSONL without the structured field: the entire flat
+        // aggregate goes into the 5m bucket, matching Anthropic's API key
+        // default TTL.
+        use crate::domain::Usage;
+        let usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 0,
+            cache_creation: None,
+            service_tier: None,
+        };
+        let mut stats = TokenStats::default();
+        stats.add(&usage);
+        assert_eq!(stats.cache_creation_5m_tokens, 50_000);
+        assert_eq!(stats.cache_creation_1h_tokens, 0);
+        assert_eq!(stats.cache_creation_tokens, 50_000);
+    }
+
+    #[test]
     fn test_calculate_cost_opus() {
         let calculator = CostCalculator::new();
         let tokens = TokenStats {
@@ -557,6 +712,8 @@ mod tests {
             output_tokens: 100_000,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let cost = calculator
             .calculate_cost(&tokens, Some("claude-opus-4-5"))

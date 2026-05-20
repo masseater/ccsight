@@ -120,6 +120,73 @@ mod tests {
         }
     }
 
+    /// Regression: `StatsAggregator` (powers TUI Overview cost) and
+    /// `DailyGrouper` (powers Daily tab / `--daily` CLI) MUST produce
+    /// identical token totals when fed the same files. They are two
+    /// independent aggregation paths and silently diverged in the past —
+    /// once when one path skipped the global cross-file dedup, once when
+    /// `if skip_tokens { continue; }` in the daily loop also skipped the
+    /// adjacent tool-usage counting in the global loop. The summed
+    /// per-day-per-model totals from `daily_groups` are the authoritative
+    /// reflection of cache_creation_5m/1h split; `stats.total_tokens`
+    /// likewise. Drift in either is a bug — pin it here.
+    #[test]
+    fn test_stats_and_grouper_agree_on_token_totals() {
+        let result = load_data(0).unwrap();
+        if result.file_count == 0 {
+            return;
+        }
+
+        let mut g_input = 0u64;
+        let mut g_output = 0u64;
+        let mut g_cache_w = 0u64;
+        let mut g_cache_r = 0u64;
+        let mut g_cache_5m = 0u64;
+        let mut g_cache_1h = 0u64;
+        for group in &result.daily_groups {
+            for session in &group.sessions {
+                for ts in session.day_tokens_by_model.values() {
+                    g_input += ts.input_tokens;
+                    g_output += ts.output_tokens;
+                    g_cache_w += ts.cache_creation_tokens;
+                    g_cache_r += ts.cache_read_tokens;
+                    g_cache_5m += ts.cache_creation_5m_tokens;
+                    g_cache_1h += ts.cache_creation_1h_tokens;
+                }
+            }
+        }
+
+        // The two aggregators are called back-to-back on the same file list,
+        // but each opens the JSONLs independently. In a dev env where Claude
+        // Code is actively writing the user's live session, that interval
+        // can land a handful of new entries on the grouper side, making the
+        // totals drift by single-digit kilotoken even when the logic is
+        // sound. Real regressions (skip_tokens divergence, missing dedup)
+        // produced megatoken-scale gaps in prior incidents, so a 0.1%
+        // tolerance keeps the test sharp without going flaky.
+        let s = &result.stats.total_tokens;
+        let pairs: [(u64, u64, &str); 6] = [
+            (g_input, s.input_tokens, "input"),
+            (g_output, s.output_tokens, "output"),
+            (g_cache_w, s.cache_creation_tokens, "cache_w"),
+            (g_cache_r, s.cache_read_tokens, "cache_r"),
+            (g_cache_5m, s.cache_creation_5m_tokens, "cache_5m"),
+            (g_cache_1h, s.cache_creation_1h_tokens, "cache_1h"),
+        ];
+        for (g, s, name) in pairs {
+            let max = g.max(s);
+            let diff = g.abs_diff(s);
+            // 0.1% tolerance, with a 1024-token floor so a small absolute
+            // delta on a near-empty corpus isn't a false negative.
+            let allowed = (max / 1000).max(1024);
+            assert!(
+                diff <= allowed,
+                "{name}: grouper={g} stats={s} diff={diff} > allowed={allowed} \
+                 — the two aggregation paths diverged beyond mid-test drift."
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn bench_search_index() {
@@ -400,11 +467,11 @@ mod tests {
 
     #[test]
     fn test_parse_custom_single_date() {
-        let f = PeriodFilter::parse_custom("2026-02-15").unwrap();
+        let f = PeriodFilter::parse_custom("2026-02-15").unwrap();  // lint-ok: date-literal
         match f {
             PeriodFilter::Custom(start, Some(end)) => {
-                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 2, 15).unwrap());
-                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 2, 15).unwrap());
+                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 2, 15).unwrap());  // lint-ok: date-literal
+                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 2, 15).unwrap());  // lint-ok: date-literal
             }
             _ => panic!("expected Custom with same start/end"),
         }
@@ -415,8 +482,8 @@ mod tests {
         let f = PeriodFilter::parse_custom("2026-02").unwrap();
         match f {
             PeriodFilter::Custom(start, Some(end)) => {
-                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
-                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
+                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());  // lint-ok: date-literal
+                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());  // lint-ok: date-literal
             }
             _ => panic!("expected Custom with month range"),
         }
@@ -427,8 +494,8 @@ mod tests {
         let f = PeriodFilter::parse_custom("2025-12").unwrap();
         match f {
             PeriodFilter::Custom(start, Some(end)) => {
-                assert_eq!(start, NaiveDate::from_ymd_opt(2025, 12, 1).unwrap());
-                assert_eq!(end, NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
+                assert_eq!(start, NaiveDate::from_ymd_opt(2025, 12, 1).unwrap());  // lint-ok: date-literal
+                assert_eq!(end, NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());  // lint-ok: date-literal
             }
             _ => panic!("expected Custom with december range"),
         }
@@ -439,8 +506,8 @@ mod tests {
         let f = PeriodFilter::parse_custom("2024-02").unwrap();
         match f {
             PeriodFilter::Custom(start, Some(end)) => {
-                assert_eq!(start, NaiveDate::from_ymd_opt(2024, 2, 1).unwrap());
-                assert_eq!(end, NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());
+                assert_eq!(start, NaiveDate::from_ymd_opt(2024, 2, 1).unwrap());  // lint-ok: date-literal
+                assert_eq!(end, NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());  // lint-ok: date-literal
             }
             _ => panic!("expected leap year feb range"),
         }
@@ -448,11 +515,11 @@ mod tests {
 
     #[test]
     fn test_parse_custom_range() {
-        let f = PeriodFilter::parse_custom("2026-01-01..2026-01-31").unwrap();
+        let f = PeriodFilter::parse_custom("2026-01-01..2026-01-31").unwrap();  // lint-ok: date-literal
         match f {
             PeriodFilter::Custom(start, Some(end)) => {
-                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());
+                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());  // lint-ok: date-literal
+                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());  // lint-ok: date-literal
             }
             _ => panic!("expected Custom range"),
         }
@@ -460,11 +527,11 @@ mod tests {
 
     #[test]
     fn test_parse_custom_range_with_spaces() {
-        let f = PeriodFilter::parse_custom("  2026-01-01 .. 2026-01-31  ").unwrap();
+        let f = PeriodFilter::parse_custom("  2026-01-01 .. 2026-01-31  ").unwrap();  // lint-ok: date-literal
         match f {
             PeriodFilter::Custom(start, Some(end)) => {
-                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());
+                assert_eq!(start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());  // lint-ok: date-literal
+                assert_eq!(end, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());  // lint-ok: date-literal
             }
             _ => panic!("expected Custom range with trimmed spaces"),
         }
@@ -487,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_parse_custom_invalid_date() {
-        assert!(PeriodFilter::parse_custom("2026-02-30").is_none());
+        assert!(PeriodFilter::parse_custom("2026-02-30").is_none());  // lint-ok: date-literal
     }
 
     #[test]
@@ -504,8 +571,8 @@ mod tests {
 
     #[test]
     fn test_date_range_label_custom_range() {
-        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let end = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();  // lint-ok: date-literal
+        let end = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();  // lint-ok: date-literal
         let label = PeriodFilter::Custom(start, Some(end)).date_range_label();
         assert!(label.contains("01-01"));
         assert!(label.contains("01-31"));

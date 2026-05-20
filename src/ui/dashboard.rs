@@ -1,19 +1,19 @@
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
-    Frame,
 };
 
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
 
-use crate::aggregator::CostCalculator;
-use crate::AppState;
 use super::theme;
-use super::{cost_style, calc_scroll};
+use super::{calc_scroll, cost_style, format_cost};
+use crate::AppState;
+use crate::aggregator::CostCalculator;
 
 fn resample_sparkline(
     data: &[(NaiveDate, u64)],
@@ -58,8 +58,8 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
     let chunks = Layout::vertical([
         Constraint::Length(4),  // Stats cards (with border)
         Constraint::Length(10), // Heatmap + Hourly pattern (fixed to match week rows)
-        Constraint::Fill(1),   // Bottom section (scales with terminal)
-        Constraint::Length(1), // Help
+        Constraint::Fill(1),    // Bottom section (scales with terminal)
+        Constraint::Length(1),  // Help
     ])
     .split(area);
 
@@ -83,8 +83,7 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         state.dashboard_scroll[6],
     );
 
-    let bottom_rows =
-        Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(chunks[2]);
+    let bottom_rows = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).split(chunks[2]);
 
     let top_row = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(bottom_rows[0]);
@@ -130,13 +129,7 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
     );
     let tools_selected = state.dashboard_panel == 3;
     let tools_scroll = state.dashboard_scroll[3];
-    draw_tool_usage(
-        frame,
-        bottom_row[1],
-        state,
-        tools_selected,
-        tools_scroll,
-    );
+    draw_tool_usage(frame, bottom_row[1], state, tools_selected, tools_scroll);
     draw_languages(
         frame,
         bottom_row[2],
@@ -202,7 +195,8 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
             Style::default()
                 .fg(theme::SUCCESS)
                 .add_modifier(Modifier::BOLD),
-        )).alignment(Alignment::Center),
+        ))
+        .alignment(Alignment::Center),
         Line::from(Span::styled("sessions", Style::default().fg(theme::DIM)))
             .alignment(Alignment::Center),
     ])
@@ -215,7 +209,8 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
             Style::default()
                 .fg(theme::WARM)
                 .add_modifier(Modifier::BOLD),
-        )).alignment(Alignment::Center),
+        ))
+        .alignment(Alignment::Center),
         Line::from(Span::styled("days", Style::default().fg(theme::DIM)))
             .alignment(Alignment::Center),
     ])
@@ -227,7 +222,8 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
             Style::default()
                 .fg(theme::PRIMARY)
                 .add_modifier(Modifier::BOLD),
-        )).alignment(Alignment::Center),
+        ))
+        .alignment(Alignment::Center),
         Line::from(Span::styled("tokens", Style::default().fg(theme::DIM)))
             .alignment(Alignment::Center),
     ])
@@ -257,7 +253,12 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
             .alignment(Alignment::Center)
     } else {
         Line::from(vec![
-            Span::styled("* ", Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "* ",
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 if card_width >= 22 {
                     format!("{pricing_gap_count} models lack pricing")
@@ -273,9 +274,14 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(Span::styled(
             cost_text,
             Style::default()
-                .fg(if pricing_gap_count == 0 { theme::WARM } else { theme::WARNING })
+                .fg(if pricing_gap_count == 0 {
+                    theme::WARM
+                } else {
+                    theme::WARNING
+                })
                 .add_modifier(Modifier::BOLD),
-        )).alignment(Alignment::Center),
+        ))
+        .alignment(Alignment::Center),
         caption,
     ])
     .block(Block::default().borders(Borders::NONE));
@@ -390,7 +396,11 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
             // ended doesn't render as one run-on token. After the first
             // label, a 0-gap means visual collision.
             let raw_gap = expected_pos.saturating_sub(used_chars);
-            let gap = if used_chars == 0 { raw_gap } else { raw_gap.max(1) };
+            let gap = if used_chars == 0 {
+                raw_gap
+            } else {
+                raw_gap.max(1)
+            };
             if gap > 0 {
                 month_row.push(Span::raw(" ".repeat(gap)));
                 used_chars += gap;
@@ -561,7 +571,8 @@ fn draw_hourly_pattern(
         )));
     }
 
-    // Hour labels
+    // Hour labels — `24` marks the right edge (= midnight next day = end of
+    // the final bar's hour window), giving a natural 0..24 axis.
     lines.push(Line::from(Span::styled(
         "0     6    12    18   24",
         Style::default().fg(theme::DIM),
@@ -593,7 +604,10 @@ fn draw_hourly_pattern(
             format!(" {prefix} Hourly avg "),
             title_style,
         )]))
-        .title_bottom(Line::from(Span::styled(peak_title, Style::default().fg(theme::DIM))));
+        .title_bottom(Line::from(Span::styled(
+            peak_title,
+            Style::default().fg(theme::DIM),
+        )));
 
     let paragraph = Paragraph::new(lines).centered().block(block);
     frame.render_widget(paragraph, area);
@@ -607,11 +621,17 @@ fn draw_top_projects(
     scroll: usize,
 ) {
     let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-    projects.sort_by_key(|p| std::cmp::Reverse(p.1.work_tokens));
+    // Tiebreaker on name (lint #30) — without it, projects with identical
+    // token counts shuffle between frames since HashMap iteration is
+    // randomized per-instance.
+    projects.sort_by(|a, b| {
+        b.1.work_tokens
+            .cmp(&a.1.work_tokens)
+            .then_with(|| a.0.cmp(b.0))
+    });
 
     let total_tokens: u64 = projects.iter().map(|(_, s)| s.work_tokens).sum();
     let (visible_height, _, scroll) = calc_scroll(area.height, projects.len(), scroll, 2);
-
 
     let rows: Vec<Row> = projects
         .iter()
@@ -697,18 +717,21 @@ fn draw_model_tokens(
             (name.clone(), work_tokens, cost)
         })
         .collect();
-    models.sort_by_key(|m| std::cmp::Reverse(m.1));
+    // Tiebreaker on model name keeps tied-token models stable; source is a
+    // Vec assembled from HashMap iteration upstream so ties would shuffle.
+    models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let total_tokens: u64 = models.iter().map(|(_, t, _)| *t).sum();
 
     let (visible_height, _, scroll) = calc_scroll(area.height, models.len(), scroll, 2);
 
-    // Name column receives whatever Min(8) leaves after the fixed columns
-    // (rank 3, tokens 6, pct 8 — pct keeps a `tok` suffix so the share basis
-    // is unambiguous against the Insights popup's cost-share row, which
-    // labels its column with a `$` suffix instead) and 3 inter-column gaps,
-    // plus 2 borders.
-    let name_w = (area.width as usize).saturating_sub(3 + 6 + 8 + 3 + 2).max(4);
+    // Name column gets whatever Min(8) leaves after the fixed columns
+    // (rank 3, tokens 6, pct 4) + 3 inter-column gaps + 2 borders.
+    // pct is `NN%` — matches the Languages / Projects panels for visual
+    // consistency across the Dashboard grid.
+    let name_w = (area.width as usize)
+        .saturating_sub(3 + 6 + 4 + 3 + 2)
+        .max(4);
     let rows: Vec<Row> = models
         .iter()
         .enumerate()
@@ -717,17 +740,16 @@ fn draw_model_tokens(
         .map(|(i, (name, tokens, _cost))| {
             let rank = format!("{}.", i + 1);
             let pct = if total_tokens > 0 {
-                format!("{:.0}% tok", *tokens as f64 / total_tokens as f64 * 100.0)
+                format!("{:.0}%", *tokens as f64 / total_tokens as f64 * 100.0)
             } else {
-                "0% tok".to_string()
+                "0%".to_string()
             };
             Row::new(vec![
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
                 Cell::from(super::truncate_with_ellipsis(name, name_w)),
                 Cell::from(crate::format_number(*tokens))
                     .style(Style::default().fg(theme::PRIMARY)),
-                Cell::from(pct)
-                    .style(Style::default().fg(theme::DIM)),
+                Cell::from(pct).style(Style::default().fg(theme::DIM)),
             ])
         })
         .collect();
@@ -745,9 +767,17 @@ fn draw_model_tokens(
     };
 
     let title = if selected {
-        format!(" ◈ Models {}/{}", if models.is_empty() { 0 } else { scroll + 1 }, models.len())
+        format!(
+            " ◈ Models {}/{}",
+            if models.is_empty() { 0 } else { scroll + 1 },
+            models.len()
+        )
     } else {
-        format!(" ◇ Models {}/{}", if models.is_empty() { 0 } else { scroll + 1 }, models.len())
+        format!(
+            " ◇ Models {}/{}",
+            if models.is_empty() { 0 } else { scroll + 1 },
+            models.len()
+        )
     };
 
     let table = Table::new(
@@ -756,7 +786,7 @@ fn draw_model_tokens(
             Constraint::Length(3),
             Constraint::Min(8),
             Constraint::Length(6),
-            Constraint::Length(8),
+            Constraint::Length(4),
         ],
     )
     .block(
@@ -769,7 +799,13 @@ fn draw_model_tokens(
     frame.render_widget(table, area);
 }
 
-fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected: bool, _scroll: usize) {
+fn draw_tool_usage(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    selected: bool,
+    _scroll: usize,
+) {
     // "Ecosystem & Health" panel — three tiers of progressive disclosure:
     //   Tier 1 (always): per-category summary (Built-in / MCP / Skills / Subagents).
     //   The popup detail merges Built-in + MCP under one "Tools" tab; the preview
@@ -779,7 +815,7 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
     // Lower tiers are dropped for narrow panels so the layout never overflows.
     // Click areas are still recorded for the Tier 1 rows so Enter / mouse opens the
     // Tools detail popup at the matching section, preserving existing UX.
-    use crate::aggregator::{classify_tool, mcp_server_of, ToolCategory};
+    use crate::aggregator::{ToolCategory, classify_tool, mcp_server_of};
 
     let tools: Vec<_> = state
         .stats
@@ -893,10 +929,38 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
     // theme::ACCENT (cyan) for Tools, which clashed with the popup tab's
     // green and made the transition feel like switching categories.
     let categories: [(usize, &str, usize, &str, usize, Color); 4] = [
-        (0, "Tools", tools_uniq, "groups", tools_total_calls, theme::CAT_TOOLS),
-        (1, "Skills", skills_uniq, "uniq", skill_total, theme::CAT_SKILLS),
-        (2, "Commands", commands_uniq, "uniq", command_total, theme::CAT_COMMANDS),
-        (3, "Subagents", subagents_uniq, "uniq", agent_total, theme::CAT_SUBAGENTS),
+        (
+            0,
+            "Tools",
+            tools_uniq,
+            "groups",
+            tools_total_calls,
+            theme::CAT_TOOLS,
+        ),
+        (
+            1,
+            "Skills",
+            skills_uniq,
+            "uniq",
+            skill_total,
+            theme::CAT_SKILLS,
+        ),
+        (
+            2,
+            "Commands",
+            commands_uniq,
+            "uniq",
+            command_total,
+            theme::CAT_COMMANDS,
+        ),
+        (
+            3,
+            "Subagents",
+            subagents_uniq,
+            "uniq",
+            agent_total,
+            theme::CAT_SUBAGENTS,
+        ),
     ];
 
     // Stale MCP servers (>30d) get inlined on the MCP row whenever there are any,
@@ -927,7 +991,11 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
         ));
     }
     if let Some(warn) = retention_warn {
-        let prefix = if warn.is_default { "default" } else { "configured" };
+        let prefix = if warn.is_default {
+            "default"
+        } else {
+            "configured"
+        };
         alerts.push((
             format!("! retention {}d {prefix} — risk of loss", warn.days),
             theme::WARNING,
@@ -946,7 +1014,11 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
     let mut top_tools: Vec<(&str, usize)> = all_tools.clone();
     top_tools.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     top_tools.truncate(3);
-    let tier2_full = if top_tools.is_empty() { 0 } else { 1 + top_tools.len() };
+    let tier2_full = if top_tools.is_empty() {
+        0
+    } else {
+        1 + top_tools.len()
+    };
     let tier2_compressed = if top_tools.is_empty() { 0 } else { 1 };
     // Tier 3: alerts.len() rows; if no alerts, 1 row "all systems nominal".
     let tier3_full = alerts.len().max(1);
@@ -1045,7 +1117,10 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
                     compact.push_str(" ·");
                 }
                 let short_name = (*name).chars().take(10).collect::<String>();
-                compact.push_str(&format!(" {short_name} {}", crate::format_number(*count as u64)));
+                compact.push_str(&format!(
+                    " {short_name} {}",
+                    crate::format_number(*count as u64)
+                ));
             }
             lines.push(Line::from(vec![Span::styled(
                 compact,
@@ -1133,7 +1208,7 @@ fn draw_tool_usage(frame: &mut Frame, area: Rect, state: &mut AppState, selected
 /// Computes total line count of the Tools detail popup body (excluding headers).
 /// Used for scroll bounds to match actual rendered lines in `draw_dashboard_detail_popup` panel 3.
 pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
-    use crate::aggregator::{classify_tool, ToolCategory};
+    use crate::aggregator::{ToolCategory, classify_tool};
     use std::collections::HashSet;
     let tools: Vec<(&String, &usize)> = state.stats.tool_usage.iter().collect();
     // Index order matches the tab order: 0=Tools, 1=Skills, 2=Commands, 3=Subagents.
@@ -1201,10 +1276,7 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
     // the scrollbar's `N/M` indicator stop short of the real end.
     let extra = if active == 0 {
         let now = chrono::Utc::now();
-        let any_stale = state
-            .mcp_status
-            .iter()
-            .any(|s| s.is_underutilized(now, 30));
+        let any_stale = state.mcp_status.iter().any(|s| s.is_underutilized(now, 30));
         // Each expanded server contributes (tool_count) sub-rows. Built-in
         // counts as a server-like group with `mcp_tool_count("Built-in")`
         // tools (i.e. all built-in keys) when expanded.
@@ -1234,35 +1306,54 @@ pub(crate) fn tool_usage_line_count(state: &AppState) -> usize {
 }
 
 fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: bool, scroll: usize) {
-    let mut languages: Vec<_> = state
+    // Known languages with their aggregate counts, excluding the literal
+    // "Other" bucket. Unknown extensions are surfaced individually below
+    // (rule: architecture.categorization — no catch-all grouping).
+    let mut entries: Vec<(String, usize, bool)> = state
         .stats
         .language_usage
         .iter()
-        .filter(|(name, _)| !name.is_empty())
+        .filter(|(name, _)| !name.is_empty() && name.as_str() != "Other")
+        .map(|(name, count)| (name.clone(), *count, false))
         .collect();
-    languages.sort_by(|a, b| b.1.cmp(a.1));
+    for (ext, count) in &state.stats.extension_usage {
+        if crate::aggregator::language::for_extension(ext) == "Other" {
+            entries.push((ext.clone(), *count, true));
+        }
+    }
+    // Tiebreaker on name keeps tied-count rows stable across frames.
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let total_usage: usize = languages.iter().map(|(_, c)| **c).sum();
-    let (visible_height, _, scroll) = calc_scroll(area.height, languages.len(), scroll, 2);
+    let total_usage: usize = entries.iter().map(|(_, c, _)| *c).sum();
+    let (visible_height, _, scroll) = calc_scroll(area.height, entries.len(), scroll, 2);
 
     // Same Min(8) name column as Models; trailing fixed columns are wider here
     // (rank 4, count 6, pct 4) plus 3 inter-column gaps and 2 borders.
-    let name_w = (area.width as usize).saturating_sub(4 + 6 + 4 + 3 + 2).max(4);
-    let rows: Vec<Row> = languages
+    let name_w = (area.width as usize)
+        .saturating_sub(4 + 6 + 4 + 3 + 2)
+        .max(4);
+    let rows: Vec<Row> = entries
         .iter()
         .enumerate()
         .skip(scroll)
         .take(visible_height)
-        .map(|(i, (name, count))| {
+        .map(|(i, (name, count, is_unknown))| {
             let rank = format!("{}.", i + 1);
             let percentage = if total_usage > 0 {
-                (**count as f64 / total_usage as f64 * 100.0) as u32
+                (*count as f64 / total_usage as f64 * 100.0) as u32
             } else {
                 0
             };
+            // Unknown extensions render dimmer so they're visually
+            // distinguishable from the named language categories.
+            let name_style = if *is_unknown {
+                Style::default().fg(theme::DIM)
+            } else {
+                Style::default()
+            };
             Row::new(vec![
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
-                Cell::from(super::truncate_with_ellipsis(name, name_w)),
+                Cell::from(super::truncate_with_ellipsis(name, name_w)).style(name_style),
                 Cell::from(count.to_string()).style(Style::default().fg(theme::PRIMARY)),
                 Cell::from(format!("{percentage}%")).style(Style::default().fg(theme::MUTED)),
             ])
@@ -1282,9 +1373,17 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
     };
 
     let title = if selected {
-        format!(" ◈ Languages {}/{}", if languages.is_empty() { 0 } else { scroll + 1 }, languages.len())
+        format!(
+            " ◈ Languages {}/{}",
+            if entries.is_empty() { 0 } else { scroll + 1 },
+            entries.len()
+        )
     } else {
-        format!(" ◇ Languages {}/{}", if languages.is_empty() { 0 } else { scroll + 1 }, languages.len())
+        format!(
+            " ◇ Languages {}/{}",
+            if entries.is_empty() { 0 } else { scroll + 1 },
+            entries.len()
+        )
     };
 
     let table = Table::new(
@@ -1331,18 +1430,19 @@ fn draw_recent_costs(
             let date_str = date.format("%m-%d(%a)").to_string();
             let cost_display = cost.max(0.0);
             let cost_str = super::format_cost(cost_display, cost_precision);
-            let tokens: u64 = state
-                .daily_groups
-                .iter()
-                .find(|g| &g.date == date)
-                .map_or(0, |group| {
-                    group
-                        .sessions
-                        .iter()
-                        .filter(|s| !s.is_subagent)
-                        .map(crate::aggregator::SessionInfo::work_tokens)
-                        .sum()
-                });
+            let tokens: u64 =
+                state
+                    .daily_groups
+                    .iter()
+                    .find(|g| &g.date == date)
+                    .map_or(0, |group| {
+                        group
+                            .sessions
+                            .iter()
+                            .filter(|s| !s.is_subagent)
+                            .map(crate::aggregator::SessionInfo::work_tokens)
+                            .sum()
+                    });
             Row::new(vec![
                 Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::DIM)),
                 Cell::from(date_str),
@@ -1392,6 +1492,530 @@ fn draw_recent_costs(
     frame.render_widget(table, area);
 }
 
+/// Number of leading rows that `activity_header_lines` adds above the
+/// scrollable daily/weekly breakdown. Used to shrink the body's
+/// `take(visible_height)` and the scroll-clamp `items_per_screen` so the
+/// fixed header always stays visible while the body still tracks position.
+pub(crate) const ACTIVITY_HEADER_ROWS: usize = 5;
+
+/// Block characters used by every header sparkline so trend rows across
+/// popups share the same visual vocabulary. Index 0 (`·`) is the dedicated
+/// "no activity" glyph — visually distinct from the `▁..█` non-zero ramp so
+/// zero days never get mistaken for the lowest non-zero bucket.
+pub(crate) const SPARK_CHARS: [char; 9] = ['·', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Render a trailing-N-day sparkline of `value_for_date(d)` ending at `today`.
+/// The bucket is normalised against the window's max so visual scale is
+/// independent of the absolute magnitude. Days with zero value render as `░`.
+pub(crate) fn render_spark_line<F>(
+    today: chrono::NaiveDate,
+    days: usize,
+    mut value_for: F,
+) -> String
+where
+    F: FnMut(chrono::NaiveDate) -> f64,
+{
+    let values: Vec<f64> = (0..days)
+        .rev()
+        .map(|offset| {
+            let date = today - chrono::Duration::days(offset as i64);
+            value_for(date).max(0.0)
+        })
+        .collect();
+    let max = values.iter().copied().fold(0.0f64, f64::max).max(1e-9);
+    values
+        .iter()
+        .map(|v| {
+            if *v <= 0.0 {
+                SPARK_CHARS[0]
+            } else {
+                let ratio = v / max;
+                let idx = ((ratio * (SPARK_CHARS.len() - 1) as f64).round() as usize)
+                    .clamp(1, SPARK_CHARS.len() - 1);
+                SPARK_CHARS[idx]
+            }
+        })
+        .collect()
+}
+
+/// Mirror of `ACTIVITY_HEADER_ROWS` for the Costs detail popup. Header carries
+/// MTD / forecast / MoM delta + top-model composition, then a separator.
+pub(crate) const COSTS_HEADER_ROWS: usize = 5;
+
+/// Header block above the Daily Costs breakdown: month-to-date spend,
+/// end-of-month forecast (run-rate × remaining days), MoM delta, and the
+/// top model contributors for the current month. Outlier callouts are
+/// surfaced inline as the user scrolls (not in the header) so the
+/// composition row stays readable.
+/// `today` is injected so the header math (MTD, forecast, MoM) is testable
+/// without reading the wall clock; the top-level draw function passes
+/// `chrono::Local::now().date_naive()` at the only production site.
+pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> Vec<Line<'static>> {
+    use chrono::{Datelike, NaiveDate};
+
+    let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+    let prev_month_end = month_start - chrono::Duration::days(1);
+    let prev_month_start =
+        NaiveDate::from_ymd_opt(prev_month_end.year(), prev_month_end.month(), 1)
+            .unwrap_or(prev_month_end);
+
+    let days_in_month = {
+        let next_month_start = if today.month() == 12 {
+            NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
+        } else {
+            NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
+        }
+        .unwrap_or(today);
+        (next_month_start - month_start).num_days() as u32
+    };
+    let day_of_month = today.day();
+
+    let mut mtd_cost = 0.0f64;
+    let mut prev_month_cost = 0.0f64;
+    for (date, cost) in &state.daily_costs {
+        if date.year() == today.year() && date.month() == today.month() {
+            mtd_cost += cost;
+        } else if date.year() == prev_month_start.year() && date.month() == prev_month_start.month()
+        {
+            prev_month_cost += cost;
+        }
+    }
+
+    // Run-rate forecast: average over elapsed days × total days in month.
+    let run_rate = if day_of_month > 0 {
+        mtd_cost / day_of_month as f64
+    } else {
+        0.0
+    };
+    let forecast = run_rate * days_in_month as f64;
+    let days_remaining = days_in_month.saturating_sub(day_of_month);
+
+    let delta_pct = if prev_month_cost > 0.0 {
+        Some(((forecast - prev_month_cost) / prev_month_cost) * 100.0)
+    } else {
+        None
+    };
+    // Most users run ccsight against a flat-rate subscription; the dollar
+    // figures in this popup are API-equivalent estimates, not actual bills.
+    // Higher usage is therefore a neutral signal (more value extracted from
+    // the plan), so the delta carries no warning/success colouring.
+    let delta_text = match delta_pct {
+        Some(d) if d.abs() < 1.0 => "≈ MoM".to_string(),
+        Some(d) if d > 0.0 => format!("↑+{d:.0}% MoM"),
+        Some(d) => format!("↓{d:.0}% MoM"),
+        None => "MoM —".to_string(),
+    };
+
+    let summary = vec![
+        Span::styled("  MTD ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            super::format_cost(mtd_cost, 0),
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · Forecast ", Style::default().fg(theme::DIM)),
+        Span::styled(super::format_cost(forecast, 0), cost_style(forecast)),
+        Span::styled(
+            format!(
+                " ({days_remaining}d left @ {}/d)  ",
+                super::format_cost(run_rate, 0)
+            ),
+            Style::default().fg(theme::DIM),
+        ),
+        Span::styled(delta_text, Style::default().fg(theme::DIM)),
+    ];
+
+    // Top model composition for the current month.
+    let calculator = crate::aggregator::CostCalculator::global();
+    let mut model_cost_mtd: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    for group in &state.daily_groups {
+        if group.date.year() != today.year() || group.date.month() != today.month() {
+            continue;
+        }
+        for session in &group.sessions {
+            if session.is_subagent {
+                continue;
+            }
+            for (model, tokens) in &session.day_tokens_by_model {
+                let c = calculator
+                    .calculate_cost(tokens, Some(model))
+                    .unwrap_or(0.0);
+                let normalized = crate::aggregator::normalize_model_name(model);
+                *model_cost_mtd.entry(normalized).or_insert(0.0) += c;
+            }
+        }
+    }
+    let mut model_costs: Vec<(String, f64)> = model_cost_mtd.into_iter().collect();
+    model_costs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut model_line: Vec<Span> = vec![Span::styled(
+        "  Top models  ",
+        Style::default().fg(theme::DIM),
+    )];
+    if mtd_cost > 0.0 && !model_costs.is_empty() {
+        for (i, (name, cost)) in model_costs.iter().take(3).enumerate() {
+            let pct = (cost / mtd_cost) * 100.0;
+            if i > 0 {
+                model_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+            }
+            model_line.push(Span::styled(
+                name.clone(),
+                Style::default().fg(theme::LABEL_MUTED),
+            ));
+            model_line.push(Span::styled(
+                format!(" {} {pct:.0}%", super::format_cost(*cost, 0)),
+                Style::default().fg(theme::PRIMARY),
+            ));
+        }
+    } else {
+        model_line.push(Span::styled(
+            "no spend this month yet",
+            Style::default().fg(theme::DIM),
+        ));
+    }
+
+    // Top project composition (symmetric to Top models). Lets users see "where
+    // the money went" by codebase as well as by model. Projects without an
+    // entry in `state.project_labels` fall back to the bare project_name.
+    let mut project_cost_mtd: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    for group in &state.daily_groups {
+        if group.date.year() != today.year() || group.date.month() != today.month() {
+            continue;
+        }
+        for session in &group.sessions {
+            if session.is_subagent {
+                continue;
+            }
+            let cost: f64 = session
+                .day_tokens_by_model
+                .iter()
+                .map(|(m, t)| calculator.calculate_cost(t, Some(m)).unwrap_or(0.0))
+                .sum();
+            *project_cost_mtd
+                .entry(session.project_name.clone())
+                .or_insert(0.0) += cost;
+        }
+    }
+    let mut project_costs: Vec<(String, f64)> = project_cost_mtd.into_iter().collect();
+    project_costs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut project_line: Vec<Span> = vec![Span::styled(
+        "  Top projects ",
+        Style::default().fg(theme::DIM),
+    )];
+    if mtd_cost > 0.0 && !project_costs.is_empty() {
+        for (i, (name, cost)) in project_costs.iter().take(3).enumerate() {
+            let pct = (cost / mtd_cost) * 100.0;
+            if i > 0 {
+                project_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+            }
+            let label = state.project_label(name);
+            project_line.push(Span::styled(label, Style::default().fg(theme::LABEL_MUTED)));
+            project_line.push(Span::styled(
+                format!(" {} {pct:.0}%", super::format_cost(*cost, 0)),
+                Style::default().fg(theme::PRIMARY),
+            ));
+        }
+    } else {
+        project_line.push(Span::styled(
+            "no spend this month yet",
+            Style::default().fg(theme::DIM),
+        ));
+    }
+
+    // Daily $/day sparkline over the trailing 30 days.
+    let cost_by_date: std::collections::HashMap<NaiveDate, f64> =
+        state.daily_costs.iter().copied().collect();
+    let spark = render_spark_line(today, 30, |d| cost_by_date.get(&d).copied().unwrap_or(0.0));
+    let trend_line = vec![
+        Span::styled("  Daily $   ", Style::default().fg(theme::DIM)),
+        Span::styled(spark, Style::default().fg(theme::PRIMARY)),
+        Span::styled("  past 30 days", Style::default().fg(theme::DIM)),
+    ];
+
+    vec![
+        Line::from(summary),
+        Line::from(model_line),
+        Line::from(project_line),
+        Line::from(trend_line),
+        // Single blank acts as the section break; the previous truncated
+        // `────` separator was visually noisy and ate a row for no gain.
+        Line::from(""),
+    ]
+}
+
+/// Header block above the Daily/Weekly Activity breakdown: streak, this-week
+/// summary, week-over-week delta, day-of-week distribution. Always reflects
+/// the calendar week of `today`, independent of the daily/weekly toggle.
+///
+/// `today` is injected by the caller so this function stays time-pure: tests
+/// can pin a specific calendar day and exercise month/year/week boundaries
+/// without depending on the wall clock.
+pub(crate) fn activity_header_lines(
+    state: &AppState,
+    today: chrono::NaiveDate,
+) -> Vec<Line<'static>> {
+    use chrono::{Datelike, NaiveDate};
+
+    fn week_start(d: NaiveDate) -> NaiveDate {
+        let dow = d.weekday().num_days_from_monday();
+        d - chrono::Duration::days(dow as i64)
+    }
+
+    let this_week_start = week_start(today);
+    let prev_week_start = this_week_start - chrono::Duration::days(7);
+
+    // Streak: walk backwards from today, counting days that had work tokens.
+    let active_dates: std::collections::HashSet<NaiveDate> = state
+        .daily_groups
+        .iter()
+        .filter(|g| {
+            g.sessions
+                .iter()
+                .any(|s| !s.is_subagent && s.work_tokens() > 0)
+        })
+        .map(|g| g.date)
+        .collect();
+    let mut streak = 0u64;
+    let mut check = today;
+    while active_dates.contains(&check) {
+        streak += 1;
+        check -= chrono::Duration::days(1);
+    }
+
+    let mut this_tokens = 0u64;
+    let mut this_sess = 0usize;
+    let mut this_days = 0usize;
+    let mut prev_tokens = 0u64;
+    let mut dow_tokens = [0u64; 7];
+    let mut this_project_tokens: HashMap<String, u64> = HashMap::new();
+    let mut this_tool_count: HashMap<String, usize> = HashMap::new();
+    for group in &state.daily_groups {
+        let tokens: u64 = group
+            .sessions
+            .iter()
+            .filter(|s| !s.is_subagent)
+            .map(crate::aggregator::SessionInfo::work_tokens)
+            .sum();
+        let sess = group.sessions.iter().filter(|s| !s.is_subagent).count();
+        let ws = week_start(group.date);
+        if ws == this_week_start {
+            this_tokens += tokens;
+            this_sess += sess;
+            if tokens > 0 {
+                this_days += 1;
+            }
+            for s in group.sessions.iter().filter(|s| !s.is_subagent) {
+                *this_project_tokens
+                    .entry(s.project_name.clone())
+                    .or_insert(0) += s.work_tokens();
+                for (tool, count) in &s.day_tool_usage {
+                    *this_tool_count.entry(tool.clone()).or_insert(0) += count;
+                }
+            }
+        } else if ws == prev_week_start {
+            prev_tokens += tokens;
+        }
+        let dow = group.date.weekday().num_days_from_monday() as usize;
+        if dow < 7 {
+            dow_tokens[dow] += tokens;
+        }
+    }
+
+    let delta_pct = if prev_tokens > 0 {
+        Some(((this_tokens as f64 - prev_tokens as f64) / prev_tokens as f64) * 100.0)
+    } else {
+        None
+    };
+    let (delta_text, delta_color) = match delta_pct {
+        Some(d) if d.abs() < 1.0 => ("≈ WoW".to_string(), theme::DIM),
+        Some(d) if d > 0.0 => (format!("↑+{d:.0}% WoW"), theme::SUCCESS),
+        Some(d) => (format!("↓{d:.0}% WoW"), theme::WARNING),
+        None => ("WoW —".to_string(), theme::DIM),
+    };
+
+    let summary = vec![
+        Span::styled("  Streak ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            format!("{streak}d"),
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · This week ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            crate::format_number(this_tokens),
+            Style::default().fg(theme::PRIMARY),
+        ),
+        Span::styled(
+            format!(" tok · {this_sess} sess · {this_days}/7d  "),
+            Style::default().fg(theme::DIM),
+        ),
+        Span::styled(delta_text, Style::default().fg(delta_color)),
+    ];
+
+    let dow_max = dow_tokens.iter().copied().max().unwrap_or(1).max(1);
+    let dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let mut dow_line: Vec<Span> = vec![Span::styled(
+        "  Day-of-week  ",
+        Style::default().fg(theme::DIM),
+    )];
+    for (i, name) in dow_names.iter().enumerate() {
+        let bar = if dow_tokens[i] == 0 {
+            SPARK_CHARS[0]
+        } else {
+            let ratio = dow_tokens[i] as f64 / dow_max as f64;
+            let idx = ((ratio * (SPARK_CHARS.len() - 1) as f64).round() as usize)
+                .clamp(1, SPARK_CHARS.len() - 1);
+            SPARK_CHARS[idx]
+        };
+        dow_line.push(Span::styled(
+            format!("{name} "),
+            Style::default().fg(theme::LABEL_MUTED),
+        ));
+        dow_line.push(Span::styled(
+            format!("{bar}  "),
+            Style::default().fg(theme::PRIMARY),
+        ));
+    }
+
+    // Daily token sparkline over the trailing 30 days. Builds a date→tokens
+    // lookup once so the sparkline closure stays O(window) rather than
+    // O(window × daily_groups).
+    let mut daily_tokens: std::collections::HashMap<NaiveDate, u64> =
+        std::collections::HashMap::new();
+    for group in &state.daily_groups {
+        let tokens: u64 = group
+            .sessions
+            .iter()
+            .filter(|s| !s.is_subagent)
+            .map(crate::aggregator::SessionInfo::work_tokens)
+            .sum();
+        daily_tokens.insert(group.date, tokens);
+    }
+    let spark = render_spark_line(today, 30, |d| {
+        daily_tokens.get(&d).copied().unwrap_or(0) as f64
+    });
+    let trend_line = vec![
+        Span::styled("  Daily tokens ", Style::default().fg(theme::DIM)),
+        Span::styled(spark, Style::default().fg(theme::PRIMARY)),
+        Span::styled("  past 30 days", Style::default().fg(theme::DIM)),
+    ];
+
+    // Top contributors this week: highest project by tokens and highest
+    // tool by call count. Skips the row entirely when the current week has
+    // no activity so empty weeks don't claim header real estate.
+    let top_project = this_project_tokens
+        .iter()
+        .max_by_key(|(_, v)| **v)
+        .map(|(name, tokens)| (name.clone(), *tokens));
+    let top_tool = this_tool_count
+        .iter()
+        .filter(|(name, _)| !name.is_empty())
+        .max_by_key(|(_, v)| **v)
+        .map(|(name, count)| (name.clone(), *count));
+    let mut top_line: Vec<Span> = vec![Span::styled(
+        "  This week  ",
+        Style::default().fg(theme::DIM),
+    )];
+    if let Some((name, tokens)) = top_project {
+        let label = state.project_label(&name);
+        top_line.push(Span::styled(label, Style::default().fg(theme::WARM)));
+        top_line.push(Span::styled(
+            format!(" {} tok", crate::format_number(tokens)),
+            Style::default().fg(theme::PRIMARY),
+        ));
+    } else {
+        top_line.push(Span::styled(
+            "no activity yet",
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    if let Some((name, count)) = top_tool {
+        top_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+        let short = crate::aggregator::format_tool_short(&name);
+        top_line.push(Span::styled(short, Style::default().fg(theme::SUCCESS)));
+        top_line.push(Span::styled(
+            format!(" {count}×"),
+            Style::default().fg(theme::PRIMARY),
+        ));
+    }
+
+    vec![
+        Line::from(summary),
+        Line::from(dow_line),
+        Line::from(top_line),
+        Line::from(trend_line),
+        // Single blank between header and the daily/weekly breakdown — see
+        // `costs_header_lines` for the same reasoning.
+        Line::from(""),
+    ]
+}
+
+pub(crate) struct WeeklyBucket {
+    pub label: String,
+    pub start_label: String,
+    pub end_label: String,
+    pub tokens: u64,
+    pub cost: f64,
+    pub active_days: usize,
+}
+
+/// ISO-week aggregation over `state.daily_groups`. Output is newest-week-first
+/// to match the surrounding popup conventions (Daily Activity also lists
+/// today at the top). Cost is summed from `daily_costs` so it stays in sync
+/// with the Costs panel.
+pub(crate) fn weekly_activity(state: &AppState) -> Vec<WeeklyBucket> {
+    use chrono::{Datelike, NaiveDate};
+
+    fn week_start(d: NaiveDate) -> NaiveDate {
+        let dow = d.weekday().num_days_from_monday();
+        d - chrono::Duration::days(dow as i64)
+    }
+
+    let cost_by_date: HashMap<NaiveDate, f64> = state.daily_costs.iter().copied().collect();
+
+    let mut buckets: HashMap<NaiveDate, WeeklyBucket> = HashMap::new();
+    for group in &state.daily_groups {
+        let start = week_start(group.date);
+        let iso = group.date.iso_week();
+        let tokens: u64 = group
+            .sessions
+            .iter()
+            .filter(|s| !s.is_subagent)
+            .map(crate::aggregator::SessionInfo::work_tokens)
+            .sum();
+        let cost = cost_by_date.get(&group.date).copied().unwrap_or(0.0);
+        let entry = buckets.entry(start).or_insert_with(|| {
+            let end = start + chrono::Duration::days(6);
+            WeeklyBucket {
+                label: format!("{}-W{:02}", iso.year(), iso.week()),
+                start_label: start.format("%m-%d").to_string(),
+                end_label: end.format("%m-%d").to_string(),
+                tokens: 0,
+                cost: 0.0,
+                active_days: 0,
+            }
+        });
+        entry.tokens += tokens;
+        entry.cost += cost;
+        entry.active_days += 1;
+    }
+
+    let mut out: Vec<WeeklyBucket> = buckets.into_values().collect();
+    // Newest week first — match Daily Activity's reverse-chronological order.
+    out.sort_by_key(|w| {
+        let parts: Vec<&str> = w.label.split("-W").collect();
+        let year: i32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let week: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::cmp::Reverse((year, week))
+    });
+    out
+}
+
 /// Append a month-summary divider line for the popup body. Same layout for
 /// the Daily Costs and Daily Activity detail popups: `── YY-MM  Nd  $cost
 /// tokens  avg $X/d ──...`. Width-aware trailing fill.
@@ -1425,6 +2049,10 @@ fn push_month_divider_line(
 }
 
 pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    // Single time-reading site for this popup. Header builders (`activity_header_lines`,
+    // `costs_header_lines`) stay time-pure and take `today` as a parameter so they
+    // can be tested deterministically at any calendar boundary.
+    let today = chrono::Local::now().date_naive();
     let popup_width = 90.min(area.width.saturating_sub(4));
     let popup_height = area.height.saturating_sub(4).min(30);
     let content_width = popup_width.saturating_sub(4) as usize;
@@ -1469,19 +2097,38 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         2 => state.model_costs.len(),
         3 => tool_usage_line_count(state),
         4 => {
-            let known = state.stats.language_usage.iter().filter(|(l, _)| l.as_str() != "Other").count();
-            let other = state.stats.extension_usage.iter().filter(|(ext, _)| {
-                crate::aggregator::language::for_extension(ext) == "Other"
-            }).count();
+            let known = state
+                .stats
+                .language_usage
+                .iter()
+                .filter(|(l, _)| l.as_str() != "Other")
+                .count();
+            let other = state
+                .stats
+                .extension_usage
+                .iter()
+                .filter(|(ext, _)| crate::aggregator::language::for_extension(ext) == "Other")
+                .count();
             known + other
         }
-        5 => state.daily_groups.len(),
+        5 => {
+            if state.activity_view_weekly {
+                weekly_activity(state).len()
+            } else {
+                state.daily_groups.len()
+            }
+        }
         6 => 24,
         _ => 0,
     };
     let items_per_screen = match state.dashboard_panel {
+        // Panel 0 reserves the top rows for the MTD/forecast/composition
+        // header; panel 5 likewise reserves rows for streak/dow header.
+        0 => visible_height.saturating_sub(COSTS_HEADER_ROWS),
         1 => visible_height / 3,
         2 => visible_height / 5,
+        4 => visible_height / 2, // Languages: main row + extensions line
+        5 => visible_height.saturating_sub(ACTIVITY_HEADER_ROWS),
         _ => visible_height,
     };
 
@@ -1498,7 +2145,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         0 => {
             use chrono::Datelike;
             let title = " Daily Costs ".to_string();
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            let mut lines: Vec<Line> = costs_header_lines(state, today);
+            let body_height = visible_height.saturating_sub(COSTS_HEADER_ROWS);
             let max_cost = state
                 .daily_costs
                 .iter()
@@ -1540,15 +2188,16 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 .iter()
                 .enumerate()
                 .skip(scroll)
-                .take(visible_height)
+                .take(body_height)
             {
                 let key = (date.year(), date.month());
                 if let Some(pm) = prev_month
-                    && pm != key {
-                        let (c, d) = monthly_cost.get(&pm).copied().unwrap_or((0.0, 0));
-                        let t = monthly_tok.get(&pm).copied().unwrap_or(0);
-                        push_month_divider_line(&mut lines, pm.0, pm.1, d, c, t, cw);
-                    }
+                    && pm != key
+                {
+                    let (c, d) = monthly_cost.get(&pm).copied().unwrap_or((0.0, 0));
+                    let t = monthly_tok.get(&pm).copied().unwrap_or(0);
+                    push_month_divider_line(&mut lines, pm.0, pm.1, d, c, t, cw);
+                }
                 prev_month = Some(key);
 
                 let cost_display = cost.max(0.0);
@@ -1562,25 +2211,32 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 let intensity = (ratio * 0.7 + 0.3).min(1.0);
                 let bar_color = theme::primary_with_intensity(intensity);
 
-                let tokens: u64 = state
-                    .daily_groups
-                    .iter()
-                    .find(|g| &g.date == date)
-                    .map_or(0, |group| {
-                        group
-                            .sessions
-                            .iter()
-                            .filter(|s| !s.is_subagent)
-                            .map(crate::aggregator::SessionInfo::work_tokens)
-                            .sum()
-                    });
+                let tokens: u64 =
+                    state
+                        .daily_groups
+                        .iter()
+                        .find(|g| &g.date == date)
+                        .map_or(0, |group| {
+                            group
+                                .sessions
+                                .iter()
+                                .filter(|s| !s.is_subagent)
+                                .map(crate::aggregator::SessionInfo::work_tokens)
+                                .sum()
+                        });
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
-                    Span::styled(format!("{}({})", date, date.format("%a")), Style::default().fg(theme::LABEL_MUTED)),
+                    Span::styled(
+                        format!("{}({})", date, date.format("%a")),
+                        Style::default().fg(theme::LABEL_MUTED),
+                    ),
                     Span::raw(" "),
                     Span::styled(bar, Style::default().fg(bar_color)),
-                    Span::styled(format!(" {}", super::format_cost(cost_display, 2)), cost_style(*cost)),
+                    Span::styled(
+                        format!(" {}", super::format_cost(cost_display, 2)),
+                        cost_style(*cost),
+                    ),
                     Span::styled(
                         format!(" ({})", crate::format_number(tokens)),
                         Style::default().fg(theme::DIM),
@@ -1591,12 +2247,21 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         }
         1 => {
             let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-            projects.sort_by_key(|p| std::cmp::Reverse(p.1.work_tokens));
-            let selected_path = projects
-                .get(scroll)
-                .map_or("", |(name, _)| name.as_str());
+            // Alphabetical tiebreaker required by lint #30 — HashMap iteration
+            // is unordered, and the mouse double-click handler indexes into
+            // the same sort, so both sides need a stable key when tokens tie.
+            projects.sort_by(|a, b| {
+                b.1.work_tokens
+                    .cmp(&a.1.work_tokens)
+                    .then_with(|| a.0.cmp(b.0))
+            });
+            // `scroll` is the cursor (j/k moves it; Enter opens this row).
+            // The actual viewport offset lives in `dashboard_viewport[1]`
+            // and only adjusts when the cursor leaves the visible window.
+            let cursor = scroll;
+            let selected_path = projects.get(cursor).map_or("", |(name, _)| name.as_str());
             let title = format!(" ◈ {selected_path} ");
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            let mut lines: Vec<Line> = Vec::new();
             let max_tokens = projects.first().map_or(1, |(_, s)| s.work_tokens);
             let bar_width = 12usize;
             let name_width = content_width.saturating_sub(8);
@@ -1610,7 +2275,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             for group in state.daily_groups.iter().rev() {
                 for session in group.user_sessions() {
                     let work = session.work_tokens();
-                    let daily = project_daily_tokens.entry(session.project_name.clone()).or_default();
+                    let daily = project_daily_tokens
+                        .entry(session.project_name.clone())
+                        .or_default();
                     if let Some(entry) = daily.last_mut().filter(|e| e.0 == group.date) {
                         entry.1 += work;
                     } else {
@@ -1621,7 +2288,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let all_resampled: HashMap<String, Vec<u64>> = project_daily_tokens
                 .iter()
                 .map(|(name, daily)| {
-                    (name.clone(), resample_sparkline(daily, spark_width, global_first, global_last))
+                    (
+                        name.clone(),
+                        resample_sparkline(daily, spark_width, global_first, global_last),
+                    )
                 })
                 .collect();
             let global_spark_max: u64 = all_resampled
@@ -1639,14 +2309,22 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             for group in &state.daily_groups {
                 for session in group.user_sessions() {
                     for (model, tokens) in &session.day_tokens_by_model {
-                        let cost = calculator.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
-                        *project_cost.entry(session.project_name.clone()).or_default() += cost;
+                        let cost = calculator
+                            .calculate_cost(tokens, Some(model))
+                            .unwrap_or(0.0);
+                        *project_cost
+                            .entry(session.project_name.clone())
+                            .or_default() += cost;
                     }
-                    let last = project_last_date.entry(session.project_name.clone()).or_insert(group.date);
+                    let last = project_last_date
+                        .entry(session.project_name.clone())
+                        .or_insert(group.date);
                     if group.date > *last {
                         *last = group.date;
                     }
-                    let first = project_first_date.entry(session.project_name.clone()).or_insert(group.date);
+                    let first = project_first_date
+                        .entry(session.project_name.clone())
+                        .or_insert(group.date);
                     if group.date < *first {
                         *first = group.date;
                     }
@@ -1657,10 +2335,26 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             }
 
             let items_visible = visible_height / 3;
+            // Edge-triggered viewport: scroll only when cursor leaves view.
+            let prev_viewport = state.dashboard_viewport[1];
+            let viewport = if cursor < prev_viewport {
+                cursor
+            } else if cursor >= prev_viewport + items_visible {
+                cursor + 1 - items_visible
+            } else {
+                prev_viewport
+            };
+            state.dashboard_viewport[1] = viewport;
+
+            // Body lines start at popup_area.y + 1 (top border). The title
+            // line lives on the border itself, not inside content.
+            let body_y0 = popup_area.y + 1;
+            let inner_x = popup_area.x + 1;
+            let row_width = popup_area.width.saturating_sub(2);
             for (i, (name, stats)) in projects
                 .iter()
                 .enumerate()
-                .skip(scroll)
+                .skip(viewport)
                 .take(items_visible)
             {
                 let ratio = stats.work_tokens as f64 / max_tokens as f64;
@@ -1672,7 +2366,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     (100.0 + 68.0 * intensity) as u8,
                     (180.0 + 75.0 * intensity) as u8,
                 );
-                let display_name = truncate(name, name_width);
+                // Show basename only; the absolute path is in the popup title.
+                let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+                let display_name = truncate(basename, name_width);
                 let cost = project_cost.get(name.as_str()).copied().unwrap_or(0.0);
                 let active_days = project_active_days.get(name.as_str()).copied().unwrap_or(0);
                 let date_range = match (
@@ -1686,12 +2382,20 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     _ => String::new(),
                 };
 
+                let is_selected = i == cursor;
+                let marker = if is_selected { "▶ " } else { "  " };
+                let name_style = if is_selected {
+                    Style::default()
+                        .fg(theme::TEXT_BRIGHT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::SECONDARY)
+                };
+                let row_start = lines.len();
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
-                    Span::styled(
-                        display_name,
-                        Style::default().fg(theme::SECONDARY),
-                    ),
+                    Span::styled(marker, Style::default().fg(theme::PRIMARY)),
+                    Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+                    Span::styled(display_name, name_style),
                 ]));
                 lines.push(Line::from(vec![
                     Span::raw("       "),
@@ -1708,26 +2412,54 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         format!("  {}", super::format_cost(cost, 0)),
                         super::cost_style(cost),
                     ),
-                    Span::styled(
-                        format!("  {active_days}d"),
-                        Style::default().fg(theme::DIM),
-                    ),
-                    Span::styled(
-                        format!("  {date_range}"),
-                        Style::default().fg(theme::DIM),
-                    ),
+                    Span::styled(format!("  {active_days}d"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!("  {date_range}"), Style::default().fg(theme::DIM)),
                 ]));
                 if let Some(values) = all_resampled.get(name.as_str())
                     && values.iter().any(|&v| v > 0)
                 {
-                    lines.push(Line::from(render_sparkline(values, global_spark_max, bar_color)));
+                    lines.push(Line::from(render_sparkline(
+                        values,
+                        global_spark_max,
+                        bar_color,
+                    )));
+                }
+                let row_end = lines.len();
+                let row_height = (row_end - row_start) as u16;
+                state.project_detail_row_areas.push((
+                    i,
+                    Rect::new(inner_x, body_y0 + row_start as u16, row_width, row_height),
+                ));
+                // Full-row bg highlight on every line in the selected row,
+                // mirroring the Live tab pattern: patch each span's bg, then
+                // pad the line out to row_width so the bg reaches the right
+                // border. `Paragraph` styles trailing area with the widget
+                // style, not the line style, so explicit padding is needed.
+                if is_selected {
+                    let bg = theme::FAINT;
+                    let sel_style = Style::default().bg(bg);
+                    for line in lines[row_start..row_end].iter_mut() {
+                        let width: usize = line
+                            .spans
+                            .iter()
+                            .map(|sp| unicode_width::UnicodeWidthStr::width(sp.content.as_ref()))
+                            .sum();
+                        for span in &mut line.spans {
+                            span.style = span.style.bg(bg);
+                        }
+                        let pad = (row_width as usize).saturating_sub(width);
+                        if pad > 0 {
+                            line.spans.push(Span::styled(" ".repeat(pad), sel_style));
+                        }
+                        *line = std::mem::take(line).style(sel_style);
+                    }
                 }
             }
             (title, lines)
         }
         2 => {
             let title = " Model Tokens ".to_string();
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            let mut lines: Vec<Line> = Vec::new();
             let calculator = CostCalculator::global();
 
             let mut model_last_used: HashMap<String, NaiveDate> = HashMap::new();
@@ -1737,11 +2469,15 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 for session in group.user_sessions() {
                     for (model_name, ts) in &session.day_tokens_by_model {
                         let normalized = crate::aggregator::normalize_model_name(model_name);
-                        let last = model_last_used.entry(normalized.clone()).or_insert(group.date);
+                        let last = model_last_used
+                            .entry(normalized.clone())
+                            .or_insert(group.date);
                         if group.date > *last {
                             *last = group.date;
                         }
-                        let first = model_first_used.entry(normalized.clone()).or_insert(group.date);
+                        let first = model_first_used
+                            .entry(normalized.clone())
+                            .or_insert(group.date);
                         if group.date < *first {
                             *first = group.date;
                         }
@@ -1762,7 +2498,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let all_resampled: HashMap<String, Vec<u64>> = model_daily_tokens
                 .iter()
                 .map(|(name, daily)| {
-                    (name.clone(), resample_sparkline(daily, spark_width, global_first, global_last))
+                    (
+                        name.clone(),
+                        resample_sparkline(daily, spark_width, global_first, global_last),
+                    )
                 })
                 .collect();
             let global_spark_max: u64 = all_resampled
@@ -1833,19 +2572,27 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
                     )
                 } else {
-                    // "actual" rate = total cost ÷ all tokens (input + output +
-                    // cache). The next line shows the static `rate/MTok` per
-                    // category; this one shows what was actually paid per
-                    // million tokens once cache reads are factored in, so the
-                    // gap between the two reflects how much cache is saving.
-                    let total_tokens = ts.input_tokens
-                        + ts.output_tokens
-                        + ts.cache_creation_tokens
-                        + ts.cache_read_tokens;
-                    let actual = if total_tokens > 0 {
-                        format!("  actual:${:.2}/MTok", cost / (total_tokens as f64 / 1_000_000.0))
-                    } else {
-                        String::new()
+                    // Two effective rates for the same cost:
+                    //   work   = $/MTok charged against input + output only (no cache).
+                    //            Compares directly to the base rate on the next line;
+                    //            large gap from base means heavy cache pulled-down.
+                    //   billed = $/MTok across every token Anthropic billed (cache
+                    //            included). Lower number, useful for "what does each
+                    //            request feel like" rather than the headline rate.
+                    let work_tokens = ts.input_tokens + ts.output_tokens;
+                    let total_tokens =
+                        work_tokens + ts.cache_creation_tokens + ts.cache_read_tokens;
+                    let rates = match (work_tokens, total_tokens) {
+                        (0, 0) => String::new(),
+                        (0, _) => format!(
+                            "  ${:.2}/MTok billed",
+                            cost / (total_tokens as f64 / 1_000_000.0),
+                        ),
+                        (_, _) => format!(
+                            "  ${:.2}/MTok work · ${:.2}/MTok billed",
+                            cost / (work_tokens as f64 / 1_000_000.0),
+                            cost / (total_tokens as f64 / 1_000_000.0),
+                        ),
                     };
                     format!(
                         "in:{} out:{} cache:{}  ${:.2}{}",
@@ -1853,7 +2600,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         crate::format_number(ts.output_tokens),
                         crate::format_number(ts.cache_creation_tokens + ts.cache_read_tokens),
                         cost,
-                        actual,
+                        rates,
                     )
                 };
 
@@ -1861,13 +2608,19 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
                     Span::styled(
                         format!("{display_name:<name_width$}"),
-                        Style::default().fg(if unknown { theme::WARNING } else { theme::PRIMARY }),
+                        Style::default().fg(if unknown {
+                            theme::WARNING
+                        } else {
+                            theme::PRIMARY
+                        }),
                     ),
                 ];
                 if unknown {
                     name_spans.push(Span::styled(
                         " ⚠ no pricing",
-                        Style::default().fg(theme::WARNING).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme::WARNING)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
                 lines.push(Line::from(name_spans));
@@ -1905,10 +2658,11 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         Span::raw("       "),
                         Span::styled(
                             format!(
-                                "rate/MTok: in:${} out:${} cache_w:${} cache_r:${}",
+                                "rate/MTok: in:${} out:${} cw_5m:${} cw_1h:${} cache_r:${}",
                                 p.input_cost_per_mtok,
                                 p.output_cost_per_mtok,
-                                p.cache_write_cost_per_mtok,
+                                p.cache_write_5m_cost_per_mtok,
+                                p.cache_write_1h_cost_per_mtok,
                                 p.cache_read_cost_per_mtok,
                             ),
                             Style::default().fg(theme::DIM),
@@ -1918,16 +2672,20 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 if let Some(values) = all_resampled.get(model)
                     && values.iter().any(|&v| v > 0)
                 {
-                    lines.push(Line::from(render_sparkline(values, global_spark_max, bar_color)));
+                    lines.push(Line::from(render_sparkline(
+                        values,
+                        global_spark_max,
+                        bar_color,
+                    )));
                 }
             }
             (title, lines)
         }
         3 => {
-            use crate::aggregator::{classify_tool, format_tool_short, ToolCategory};
+            use crate::aggregator::{ToolCategory, classify_tool, format_tool_short};
 
             let title = " Ecosystem ".to_string();
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            let mut lines: Vec<Line> = Vec::new();
             let tools: Vec<_> = state.stats.tool_usage.iter().collect();
 
             let (mut builtin, mut skill, mut agent, mut mcp, mut command): (
@@ -1982,9 +2740,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
             // Color base+amp tables per category (identical curve, only hues differ).
             const BUILTIN_RGB: [f64; 6] = [150.0, 180.0, 100.0, 68.0, 38.0, 55.0];
-            const SKILL_RGB:   [f64; 6] = [200.0, 160.0,  80.0, 40.0, 50.0, 40.0];
-            const AGENT_RGB:   [f64; 6] = [130.0, 170.0, 200.0, 55.0, 50.0, 40.0];
-            const MCP_RGB:     [f64; 6] = [100.0, 150.0, 180.0, 55.0, 68.0, 38.0];
+            const SKILL_RGB: [f64; 6] = [200.0, 160.0, 80.0, 40.0, 50.0, 40.0];
+            const AGENT_RGB: [f64; 6] = [130.0, 170.0, 200.0, 55.0, 50.0, 40.0];
+            const MCP_RGB: [f64; 6] = [100.0, 150.0, 180.0, 55.0, 68.0, 38.0];
             const COMMAND_RGB: [f64; 6] = [180.0, 130.0, 200.0, 55.0, 60.0, 50.0];
 
             fn rgb_from_table(table: &[f64; 6], ratio: f64) -> (u8, u8, u8) {
@@ -2008,7 +2766,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             // Subagents are dispatcher-tier meta-tools shown last.
             // `mcp` is rendered specially inside the Tools body and is not
             // represented here as its own Section.
-            let sections = [Section {
+            let sections = [
+                Section {
                     items: builtin,
                     total: builtin_total,
                     color: theme::CAT_TOOLS,
@@ -2035,7 +2794,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     color: theme::CAT_SUBAGENTS,
                     bar_rgb_table: AGENT_RGB,
                     format_name: short_name,
-                }];
+                },
+            ];
             // The Tools tab is "active for nav" if either built-in OR mcp has rows.
             let tools_tab_has_rows = !sections[0].items.is_empty() || !mcp.is_empty();
 
@@ -2052,9 +2812,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             };
             let active = state.tools_detail_section.min(sections.len() - 1);
             let active = if !tab_has_rows(active) {
-                (0..sections.len())
-                    .find(|&i| tab_has_rows(i))
-                    .unwrap_or(0)
+                (0..sections.len()).find(|&i| tab_has_rows(i)).unwrap_or(0)
             } else {
                 active
             };
@@ -2106,18 +2864,14 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     let label_w = unicode_width::UnicodeWidthStr::width(label_core.as_str()) as u16;
                     tab_width = prefix_w + label_w;
                     tab_spans.push(Span::styled(prefix, Style::default().fg(theme::FAINT)));
-                    tab_spans.push(Span::styled(
-                        label_core,
-                        Style::default().fg(sec.color),
-                    ));
+                    tab_spans.push(Span::styled(label_core, Style::default().fg(sec.color)));
                 }
 
                 // Record click area for non-empty sections (empty is not clickable)
                 if !empty {
-                    state.tools_detail_tab_areas.push((
-                        i,
-                        Rect::new(cursor_x, tab_bar_y, tab_width, 1),
-                    ));
+                    state
+                        .tools_detail_tab_areas
+                        .push((i, Rect::new(cursor_x, tab_bar_y, tab_width, 1)));
                 }
                 cursor_x += tab_width;
 
@@ -2232,7 +2986,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     for (k, c) in builtin_items {
                         bi.tools.push((*k, **c));
                     }
-                    rows.push((crate::handlers::mcp_popup::BUILTIN_GROUP_NAME.to_string(), bi));
+                    rows.push((
+                        crate::handlers::mcp_popup::BUILTIN_GROUP_NAME.to_string(),
+                        bi,
+                    ));
                 }
                 rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then_with(|| a.0.cmp(&b.0)));
 
@@ -2271,7 +3028,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             ),
                             Style::default().fg(theme::CAT_BUILTIN),
                         ),
-                        Span::styled("  ·  ", Style::default().fg(theme::DIM)),
+                        Span::styled(" · ", Style::default().fg(theme::DIM)),
                         Span::styled(
                             format!(
                                 "MCP {} ({:.0}%)",
@@ -2339,8 +3096,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         Some(0)
                     };
                     let filled = (ratio * bar_width as f64).round() as usize;
-                    let bar =
-                        format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+                    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
                     // Built-in row gets the Built-in palette so it stays visually
                     // distinct from MCP servers in the same list. Both colors
                     // come from `theme::CAT_*` aliases so the canonical
@@ -2350,11 +3106,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     } else {
                         theme::CAT_MCP
                     };
-                    let row_rgb_table = if agg.is_builtin {
-                        BUILTIN_RGB
-                    } else {
-                        MCP_RGB
-                    };
+                    let row_rgb_table = if agg.is_builtin { BUILTIN_RGB } else { MCP_RGB };
                     let (r, g, b) = rgb_from_table(&row_rgb_table, ratio);
                     let bar_color = Color::Rgb(r, g, b);
                     let display_name = truncate(group, group_name_width);
@@ -2364,9 +3116,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         // max as a coarse "how active the group is" signal.
                         agg.tools
                             .iter()
-                            .map(|(k, _)| {
-                                state.stats.tool_sessions.get(*k).copied().unwrap_or(0)
-                            })
+                            .map(|(k, _)| state.stats.tool_sessions.get(*k).copied().unwrap_or(0))
                             .max()
                             .unwrap_or(0)
                     } else {
@@ -2389,21 +3139,15 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     // configured + (never used OR >=30d idle). Threshold matches
                     // `McpServerStatus::is_underutilized` exactly so per-row `⚠`
                     // and the header "N stale" stay in sync.
-                    let is_stale = !agg.is_builtin
-                        && agg.configured
-                        && days_since.is_none_or(|d| d >= 30);
+                    let is_stale =
+                        !agg.is_builtin && agg.configured && days_since.is_none_or(|d| d >= 30);
                     let expanded = state.mcp_expanded_servers.contains(group);
                     let is_selected = i == selected_idx;
                     let arrow = if expanded { "▼" } else { "▶" };
                     let server_row_y = base_y + lines.len() as u16;
                     state.mcp_server_row_areas.push((
                         i,
-                        Rect::new(
-                            inner_x,
-                            server_row_y,
-                            popup_area.width.saturating_sub(2),
-                            1,
-                        ),
+                        Rect::new(inner_x, server_row_y, popup_area.width.saturating_sub(2), 1),
                     ));
                     let name_style = if is_selected {
                         Style::default()
@@ -2421,14 +3165,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             format!(" {arrow} "),
                             Style::default().fg(if expanded { row_color } else { theme::DIM }),
                         ),
-                        Span::styled(
-                            format!("{:>2}. ", i + 1),
-                            Style::default().fg(theme::DIM),
-                        ),
-                        Span::styled(
-                            format!("{display_name:<group_name_width$}"),
-                            name_style,
-                        ),
+                        Span::styled(format!("{:>2}. ", i + 1), Style::default().fg(theme::DIM)),
+                        Span::styled(format!("{display_name:<group_name_width$}"), name_style),
                         Span::raw(" "),
                         Span::styled(bar, Style::default().fg(bar_color)),
                         Span::styled(
@@ -2455,11 +3193,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         ),
                         Span::styled(
                             format!(" · {last_used_str}"),
-                            Style::default().fg(if is_stale {
-                                theme::WARNING
-                            } else {
-                                theme::DIM
-                            }),
+                            Style::default().fg(if is_stale { theme::WARNING } else { theme::DIM }),
                         ),
                         Span::styled(
                             if is_stale { " ⚠" } else { "" },
@@ -2469,9 +3203,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
                     if expanded && !agg.tools.is_empty() {
                         let mut tools_sorted = agg.tools.clone();
-                        tools_sorted.sort_by(|a, b| {
-                            b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0))
-                        });
+                        tools_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
                         let tool_max = tools_sorted.first().map_or(1, |(_, c)| *c).max(1);
                         let tool_bar_width = 6usize;
                         let selected_tool_idx = if is_selected {
@@ -2525,10 +3257,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                                     format!("{:>2}. ", ti + 1),
                                     Style::default().fg(theme::DIM),
                                 ),
-                                Span::styled(
-                                    format!("{t_name:<tool_name_width$}"),
-                                    t_name_style,
-                                ),
+                                Span::styled(format!("{t_name:<tool_name_width$}"), t_name_style),
                                 Span::raw(" "),
                                 Span::styled(t_bar, Style::default().fg(bar_color)),
                                 Span::styled(
@@ -2556,12 +3285,13 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 // surfaces stale-never MCP servers — without this, an
                 // installed-but-never-tried Skill / Command / Agent stays
                 // invisible in the popup it ought to show up in.
-                let (storage_prefix, configured_set): (&str, &std::collections::HashSet<String>) = match active {
-                    1 => ("skill:", &state.configured_resources.skills),
-                    2 => ("command:", &state.configured_resources.commands),
-                    3 => ("agent:", &state.configured_resources.agents),
-                    _ => ("", &state.configured_resources.skills),
-                };
+                let (storage_prefix, configured_set): (&str, &std::collections::HashSet<String>) =
+                    match active {
+                        1 => ("skill:", &state.configured_resources.skills),
+                        2 => ("command:", &state.configured_resources.commands),
+                        3 => ("agent:", &state.configured_resources.agents),
+                        _ => ("", &state.configured_resources.skills),
+                    };
                 let used_keys: std::collections::HashSet<String> =
                     sec.items.iter().map(|(k, _)| (*k).clone()).collect();
                 let mut unused_keys: Vec<String> = configured_set
@@ -2614,7 +3344,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         None => "never".to_string(),
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {:>3}. ", row_idx + 1), Style::default().fg(theme::DIM)),
+                        Span::styled(
+                            format!("  {:>3}. ", row_idx + 1),
+                            Style::default().fg(theme::DIM),
+                        ),
                         Span::styled(
                             format!("{display_name:<name_width$}"),
                             Style::default().fg(sec.color),
@@ -2626,10 +3359,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             Style::default().fg(theme::LABEL_MUTED),
                         ),
                         Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
-                        Span::styled(
-                            format!(" · {ses:>3} ses"),
-                            Style::default().fg(theme::DIM),
-                        ),
+                        Span::styled(format!(" · {ses:>3} ses"), Style::default().fg(theme::DIM)),
                         Span::styled(
                             format!(" · {last_used_str}"),
                             Style::default().fg(theme::DIM),
@@ -2643,7 +3373,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     let display_raw = (sec.format_name)(key);
                     let display_name = truncate(&display_raw, name_width);
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {:>3}. ", row_idx + 1), Style::default().fg(theme::DIM)),
+                        Span::styled(
+                            format!("  {:>3}. ", row_idx + 1),
+                            Style::default().fg(theme::DIM),
+                        ),
                         Span::styled(
                             format!("{display_name:<name_width$}"),
                             Style::default().fg(theme::LABEL_SUBTLE),
@@ -2684,7 +3417,6 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         4 => {
             let title = " Languages ".to_string();
             let mut lines: Vec<Line> = vec![
-                Line::from(""),
                 Line::from(Span::styled(
                     "  File types touched by tool calls (Read, Edit, Write, etc.)",
                     Style::default().fg(theme::DIM),
@@ -2704,9 +3436,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 }
             }
             for exts in ext_by_lang.values_mut() {
-                exts.sort_by(|a, b| b.1.cmp(a.1));
+                exts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             }
-            other_exts.sort_by(|a, b| b.1.cmp(a.1));
+            other_exts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
 
             let mut known_langs: Vec<_> = state
                 .stats
@@ -2714,7 +3446,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 .iter()
                 .filter(|(lang, _)| lang.as_str() != "Other")
                 .collect();
-            known_langs.sort_by(|a, b| b.1.cmp(a.1));
+            known_langs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
 
             let total_usage: usize = state.stats.language_usage.values().sum();
             let max_count = known_langs
@@ -2795,51 +3527,65 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
                 if is_known
                     && let LangItem::Known(lang, lang_count) = item
-                        && let Some(exts) = ext_by_lang.get(lang) {
-                            // Surface the residual: `language_usage[lang]`
-                            // counts hits without a file extension too (see
-                            // `extract_language_from_tool_input`); without
-                            // this tail the breakdown wouldn't add up to
-                            // the row header.
-                            let ext_sum: usize = exts.iter().map(|(_, c)| **c).sum();
-                            let no_ext = lang_count.saturating_sub(ext_sum);
-                            let indent = "        ";
-                            let max_line_width = content_width.saturating_sub(2);
-                            let mut current_line = String::from(indent);
-                            let mut wrote_any = false;
-                            let push_part = |part: String, current_line: &mut String, wrote_any: &mut bool, lines: &mut Vec<Line>| {
-                                let needed = if current_line.len() == indent.len() {
-                                    current_line.len() + part.len()
-                                } else {
-                                    current_line.len() + 2 + part.len()
-                                };
-                                if needed > max_line_width && current_line.len() > indent.len() {
-                                    lines.push(Line::from(Span::styled(
-                                        current_line.clone(),
-                                        Style::default().fg(theme::DIM),
-                                    )));
-                                    *current_line = format!("{indent}{part}");
-                                } else {
-                                    if *wrote_any {
-                                        current_line.push_str("  ");
-                                    }
-                                    current_line.push_str(&part);
-                                }
-                                *wrote_any = true;
-                            };
-                            for (ext, c) in exts.iter() {
-                                push_part(format!(".{ext}({c})"), &mut current_line, &mut wrote_any, &mut lines);
+                    && let Some(exts) = ext_by_lang.get(lang)
+                {
+                    // Surface the residual: `language_usage[lang]`
+                    // counts hits without a file extension too (see
+                    // `extract_language_from_tool_input`); without
+                    // this tail the breakdown wouldn't add up to
+                    // the row header.
+                    let ext_sum: usize = exts.iter().map(|(_, c)| **c).sum();
+                    let no_ext = lang_count.saturating_sub(ext_sum);
+                    let indent = "        ";
+                    let max_line_width = content_width.saturating_sub(2);
+                    let mut current_line = String::from(indent);
+                    let mut wrote_any = false;
+                    let push_part = |part: String,
+                                     current_line: &mut String,
+                                     wrote_any: &mut bool,
+                                     lines: &mut Vec<Line>| {
+                        let needed = if current_line.len() == indent.len() {
+                            current_line.len() + part.len()
+                        } else {
+                            current_line.len() + 2 + part.len()
+                        };
+                        if needed > max_line_width && current_line.len() > indent.len() {
+                            lines.push(Line::from(Span::styled(
+                                current_line.clone(),
+                                Style::default().fg(theme::DIM),
+                            )));
+                            *current_line = format!("{indent}{part}");
+                        } else {
+                            if *wrote_any {
+                                current_line.push_str("  ");
                             }
-                            if no_ext > 0 {
-                                push_part(format!("(no-ext: {no_ext})"), &mut current_line, &mut wrote_any, &mut lines);
-                            }
-                            if current_line.len() > indent.len() {
-                                lines.push(Line::from(Span::styled(
-                                    current_line,
-                                    Style::default().fg(theme::DIM),
-                                )));
-                            }
+                            current_line.push_str(&part);
                         }
+                        *wrote_any = true;
+                    };
+                    for (ext, c) in exts.iter() {
+                        push_part(
+                            format!(".{ext}({c})"),
+                            &mut current_line,
+                            &mut wrote_any,
+                            &mut lines,
+                        );
+                    }
+                    if no_ext > 0 {
+                        push_part(
+                            format!("(no-ext: {no_ext})"),
+                            &mut current_line,
+                            &mut wrote_any,
+                            &mut lines,
+                        );
+                    }
+                    if current_line.len() > indent.len() {
+                        lines.push(Line::from(Span::styled(
+                            current_line,
+                            Style::default().fg(theme::DIM),
+                        )));
+                    }
+                }
             }
 
             if known_langs.is_empty() && other_exts.is_empty() {
@@ -2850,10 +3596,52 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             }
             (title, lines)
         }
+        5 if state.activity_view_weekly => {
+            let title = " Weekly Activity ".to_string();
+            let mut lines: Vec<Line> = activity_header_lines(state, today);
+            let body_height = visible_height.saturating_sub(ACTIVITY_HEADER_ROWS);
+            let weekly = weekly_activity(state);
+            let max_tokens = weekly.iter().map(|w| w.tokens).max().unwrap_or(1);
+            let bar_width = 15usize;
+            for (i, w) in weekly.iter().enumerate().skip(scroll).take(body_height) {
+                let ratio = w.tokens as f64 / max_tokens as f64;
+                let filled = (ratio * bar_width as f64).round() as usize;
+                let intensity = (ratio * 0.7 + 0.3).min(1.0);
+                let bar_color = Color::Rgb(
+                    (80.0 + 100.0 * intensity) as u8,
+                    (160.0 + 58.0 * intensity) as u8,
+                    (180.0 + 75.0 * intensity) as u8,
+                );
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
+                    Span::styled(
+                        format!("{} ({}–{})", w.label, w.start_label, w.end_label),
+                        Style::default().fg(theme::LABEL_MUTED),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(bar, Style::default().fg(bar_color)),
+                    Span::styled(
+                        format!(" {:>9}", crate::format_number(w.tokens)),
+                        Style::default().fg(theme::PRIMARY),
+                    ),
+                    Span::styled(
+                        format!(" {:>6}", format_cost(w.cost, 0)),
+                        cost_style(w.cost),
+                    ),
+                    Span::styled(
+                        format!(" {}d", w.active_days),
+                        Style::default().fg(theme::DIM),
+                    ),
+                ]));
+            }
+            (title, lines)
+        }
         5 => {
             use chrono::Datelike;
             let title = " Daily Activity ".to_string();
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            let mut lines: Vec<Line> = activity_header_lines(state, today);
+            let body_height = visible_height.saturating_sub(ACTIVITY_HEADER_ROWS);
             let daily: Vec<_> = state
                 .daily_groups
                 .iter()
@@ -2877,24 +3665,29 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let mut monthly_tok: std::collections::HashMap<(i32, u32), (u64, usize)> =
                 std::collections::HashMap::new();
             for (date, tokens) in &daily {
-                let entry = monthly_tok.entry((date.year(), date.month())).or_insert((0, 0));
+                let entry = monthly_tok
+                    .entry((date.year(), date.month()))
+                    .or_insert((0, 0));
                 entry.0 += *tokens;
                 entry.1 += 1;
             }
             let mut monthly_cost: std::collections::HashMap<(i32, u32), f64> =
                 std::collections::HashMap::new();
             for (date, cost) in &state.daily_costs {
-                *monthly_cost.entry((date.year(), date.month())).or_insert(0.0) += cost;
+                *monthly_cost
+                    .entry((date.year(), date.month()))
+                    .or_insert(0.0) += cost;
             }
             let mut prev_month: Option<(i32, u32)> = None;
-            for (i, (date, tokens)) in daily.iter().enumerate().skip(scroll).take(visible_height) {
+            for (i, (date, tokens)) in daily.iter().enumerate().skip(scroll).take(body_height) {
                 let key = (date.year(), date.month());
                 if let Some(pm) = prev_month
-                    && pm != key {
-                        let (t, d) = monthly_tok.get(&pm).copied().unwrap_or((0, 0));
-                        let c = monthly_cost.get(&pm).copied().unwrap_or(0.0);
-                        push_month_divider_line(&mut lines, pm.0, pm.1, d, c, t, content_width);
-                    }
+                    && pm != key
+                {
+                    let (t, d) = monthly_tok.get(&pm).copied().unwrap_or((0, 0));
+                    let c = monthly_cost.get(&pm).copied().unwrap_or(0.0);
+                    push_month_divider_line(&mut lines, pm.0, pm.1, d, c, t, content_width);
+                }
                 prev_month = Some(key);
 
                 let ratio = *tokens as f64 / max_tokens as f64;
@@ -2909,7 +3702,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
-                    Span::styled(format!("{}({})", date, date.format("%a")), Style::default().fg(theme::LABEL_MUTED)),
+                    Span::styled(
+                        format!("{}({})", date, date.format("%a")),
+                        Style::default().fg(theme::LABEL_MUTED),
+                    ),
                     Span::raw(" "),
                     Span::styled(bar, Style::default().fg(bar_color)),
                     Span::styled(
@@ -2922,7 +3718,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         }
         6 => {
             let title = " Hourly Average ".to_string();
-            let mut lines: Vec<Line> = vec![Line::from("")];
+            // No leading blank line — 24 hours need every row we can get to
+            // fit on lower-height terminals.
+            let mut lines: Vec<Line> = Vec::new();
             let mut hourly_total: std::collections::HashMap<u8, u64> =
                 std::collections::HashMap::new();
             for group in &state.daily_groups {
@@ -2992,10 +3790,13 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
     };
 
     let position_info = if total_items > 0 {
+        // Use `items_per_screen` (not `visible_height`) — multi-line items
+        // like Projects (3 lines) and Models (5 lines) otherwise inflate
+        // the visible count to the raw row count.
         format!(
             " {}-{}/{} ",
             scroll + 1,
-            (scroll + visible_height).min(total_items),
+            (scroll + items_per_screen).min(total_items),
             total_items
         )
     } else {
@@ -3016,6 +3817,12 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         " ←→: section  ↑↓: nav  Enter: expand  o/c: all  q: close "
                     } else if state.dashboard_panel == 3 {
                         " ←→: section  ↑↓: scroll  q: close "
+                    } else if state.dashboard_panel == 5 {
+                        if state.activity_view_weekly {
+                            " ↑↓: scroll  w: daily  q: close "
+                        } else {
+                            " ↑↓: scroll  w: weekly  q: close "
+                        }
                     } else {
                         " ↑↓: scroll  q: close "
                     },
@@ -3066,6 +3873,79 @@ mod tests {
         let mut lines: Vec<Line<'static>> = Vec::new();
         push_month_divider_line(&mut lines, 2026, 5, 1, -50.0, 1000, 80);
         let text = line_text(&lines[0]);
-        assert!(text.contains("$0"), "negative cost should clamp to 0, got: {text}");
+        assert!(
+            text.contains("$0"),
+            "negative cost should clamp to 0, got: {text}"
+        );
+    }
+
+    #[test]
+    fn spark_line_renders_zero_as_empty_bucket() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(); // lint-ok: date-literal
+        let line = super::render_spark_line(today, 5, |_| 0.0);
+        // All five days should be the empty-bucket glyph.
+        assert_eq!(line, "·····");
+    }
+
+    #[test]
+    fn spark_line_normalises_to_window_max() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(); // lint-ok: date-literal
+        // Two days: one with the peak value, one with half. The peak must
+        // render as `█` and the half-value strictly below it.
+        let _half = today - chrono::Duration::days(1);
+        let line = super::render_spark_line(today, 2, |d| if d == today { 100.0 } else { 50.0 });
+        let chars: Vec<char> = line.chars().collect();
+        assert_eq!(chars.len(), 2);
+        assert_eq!(chars[1], '█', "peak day renders as full block");
+        assert!(chars[0] < chars[1], "half-value renders strictly shorter");
+    }
+
+    #[test]
+    fn weekly_activity_buckets_by_iso_week_newest_first() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        use chrono::NaiveDate;
+
+        // Fixed Monday + 4 days spanning two ISO weeks. Aggregation is a
+        // pure function of `state.daily_groups`, so the reference date is
+        // immaterial — pick one for determinism.
+        let prev_mon = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(); // lint-ok: date-literal
+        let prev_w_a = prev_mon;
+        let prev_w_b = prev_mon + chrono::Duration::days(1);
+        let this_mon = prev_mon + chrono::Duration::days(7);
+        let this_w_a = this_mon;
+        let this_w_b = this_mon + chrono::Duration::days(2);
+
+        let mk = |date, tokens: u64| {
+            make_daily_group(
+                date,
+                vec![make_session_with_tokens("p", tokens, 0, "claude-opus")],
+            )
+        };
+        let mut state = make_test_app_state(vec![
+            mk(prev_w_a, 100),
+            mk(prev_w_b, 200),
+            mk(this_w_a, 1000),
+            mk(this_w_b, 500),
+        ]);
+        state.daily_costs = vec![
+            (prev_w_a, 1.0),
+            (prev_w_b, 2.0),
+            (this_w_a, 10.0),
+            (this_w_b, 5.0),
+        ];
+
+        let weeks = super::weekly_activity(&state);
+        assert_eq!(weeks.len(), 2, "two ISO weeks expected");
+        assert_eq!(weeks[0].tokens, 1500, "newer week first");
+        assert!((weeks[0].cost - 15.0).abs() < 1e-9);
+        assert_eq!(weeks[0].active_days, 2);
+        assert_eq!(weeks[1].tokens, 300);
+        assert!((weeks[1].cost - 3.0).abs() < 1e-9);
+        assert_eq!(weeks[1].active_days, 2);
+        assert_ne!(weeks[0].label, weeks[1].label);
     }
 }

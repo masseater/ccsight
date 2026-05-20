@@ -20,6 +20,13 @@ pub struct SessionInfo {
     pub day_last_timestamp: DateTime<Utc>,
     pub day_input_tokens: u64,
     pub day_output_tokens: u64,
+    /// User-role messages submitted on this day. Counts only entries whose
+    /// `message.role == User` (slash-command tokens included once per user
+    /// turn). Used by the session-detail popup to show conversation depth.
+    pub day_user_msgs: u64,
+    /// Assistant-role messages emitted on this day. Counted per assistant
+    /// entry regardless of whether it carried tool calls or just text.
+    pub day_assistant_msgs: u64,
     pub day_tokens_by_model: HashMap<String, ModelTokens>,
     pub day_hourly_activity: HashMap<u8, u64>,
     pub day_hourly_work_tokens: HashMap<u8, u64>,
@@ -29,6 +36,14 @@ pub struct SessionInfo {
     pub summary: Option<String>,
     pub custom_title: Option<String>,
     pub ai_title: Option<String>,
+    /// Most recent user-role message text, trimmed. Shown on Live/Daily row
+    /// preview to help recognize "which session was this".
+    pub last_user_message: Option<String>,
+    /// First user-role message text. Acts as the always-available title
+    /// fallback when ai_title / custom_title / summary / name are all
+    /// absent — virtually every session has at least one user prompt, so
+    /// this keeps line 2 populated with meaningful content instead of "—".
+    pub first_user_message: Option<String>,
     pub model: Option<String>,
     pub is_subagent: bool,
     pub is_continued: bool,
@@ -61,15 +76,47 @@ impl DailyGroup {
 pub struct DailyGrouper;
 
 impl DailyGrouper {
-
     pub fn group_by_date_with_shared_cache(
         files: &[PathBuf],
         cache: &Option<Cache>,
     ) -> Vec<DailyGroup> {
         let mut date_map: HashMap<NaiveDate, Vec<SessionInfo>> = HashMap::new();
 
-        for file in files {
-            let sessions_by_date = Self::get_sessions_by_date(file, cache);
+        // Global dedup across files: same (msg_id, requestId) can appear
+        // in multiple session JSONLs because Claude Code rewrites prior
+        // turns when a session is resumed/branched. Each API request is
+        // billed once by Anthropic, so we must collapse the duplicates.
+        // Pre-load with hashes already credited to cached files so a
+        // fresh-parse file doesn't re-claim them.
+        //
+        // Restrict pre-load to files whose cache is STILL VALID for this
+        // run: a stale cache entry (mtime changed → file about to be
+        // re-parsed) would otherwise inject hashes into `global_seen`
+        // that the fresh parse should be free to re-credit. Result was
+        // those hashes' tokens dropped from totals entirely. Files no
+        // longer on disk are excluded by the same `is_valid` check.
+        let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(c) = cache {
+            for file in files {
+                if c.is_valid(file)
+                    && let Some(cached) = c.get(file)
+                {
+                    for h in &cached.unique_hashes {
+                        global_seen.insert(h.clone());
+                    }
+                }
+            }
+        }
+
+        // Sorted iteration so fresh-parse ordering is deterministic across
+        // runs — otherwise glob() order shifts attribute the same hash to
+        // different files between runs, churning the cache without changing
+        // totals.
+        let mut sorted_files: Vec<&PathBuf> = files.iter().collect();
+        sorted_files.sort();
+
+        for file in &sorted_files {
+            let sessions_by_date = Self::get_sessions_by_date(file, cache, &mut global_seen);
             for (date, session) in sessions_by_date {
                 date_map.entry(date).or_default().push(session);
             }
@@ -94,15 +141,23 @@ impl DailyGrouper {
         groups
     }
 
-    fn get_sessions_by_date(file: &Path, cache: &Option<Cache>) -> Vec<(NaiveDate, SessionInfo)> {
+    fn get_sessions_by_date(
+        file: &Path,
+        cache: &Option<Cache>,
+        global_seen: &mut std::collections::HashSet<String>,
+    ) -> Vec<(NaiveDate, SessionInfo)> {
         if let Some(c) = cache
             && c.is_valid(file)
-                && let Some(cached) = c.get(file)
-                    && !cached.daily_stats.is_empty() {
-                        return Self::build_sessions_from_cache(file, cached);
-                    }
+            && let Some(cached) = c.get(file)
+            && !cached.daily_stats.is_empty()
+        {
+            // Cache hit: hashes are already in `global_seen`
+            // from the pre-load pass at the top of
+            // `group_by_date_with_shared_cache`.
+            return Self::build_sessions_from_cache(file, cached);
+        }
 
-        Self::parse_and_build_sessions(file, cache)
+        Self::parse_and_build_sessions(file, cache, global_seen)
     }
 
     fn build_sessions_from_cache(
@@ -141,6 +196,8 @@ impl DailyGrouper {
                         day_last_timestamp: ds.last_timestamp.unwrap_or(session_first),
                         day_input_tokens: ds.input_tokens,
                         day_output_tokens: ds.output_tokens,
+                        day_user_msgs: ds.user_msgs,
+                        day_assistant_msgs: ds.assistant_msgs,
                         day_tokens_by_model: tokens_by_model,
                         day_hourly_activity: ds.hourly_activity.clone(),
                         day_hourly_work_tokens: ds.hourly_work_activity.clone(),
@@ -150,6 +207,8 @@ impl DailyGrouper {
                         summary: cached.summary.clone(),
                         custom_title: cached.custom_title.clone(),
                         ai_title: cached.ai_title.clone(),
+                        last_user_message: cached.last_user_message.clone(),
+                        first_user_message: cached.first_user_message.clone(),
                         model: cached.model.clone(),
                         is_subagent: cached.is_subagent,
                         is_continued: date != session_start_date,
@@ -162,6 +221,7 @@ impl DailyGrouper {
     fn parse_and_build_sessions(
         file: &Path,
         cache: &Option<Cache>,
+        global_seen: &mut std::collections::HashSet<String>,
     ) -> Vec<(NaiveDate, SessionInfo)> {
         let Ok(entries) = JsonlParser::parse_file(file) else {
             return vec![];
@@ -213,15 +273,16 @@ impl DailyGrouper {
             .is_some_and(|n| n.starts_with("agent-"));
         let is_subagent = is_subagent_by_entry || is_subagent_by_filename;
 
-        let summary = if let Some(c) = cache {
-            if c.is_valid(file) {
-                c.get(file).and_then(|cached| cached.summary.clone())
-            } else {
-                entries
-                    .iter()
-                    .rfind(|e| e.entry_type == EntryType::Summary)
-                    .and_then(|e| e.summary.clone())
-            }
+        // One stat() instead of five: each per-field `c.is_valid(file)` was
+        // a fresh `fs::metadata` syscall. Hoist the cache lookup to a
+        // single Option borrow so the per-field branches reuse it.
+        let cached = cache
+            .as_ref()
+            .filter(|c| c.is_valid(file))
+            .and_then(|c| c.get(file));
+
+        let summary = if let Some(cached) = cached {
+            cached.summary.clone()
         } else {
             entries
                 .iter()
@@ -229,15 +290,8 @@ impl DailyGrouper {
                 .and_then(|e| e.summary.clone())
         };
 
-        let custom_title = if let Some(c) = cache {
-            if c.is_valid(file) {
-                c.get(file).and_then(|cached| cached.custom_title.clone())
-            } else {
-                entries
-                    .iter()
-                    .rfind(|e| e.entry_type == EntryType::CustomTitle)
-                    .and_then(|e| e.custom_title.clone())
-            }
+        let custom_title = if let Some(cached) = cached {
+            cached.custom_title.clone()
         } else {
             entries
                 .iter()
@@ -251,20 +305,30 @@ impl DailyGrouper {
 
         // Anthropic-generated short title; preferred over custom_title and
         // summary in the display precedence.
-        let ai_title = if let Some(c) = cache {
-            if c.is_valid(file) {
-                c.get(file).and_then(|cached| cached.ai_title.clone())
-            } else {
-                entries
-                    .iter()
-                    .rfind(|e| e.entry_type == EntryType::AiTitle)
-                    .and_then(|e| e.ai_title.clone())
-            }
+        let ai_title = if let Some(cached) = cached {
+            cached.ai_title.clone()
         } else {
             entries
                 .iter()
                 .rfind(|e| e.entry_type == EntryType::AiTitle)
                 .and_then(|e| e.ai_title.clone())
+        };
+
+        // Last user-role message — drives the Live/Daily preview's
+        // "remind me what I was doing" line. Cached so unchanged files skip
+        // the entries walk.
+        let last_user_message = if let Some(cached) = cached {
+            cached.last_user_message.clone()
+        } else {
+            extract_last_user_message(&entries)
+        };
+
+        // First user-role message — used as the universal title fallback in
+        // the Live tab when no other title source exists.
+        let first_user_message = if let Some(cached) = cached {
+            cached.first_user_message.clone()
+        } else {
+            extract_first_user_message(&entries)
         };
 
         let model = super::extract_session_model(&entries);
@@ -279,6 +343,8 @@ impl DailyGrouper {
                     last_timestamp: ts,
                     input_tokens: 0,
                     output_tokens: 0,
+                    user_msgs: 0,
+                    assistant_msgs: 0,
                     tokens_by_model: HashMap::new(),
                     hourly_activity: HashMap::new(),
                     hourly_work_activity: HashMap::new(),
@@ -300,10 +366,16 @@ impl DailyGrouper {
                     // XML metadata in user message text — count them under `command:foo`
                     // so the per-day tool_usage reflects command invocations.
                     if matches!(message.role, crate::domain::Role::User) {
+                        stats.user_msgs += 1;
                         let text = message.content.extract_text();
                         for cmd in crate::aggregator::stats::extract_command_names(&text) {
-                            *stats.tool_usage.entry(format!("command:{cmd}")).or_insert(0) += 1;
+                            *stats
+                                .tool_usage
+                                .entry(format!("command:{cmd}"))
+                                .or_insert(0) += 1;
                         }
+                    } else if matches!(message.role, crate::domain::Role::Assistant) {
+                        stats.assistant_msgs += 1;
                     }
                     if let MessageContent::Blocks(ref blocks) = message.content {
                         for block in blocks {
@@ -312,20 +384,30 @@ impl DailyGrouper {
                                 let key = crate::aggregator::tool_usage_key(name, input);
                                 *stats.tool_usage.entry(key).or_insert(0) += 1;
                                 let extensions =
-                                    StatsAggregator::extract_extensions_from_tool_input(name, input);
+                                    StatsAggregator::extract_extensions_from_tool_input(
+                                        name, input,
+                                    );
                                 if extensions.is_empty() {
                                     // Special filenames (Dockerfile, Makefile, etc.) carry a
                                     // language but no extension — count them under language only.
                                     if let Some(lang) =
-                                        StatsAggregator::extract_language_from_tool_input(name, input)
+                                        StatsAggregator::extract_language_from_tool_input(
+                                            name, input,
+                                        )
                                     {
-                                        *stats.language_usage.entry(lang.to_string()).or_insert(0) += 1;
+                                        *stats
+                                            .language_usage
+                                            .entry(lang.to_string())
+                                            .or_insert(0) += 1;
                                     }
                                 } else {
                                     for ext in extensions {
                                         let lang = crate::aggregator::language::for_extension(&ext);
                                         *stats.extension_usage.entry(ext).or_insert(0) += 1;
-                                        *stats.language_usage.entry(lang.to_string()).or_insert(0) += 1;
+                                        *stats
+                                            .language_usage
+                                            .entry(lang.to_string())
+                                            .or_insert(0) += 1;
                                     }
                                 }
                             }
@@ -333,6 +415,14 @@ impl DailyGrouper {
                     }
 
                     if let Some(ref usage) = message.usage {
+                        // Global dedup: same (msg_id, requestId) across
+                        // multiple JSONLs (resume / branch) should bill
+                        // once. Skip if another file already credited it.
+                        if let Some(hash) = crate::parser::JsonlParser::entry_hash(entry) {
+                            if !global_seen.insert(hash) {
+                                continue;
+                            }
+                        }
                         let model_key = message
                             .model
                             .clone()
@@ -344,10 +434,7 @@ impl DailyGrouper {
                         stats.output_tokens += usage.output_tokens;
 
                         let model_tokens = stats.tokens_by_model.entry(model_key).or_default();
-                        model_tokens.input_tokens += usage.input_tokens;
-                        model_tokens.output_tokens += usage.output_tokens;
-                        model_tokens.cache_creation_tokens += usage.cache_creation_input_tokens;
-                        model_tokens.cache_read_tokens += usage.cache_read_input_tokens;
+                        model_tokens.add(usage);
 
                         let hour = ts.with_timezone(&Local).hour() as u8;
                         let tokens = usage.input_tokens
@@ -377,6 +464,8 @@ impl DailyGrouper {
                         day_last_timestamp: stats.last_timestamp,
                         day_input_tokens: stats.input_tokens,
                         day_output_tokens: stats.output_tokens,
+                        day_user_msgs: stats.user_msgs,
+                        day_assistant_msgs: stats.assistant_msgs,
                         day_tokens_by_model: stats.tokens_by_model,
                         day_hourly_activity: stats.hourly_activity,
                         day_hourly_work_tokens: stats.hourly_work_activity,
@@ -386,6 +475,8 @@ impl DailyGrouper {
                         summary: summary.clone(),
                         custom_title: custom_title.clone(),
                         ai_title: ai_title.clone(),
+                        last_user_message: last_user_message.clone(),
+                        first_user_message: first_user_message.clone(),
                         model: model.clone(),
                         is_subagent,
                         is_continued,
@@ -400,11 +491,133 @@ impl DailyGrouper {
     }
 }
 
+/// Public-to-crate alias of [`extract_last_user_message`] so the stats path
+/// (which fills the cache) can use the same cleanup logic as the grouper.
+pub(crate) fn extract_last_user_message_for_cache(
+    entries: &[crate::domain::LogEntry],
+) -> Option<String> {
+    extract_last_user_message(entries)
+}
+
+/// Same as [`extract_last_user_message_for_cache`] but for the *first*
+/// user-role message — used as the universal title fallback so empty rows
+/// stop showing "—".
+pub(crate) fn extract_first_user_message_for_cache(
+    entries: &[crate::domain::LogEntry],
+) -> Option<String> {
+    extract_first_user_message(entries)
+}
+
+/// Forward walk for the first user-role message; same cleanup pipeline as
+/// the "last" variant so injected wrappers don't end up in the title.
+fn extract_first_user_message(entries: &[crate::domain::LogEntry]) -> Option<String> {
+    use crate::domain::Role;
+    entries.iter().find_map(|e| {
+        let msg = e.message.as_ref()?;
+        if !matches!(msg.role, Role::User) {
+            return None;
+        }
+        let raw = msg.content.extract_text();
+        let cleaned = clean_user_message_preview(&raw);
+        if cleaned.is_empty() || looks_like_system_injection(&cleaned) {
+            return None;
+        }
+        Some(cleaned)
+    })
+}
+
+/// Pull the most recent meaningful user-role text from the entry stream.
+/// Strips well-known system-injected wrappers; for anything still bearing
+/// an unrecognised kebab-case tag (`<local-command-caveat>`,
+/// `<task-notification>`, etc.) skips the whole message and falls through
+/// to the previous user entry — same approach as
+/// `extract_first_user_message`.
+fn extract_last_user_message(entries: &[crate::domain::LogEntry]) -> Option<String> {
+    use crate::domain::Role;
+    entries.iter().rev().find_map(|e| {
+        let msg = e.message.as_ref()?;
+        if !matches!(msg.role, Role::User) {
+            return None;
+        }
+        let raw = msg.content.extract_text();
+        let cleaned = clean_user_message_preview(&raw);
+        if cleaned.is_empty() || looks_like_system_injection(&cleaned) {
+            return None;
+        }
+        Some(cleaned)
+    })
+}
+
+/// Heuristic: after the known-tag strip pass, any remaining `<kebab-case>`
+/// marker (one or more `-` inside ASCII alphanumeric) is treated as an
+/// unstripped system-injected wrapper. Single-word tags (`<foo>`) and
+/// arrow-style prose (`x < 3` / `if a > b`) are NOT matched so genuine
+/// user content with `<`/`>` is preserved.
+fn looks_like_system_injection(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('>') else {
+            return false;
+        };
+        let inside = &rest[..end];
+        let name = inside.trim_start_matches('/');
+        let is_kebab_tag = name.contains('-')
+            && !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if is_kebab_tag {
+            return true;
+        }
+        rest = &rest[end + 1..];
+    }
+    false
+}
+
+/// Strip injected XML wrappers and collapse whitespace so the preview line
+/// reads as a single natural-language snippet.
+fn clean_user_message_preview(raw: &str) -> String {
+    // Strip well-known injected tags. Treated greedily — these are emitted
+    // by Claude Code / hooks and never contain user-authored prose worth
+    // showing in a one-line preview.
+    let strip_tags = |s: String, tag: &str| -> String {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut out = String::new();
+        let mut rest = s.as_str();
+        while let Some(start) = rest.find(&open) {
+            out.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find(&close) {
+                rest = &rest[start + end + close.len()..];
+            } else {
+                rest = &rest[start + open.len()..];
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    let mut s = raw.to_string();
+    for tag in [
+        "command-name",
+        "command-message",
+        "command-args",
+        "system-reminder",
+        "local-command-stdout",
+        "user-prompt-submit-hook",
+    ] {
+        s = strip_tags(s, tag);
+    }
+    // Collapse all whitespace runs to single spaces so multi-line messages
+    // become single-line previews.
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 struct DailyStats {
     first_timestamp: DateTime<Utc>,
     last_timestamp: DateTime<Utc>,
     input_tokens: u64,
     output_tokens: u64,
+    user_msgs: u64,
+    assistant_msgs: u64,
     tokens_by_model: HashMap<String, ModelTokens>,
     hourly_activity: HashMap<u8, u64>,
     hourly_work_activity: HashMap<u8, u64>,
@@ -418,6 +631,126 @@ mod tests {
     use super::*;
     use crate::infrastructure::CachedTokenStats;
 
+    fn user_entry(text: &str) -> crate::domain::LogEntry {
+        use crate::domain::{ContentBlock, EntryType, LogEntry, Message, MessageContent, Role};
+        LogEntry {
+            uuid: None,
+            parent_uuid: None,
+            session_id: None,
+            timestamp: None,
+            entry_type: EntryType::User,
+            message: Some(Message {
+                id: None,
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }]),
+                model: None,
+                usage: None,
+            }),
+            summary: None,
+            custom_title: None,
+            ai_title: None,
+            cwd: None,
+            git_branch: None,
+            version: None,
+            is_sidechain: false,
+            user_type: None,
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn extract_first_user_message_returns_first_entry() {
+        let entries = vec![
+            user_entry("first prompt"),
+            user_entry("middle"),
+            user_entry("last"),
+        ];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("first prompt".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_last_user_message_returns_final_entry() {
+        let entries = vec![
+            user_entry("first"),
+            user_entry("middle"),
+            user_entry("final prompt"),
+        ];
+        assert_eq!(
+            extract_last_user_message(&entries),
+            Some("final prompt".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_user_message_strips_command_wrappers() {
+        // System-injected command/system-reminder wrappers should be peeled
+        // off so the preview reads as natural prose, not noise.
+        let entries = vec![user_entry(
+            "<command-name>compact</command-name>\nReal user text after the wrapper.",
+        )];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("Real user text after the wrapper.".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_user_message_skips_empty_after_cleanup() {
+        // Pure command-wrapper messages collapse to "" after stripping —
+        // the extractor should fall through to the next user entry.
+        let entries = vec![
+            user_entry("<command-name>foo</command-name>"),
+            user_entry("real prompt"),
+        ];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("real prompt".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_user_message_returns_none_for_no_user_entries() {
+        let entries: Vec<crate::domain::LogEntry> = vec![];
+        assert_eq!(extract_first_user_message(&entries), None);
+        assert_eq!(extract_last_user_message(&entries), None);
+    }
+
+    #[test]
+    fn extract_user_message_skips_unknown_kebab_wrappers() {
+        // Wrappers Claude Code may inject in the future (or that aren't on
+        // the static strip list) should not bleed into the preview. The
+        // extractor falls through to the next user message that's clean.
+        let entries = vec![
+            user_entry("<local-command-caveat>Caveat: DO NOT respond.</local-command-caveat>"),
+            user_entry("<task-notification><task-id>abc</task-id></task-notification>"),
+            user_entry("genuine human prompt"),
+        ];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("genuine human prompt".to_string()),
+        );
+        assert_eq!(
+            extract_last_user_message(&entries),
+            Some("genuine human prompt".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_user_message_preserves_arrow_prose() {
+        // `if x < 3 then` / `<foo>` (single-word) are NOT kebab-cased
+        // and so must NOT trigger the system-injection skip.
+        let entries = vec![user_entry("compare x < 3 and y > 5 then <foo>")];
+        assert_eq!(
+            extract_first_user_message(&entries),
+            Some("compare x < 3 and y > 5 then <foo>".to_string()),
+        );
+    }
+
     #[test]
     fn test_model_tokens_work_tokens() {
         let tokens = ModelTokens {
@@ -425,6 +758,8 @@ mod tests {
             output_tokens: 500,
             cache_creation_tokens: 200,
             cache_read_tokens: 300,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         assert_eq!(tokens.work_tokens(), 1500);
     }
@@ -436,6 +771,8 @@ mod tests {
             output_tokens: 500,
             cache_creation_tokens: 200,
             cache_read_tokens: 300,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         assert_eq!(tokens.all_tokens(), 2000);
     }
@@ -453,6 +790,8 @@ mod tests {
             output_tokens: 50,
             cache_creation_tokens: 20,
             cache_read_tokens: 10,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
         };
         let model_tokens = cached.clone();
 
@@ -561,6 +900,9 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            unique_hashes: Vec::new(),
             cache_read_tokens: 0,
             tool_usage: HashMap::new(),
             model_usage: HashMap::new(),
@@ -574,6 +916,8 @@ mod tests {
             summary: None,
             custom_title: None,
             ai_title: None,
+            last_user_message: None,
+            first_user_message: None,
             model: None,
             is_subagent: false,
             daily_stats,
@@ -601,6 +945,8 @@ mod tests {
             tool_usage: HashMap::new(),
             language_usage: HashMap::new(),
             extension_usage: HashMap::new(),
+            user_msgs: 0,
+            assistant_msgs: 0,
         }
     }
 
@@ -614,19 +960,21 @@ mod tests {
                 output_tokens: 500,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                cache_creation_5m_tokens: 0,
+                cache_creation_1h_tokens: 0,
             },
         );
 
         let mut ds = make_cached_daily(1000, 500);
         ds.tokens_by_model = tokens_by_model;
         let mut daily_stats = HashMap::new();
-        daily_stats.insert("2026-02-25".to_string(), ds);
+        daily_stats.insert("2026-02-25".to_string(), ds); // lint-ok: date-literal
 
         let mut cached = make_cached_file_stats(daily_stats);
         cached.entry_count = 10;
         cached.input_tokens = 1000;
         cached.output_tokens = 500;
-        cached.session_date = Some(NaiveDate::from_ymd_opt(2026, 2, 25).unwrap());
+        cached.session_date = Some(NaiveDate::from_ymd_opt(2026, 2, 25).unwrap()); // lint-ok: date-literal
         cached.project_name = Some("~/projects/test".to_string());
         cached.git_branch = Some("main".to_string());
         cached.first_timestamp = Some(chrono::Utc::now());
@@ -639,7 +987,7 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         let (date, session) = &sessions[0];
-        assert_eq!(*date, NaiveDate::from_ymd_opt(2026, 2, 25).unwrap());
+        assert_eq!(*date, NaiveDate::from_ymd_opt(2026, 2, 25).unwrap()); // lint-ok: date-literal
         assert_eq!(session.project_name, "~/projects/test");
         assert_eq!(session.git_branch.as_deref(), Some("main"));
         assert_eq!(session.summary.as_deref(), Some("test summary"));
@@ -652,11 +1000,11 @@ mod tests {
     #[test]
     fn test_build_sessions_from_cache_multi_day() {
         let mut daily_stats = HashMap::new();
-        daily_stats.insert("2026-02-24".to_string(), make_cached_daily(500, 200));
-        daily_stats.insert("2026-02-25".to_string(), make_cached_daily(800, 300));
+        daily_stats.insert("2026-02-24".to_string(), make_cached_daily(500, 200)); // lint-ok: date-literal
+        daily_stats.insert("2026-02-25".to_string(), make_cached_daily(800, 300)); // lint-ok: date-literal
 
         let mut cached = make_cached_file_stats(daily_stats);
-        cached.session_date = Some(NaiveDate::from_ymd_opt(2026, 2, 24).unwrap());
+        cached.session_date = Some(NaiveDate::from_ymd_opt(2026, 2, 24).unwrap()); // lint-ok: date-literal
         cached.project_name = Some("~/projects/multi".to_string());
         cached.first_timestamp = Some(chrono::Utc::now());
 
@@ -679,7 +1027,7 @@ mod tests {
         ds.first_timestamp = None;
         ds.last_timestamp = None;
         let mut daily_stats = HashMap::new();
-        daily_stats.insert("2026-02-25".to_string(), ds);
+        daily_stats.insert("2026-02-25".to_string(), ds); // lint-ok: date-literal
 
         let cached = make_cached_file_stats(daily_stats);
 
@@ -696,7 +1044,7 @@ mod tests {
         ds.first_timestamp = None;
         ds.last_timestamp = None;
         let mut daily_stats = HashMap::new();
-        daily_stats.insert("2026-02-25".to_string(), ds);
+        daily_stats.insert("2026-02-25".to_string(), ds); // lint-ok: date-literal
 
         let mut cached = make_cached_file_stats(daily_stats);
         cached.project_name = Some("~/projects/task".to_string());
@@ -743,7 +1091,11 @@ mod tests {
             }
         }
 
-        let sessions = DailyGrouper::parse_and_build_sessions(&path, &None);
+        let sessions = DailyGrouper::parse_and_build_sessions(
+            &path,
+            &None,
+            &mut std::collections::HashSet::new(),
+        );
         std::fs::remove_file(&path).ok();
 
         assert_eq!(sessions.len(), 1);
@@ -760,7 +1112,11 @@ mod tests {
         {
             std::fs::File::create(&path).unwrap();
         }
-        let sessions = DailyGrouper::parse_and_build_sessions(&path, &None);
+        let sessions = DailyGrouper::parse_and_build_sessions(
+            &path,
+            &None,
+            &mut std::collections::HashSet::new(),
+        );
         std::fs::remove_file(&path).ok();
         assert!(sessions.is_empty());
     }
@@ -781,7 +1137,11 @@ mod tests {
                 writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
             }
         }
-        let sessions = DailyGrouper::parse_and_build_sessions(&path, &None);
+        let sessions = DailyGrouper::parse_and_build_sessions(
+            &path,
+            &None,
+            &mut std::collections::HashSet::new(),
+        );
         std::fs::remove_file(&path).ok();
 
         assert_eq!(sessions.len(), 1);

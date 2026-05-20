@@ -50,8 +50,8 @@ pub struct CoworkMetadata {
 /// platforms / hosts that don't have it.
 pub fn cowork_root() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home)
-        .join("Library/Application Support/Claude/local-agent-mode-sessions");
+    let path =
+        PathBuf::from(home).join("Library/Application Support/Claude/local-agent-mode-sessions");
     path.is_dir().then_some(path)
 }
 

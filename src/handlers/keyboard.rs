@@ -14,8 +14,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::handlers;
-use crate::state::{ConvListMode, ConversationPane, SummaryType, MAX_PANES};
-use crate::{search, ui, AppState, PeriodFilter, Tab};
+use crate::state::{ConvListMode, ConversationPane, MAX_PANES, SummaryType};
+use crate::{AppState, PeriodFilter, Tab, search, ui};
 
 /// `state.show_help == true` branch — Esc/q/? close, j/k/↑↓ scroll the body.
 pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
@@ -43,6 +43,32 @@ pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
             // Draw clamps `help_scroll` against the actual content height,
             // so a saturating-large value here lands on the last page.
             state.help_scroll = u16::MAX;
+        }
+        _ => {}
+    }
+}
+
+/// `state.show_project_detail == true` branch — Esc/q/Enter close (Enter
+/// mirrors the insights detail pattern so the same key toggles open/close),
+/// j/k/↑↓ scroll.
+pub(crate) fn handle_project_detail_key(state: &mut AppState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            state.show_project_detail = false;
+            state.project_detail_scroll = 0;
+            state.project_detail_path.clear();
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.project_detail_scroll = state.project_detail_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.project_detail_scroll = state.project_detail_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown | KeyCode::Char('d') => {
+            state.project_detail_scroll = state.project_detail_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp | KeyCode::Char('u') => {
+            state.project_detail_scroll = state.project_detail_scroll.saturating_sub(10);
         }
         _ => {}
     }
@@ -145,18 +171,15 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => {
                 state.show_filter_popup = false;
             }
-            KeyCode::Up | KeyCode::Char('k')
-                if state.filter_popup_selected > 0 => {
-                    state.filter_popup_selected -= 1;
-                }
-            KeyCode::Down | KeyCode::Char('j')
-                if state.filter_popup_selected < total_items - 1 => {
-                    state.filter_popup_selected += 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if state.filter_popup_selected > 0 => {
+                state.filter_popup_selected -= 1;
+            }
+            KeyCode::Down | KeyCode::Char('j') if state.filter_popup_selected < total_items - 1 => {
+                state.filter_popup_selected += 1;
+            }
             KeyCode::Enter => {
                 if state.filter_popup_selected < PeriodFilter::ALL_VARIANTS.len() {
-                    state.period_filter =
-                        PeriodFilter::ALL_VARIANTS[state.filter_popup_selected];
+                    state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected];
                     state.apply_filter();
                     state.show_filter_popup = false;
                 } else {
@@ -179,9 +202,7 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
             // (or `-`/`.` separators) jumps straight into input mode
             // with that character as the first keystroke. Saves the
             // user from having to press Enter first.
-            KeyCode::Char(c)
-                if on_custom_row && (c.is_ascii_digit() || c == '-' || c == '.') =>
-            {
+            KeyCode::Char(c) if on_custom_row && (c.is_ascii_digit() || c == '-' || c == '.') => {
                 state.filter_input_mode = true;
                 state.filter_input.set(String::new());
                 state.filter_input.insert_char(c);
@@ -199,6 +220,8 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('i') => {
             state.show_detail = false;
+            state.session_detail_override = None;
+            state.session_detail_live_extra = None;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.session_detail_scroll = state.session_detail_scroll.saturating_add(1);
@@ -234,6 +257,8 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
                     state.conv_list_mode = ConvListMode::Day;
                     state.show_conversation = true;
                     state.show_detail = false;
+                    state.session_detail_override = None;
+                    state.session_detail_live_extra = None;
                 }
             }
         }
@@ -252,8 +277,7 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Char('R') => {
             let selected_day = state.selected_day;
             let selected_session = state.selected_session;
-            if let Some((actual_idx, session)) =
-                crate::current_selected_session_with_index(state)
+            if let Some((actual_idx, session)) = crate::current_selected_session_with_index(state)
                 && state.updating_task.is_none()
             {
                 handlers::tasks::start_jsonl_regen(
@@ -297,8 +321,7 @@ pub(crate) fn handle_conversation_key(
                     pane.search_mode = false;
                     if pane.search_matches.is_empty() {
                         pane.search_input.clear();
-                        if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take()
-                        {
+                        if let Some((saved_scroll, saved_msg)) = pane.search_saved_scroll.take() {
                             pane.scroll = saved_scroll;
                             pane.selected_message = saved_msg;
                         }
@@ -306,26 +329,24 @@ pub(crate) fn handle_conversation_key(
                         pane.search_saved_scroll = None;
                     }
                 }
-                KeyCode::Enter
-                    if !pane.search_matches.is_empty() => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            pane.search_current = pane
-                                .search_current
-                                .checked_sub(1)
-                                .unwrap_or(pane.search_matches.len() - 1);
-                        } else {
-                            pane.search_current =
-                                (pane.search_current + 1) % pane.search_matches.len();
-                        }
-                        pane.scroll = pane.search_matches[pane.search_current];
-                        if let Some(msg_idx) = pane
-                            .message_lines
-                            .iter()
-                            .rposition(|&(start, _)| start <= pane.scroll)
-                        {
-                            pane.selected_message = msg_idx;
-                        }
+                KeyCode::Enter if !pane.search_matches.is_empty() => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        pane.search_current = pane
+                            .search_current
+                            .checked_sub(1)
+                            .unwrap_or(pane.search_matches.len() - 1);
+                    } else {
+                        pane.search_current = (pane.search_current + 1) % pane.search_matches.len();
                     }
+                    pane.scroll = pane.search_matches[pane.search_current];
+                    if let Some(msg_idx) = pane
+                        .message_lines
+                        .iter()
+                        .rposition(|&(start, _)| start <= pane.scroll)
+                    {
+                        pane.selected_message = msg_idx;
+                    }
+                }
                 KeyCode::Backspace => {
                     pane.search_input.delete_back();
                     ui::update_pane_search_matches(pane);
@@ -404,6 +425,11 @@ pub(crate) fn handle_conversation_key(
         }
         KeyCode::Char('Q') => {
             state.show_conversation = false;
+            // Leaving conv view from Live mode: reset selection so the next
+            // open doesn't index into a stale live row.
+            if state.conv_list_mode == ConvListMode::Live {
+                state.selected_session = 0;
+            }
             state.panes.clear();
             state.active_pane_index = None;
             state.conv_list_mode = ConvListMode::Day;
@@ -414,6 +440,8 @@ pub(crate) fn handle_conversation_key(
         KeyCode::Esc | KeyCode::Char('q') => {
             if state.show_detail {
                 state.show_detail = false;
+                state.session_detail_override = None;
+                state.session_detail_live_extra = None;
                 return;
             }
             let has_search = state
@@ -435,6 +463,9 @@ pub(crate) fn handle_conversation_key(
                 }
             } else if state.search_preview_mode {
                 state.show_conversation = false;
+                if state.conv_list_mode == ConvListMode::Live {
+                    state.selected_session = 0;
+                }
                 for pane in &mut state.panes {
                     pane.clear();
                 }
@@ -451,12 +482,18 @@ pub(crate) fn handle_conversation_key(
                     state.active_pane_index = Some(0);
                 } else {
                     state.show_conversation = false;
+                    if state.conv_list_mode == ConvListMode::Live {
+                        state.selected_session = 0;
+                    }
                     state.conv_list_mode = ConvListMode::Day;
                 }
             } else if let Some(idx) = state.active_pane_index {
                 state.panes.remove(idx);
                 if state.panes.is_empty() {
                     state.show_conversation = false;
+                    if state.conv_list_mode == ConvListMode::Live {
+                        state.selected_session = 0;
+                    }
                     state.active_pane_index = None;
                     state.conv_list_mode = ConvListMode::Day;
                 } else {
@@ -513,22 +550,23 @@ pub(crate) fn handle_conversation_key(
         // pane is focused).
         KeyCode::Char('H')
             if state.conv_list_mode == ConvListMode::Day
-                && state.selected_day < state.daily_groups.len().saturating_sub(1)
-            => {
-                state.selected_day += 1;
-                state.selected_session = 0;
-                if state.panes.len() == 1 {
-                    preview_conversation_in_pane(state);
-                }
+                && state.selected_day < state.daily_groups.len().saturating_sub(1) =>
+        {
+            state.selected_day += 1;
+            state.selected_session = 0;
+            if state.panes.len() == 1 {
+                preview_conversation_in_pane(state);
             }
+        }
         KeyCode::Char('L')
-            if state.conv_list_mode == ConvListMode::Day && state.selected_day > 0 => {
-                state.selected_day -= 1;
-                state.selected_session = 0;
-                if state.panes.len() == 1 {
-                    preview_conversation_in_pane(state);
-                }
+            if state.conv_list_mode == ConvListMode::Day && state.selected_day > 0 =>
+        {
+            state.selected_day -= 1;
+            state.selected_session = 0;
+            if state.panes.len() == 1 {
+                preview_conversation_in_pane(state);
             }
+        }
         KeyCode::Char(' ') => {
             if state.show_detail {
                 let fp = state
@@ -589,24 +627,26 @@ pub(crate) fn handle_conversation_key(
                 }
             }
         }
-        KeyCode::BackTab
-            if state.active_pane_index.is_none() => {
-                state.conv_list_mode = match state.conv_list_mode {
-                    ConvListMode::Day => {
-                        if state.pins.entries().is_empty() {
-                            ConvListMode::All
-                        } else {
-                            ConvListMode::Pinned
-                        }
+        KeyCode::BackTab if state.active_pane_index.is_none() => {
+            state.conv_list_mode = match state.conv_list_mode {
+                ConvListMode::Day => {
+                    if state.pins.entries().is_empty() {
+                        ConvListMode::All
+                    } else {
+                        ConvListMode::Pinned
                     }
-                    ConvListMode::Pinned => ConvListMode::All,
-                    ConvListMode::All => ConvListMode::Day,
-                };
-                state.selected_session = 0;
-                if state.panes.len() == 1 {
-                    preview_conversation_in_pane(state);
                 }
+                ConvListMode::Pinned => ConvListMode::All,
+                ConvListMode::All => ConvListMode::Day,
+                // Live mode is sticky once entered from the Live tab —
+                // S-Tab leaves it alone so j/k still navigates live rows.
+                ConvListMode::Live => ConvListMode::Live,
+            };
+            state.selected_session = 0;
+            if state.panes.len() == 1 {
+                preview_conversation_in_pane(state);
             }
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             if state.active_pane_index.is_none() {
                 let max = get_conv_session_count(state).saturating_sub(1);
@@ -626,8 +666,26 @@ pub(crate) fn handle_conversation_key(
             {
                 let msg_count = pane.message_lines.len();
                 if msg_count > 0 {
-                    pane.selected_message =
-                        pane.selected_message.saturating_add(1).min(msg_count - 1);
+                    // Mirror the draw-time clamp: `selected_message == usize::MAX`
+                    // is the "scroll to end" sentinel set at load time; without
+                    // this guard, `+ 1` below overflows before the first draw.
+                    if pane.selected_message == usize::MAX || pane.selected_message >= msg_count {
+                        pane.selected_message = msg_count - 1;
+                    }
+                    if pane.selected_message + 1 < msg_count {
+                        pane.selected_message += 1;
+                    } else if let (Some(visible_height), Some(cached)) =
+                        (pane.last_visible_height, pane.rendered.as_ref())
+                    {
+                        // On the last message: if its bottom is below the viewport,
+                        // fall back to scrolling one line so j keeps making downward
+                        // progress instead of becoming a silent no-op.
+                        let total_lines = cached.0.len();
+                        let max_scroll = total_lines.saturating_sub(visible_height);
+                        if pane.scroll < max_scroll {
+                            pane.scroll += 1;
+                        }
+                    }
                 }
             }
         }
@@ -644,9 +702,20 @@ pub(crate) fn handle_conversation_key(
                 }
             } else if let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
-                && pane.selected_message > 0
             {
-                pane.selected_message -= 1;
+                let msg_count = pane.message_lines.len();
+                if msg_count > 0
+                    && (pane.selected_message == usize::MAX || pane.selected_message >= msg_count)
+                {
+                    pane.selected_message = msg_count - 1;
+                }
+                if pane.selected_message > 0 {
+                    pane.selected_message -= 1;
+                } else if pane.scroll > 0 {
+                    // Symmetric to j on last message: on the first message with its
+                    // top scrolled out of view, k scrolls up by one line.
+                    pane.scroll -= 1;
+                }
             }
         }
         KeyCode::PageDown | KeyCode::Char('d') => {
@@ -714,8 +783,7 @@ pub(crate) fn handle_conversation_key(
                 && let Some(pane) = state.panes.get_mut(idx)
             {
                 if !pane.search_matches.is_empty() {
-                    pane.search_current =
-                        (pane.search_current + 1) % pane.search_matches.len();
+                    pane.search_current = (pane.search_current + 1) % pane.search_matches.len();
                     pane.scroll = pane.search_matches[pane.search_current];
                     if let Some(msg_idx) = pane
                         .message_lines
@@ -799,7 +867,7 @@ pub(crate) fn handle_conversation_key(
                 let len = content.chars().count();
                 state.toast_message = Some(format!("Copied ({len} chars)"));
                 state.toast_time = Some(std::time::Instant::now());
-                crate::handlers::tasks::spawn_clipboard_write(content);
+                state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(content));
             }
         }
         KeyCode::Char('i') => {
@@ -808,10 +876,9 @@ pub(crate) fn handle_conversation_key(
                 state.session_detail_scroll = 0;
             }
         }
-        KeyCode::Enter
-            if state.active_pane_index.is_none() => {
-                open_conversation_in_pane(state);
-            }
+        KeyCode::Enter if state.active_pane_index.is_none() => {
+            open_conversation_in_pane(state);
+        }
         _ => {}
     }
 }
@@ -836,17 +903,114 @@ pub(crate) fn handle_default_key(
             state.toast_time = Some(std::time::Instant::now());
             state.needs_draw = true;
         }
-        KeyCode::Esc
-            if state.daily_breakdown_focus => {
-                state.daily_breakdown_focus = false;
-                state.daily_breakdown_scroll = 0;
-            }
+        KeyCode::Esc if state.daily_breakdown_focus => {
+            state.daily_breakdown_focus = false;
+            state.daily_breakdown_scroll = 0;
+        }
         KeyCode::Char('x')
-            if state.retention_warning.is_some() && !state.retention_warning_dismissed => {
-                state.retention_warning_dismissed = true;
-            }
+            if state.retention_warning.is_some() && !state.retention_warning_dismissed =>
+        {
+            state.retention_warning_dismissed = true;
+        }
         KeyCode::Char('?') => {
             state.show_help = true;
+        }
+        KeyCode::Char(' ') if state.tab == Tab::Live => {
+            // Pin / unpin the currently-selected Live row — same semantics as
+            // Daily's Space handler so the `*` glyph in Live and Daily share
+            // a single toggle path.
+            let path = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
+            if let Some(path) = path {
+                state.pins.toggle(&path);
+                if let Err(e) = state.pins.save() {
+                    state.toast_message = Some(format!("Pin save failed: {e}"));
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                state.needs_draw = true;
+            }
+        }
+        KeyCode::Char('y') if state.tab == Tab::Live => {
+            if let Some(s) = crate::live_selected_session(state) {
+                // `cd ... && claude -r ...` works from any terminal, not just
+                // one already in the right cwd. Single-line so paste-and-enter
+                // executes immediately. Both `cwd` (read from
+                // `~/.claude/sessions/<pid>.json`) and `session_id` are
+                // POSIX-quoted: even though they should be a normal path and
+                // a UUID, the JSON is on disk and could in principle be
+                // tampered with; quoting prevents the clipboard payload from
+                // becoming a shell-injection vector.
+                let cmd = format!(
+                    "cd {} && claude -r {}",
+                    crate::shell::shell_quote_cwd(&s.cwd.to_string_lossy()),
+                    crate::shell::posix_shell_quote(&s.session_id),
+                );
+                state.clipboard_task =
+                    Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
+                state.toast_message = Some(format!("Copied: {cmd}"));
+                state.toast_time = Some(std::time::Instant::now());
+            }
+        }
+        KeyCode::Char('i') if state.tab == Tab::Live => {
+            // Reuse the existing Session Detail popup. Live sessions might be
+            // outside the active period/project filter, so look up in
+            // `original_daily_groups` and stash the result in
+            // `session_detail_override` for `draw_detail_popup` to consume.
+            // Snapshot the live fields up-front so subsequent state mutation
+            // doesn't fight the borrow on `live_selected_session`.
+            let live_info = crate::live_selected_session(state).map(|live| {
+                let started = live
+                    .started_at
+                    .map(|t| {
+                        t.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                (
+                    live.jsonl_path.clone(),
+                    live.pid,
+                    live.status.clone().unwrap_or_else(|| "—".to_string()),
+                    started,
+                )
+            });
+            if let Some((Some(jsonl), pid, status, started)) = live_info {
+                let found = state.original_daily_groups.iter().find_map(|g| {
+                    g.sessions
+                        .iter()
+                        .find(|s| s.file_path == jsonl && !s.is_subagent)
+                        .cloned()
+                });
+                if let Some(session) = found {
+                    state.session_detail_override = Some(session);
+                    state.session_detail_live_extra = Some((pid, status, started));
+                    state.show_detail = true;
+                    state.session_detail_scroll = 0;
+                } else {
+                    state.toast_message =
+                        Some("Session not yet indexed; ccsight reloads every 30s".to_string());
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+            }
+        }
+        KeyCode::Enter if state.tab == Tab::Live => {
+            let jsonl = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
+            if let Some(jsonl) = jsonl {
+                // Replace the active pane (or push one) with the selected JSONL.
+                if state.panes.is_empty() {
+                    state.panes.push(ConversationPane::load_from(&jsonl));
+                } else {
+                    let idx = state.active_pane_index.unwrap_or(0);
+                    state.panes[idx] = ConversationPane::load_from(&jsonl);
+                    state.active_pane_index = Some(idx);
+                }
+                // Switch the conv list to Live so j/k navigates among live
+                // sessions instead of Daily; remembered until conv view closes.
+                state.conv_list_mode = ConvListMode::Live;
+                state.show_conversation = true;
+                // selected_session is the index inside the conv list, which
+                // for Live mode counts active+paused. Mirror live_selected.
+                state.selected_session = state.live_selected;
+            }
         }
         KeyCode::Char('f') => {
             state.show_filter_popup = true;
@@ -888,40 +1052,48 @@ pub(crate) fn handle_default_key(
                 }
             }
         }
-        KeyCode::Char('m')
-            if !state.pins.entries().is_empty() => {
-                state.conv_list_mode = ConvListMode::Pinned;
-                state.selected_session = 0;
-                state.tab = Tab::Daily;
-                if !state.show_conversation {
-                    state.panes.clear();
-                    state.panes.push(ConversationPane::default());
-                    state.show_conversation = true;
-                }
-                state.active_pane_index = None;
-                if state.panes.len() == 1 {
-                    preview_conversation_in_pane(state);
-                }
+        KeyCode::Char('m') if !state.pins.entries().is_empty() => {
+            state.conv_list_mode = ConvListMode::Pinned;
+            state.selected_session = 0;
+            state.tab = Tab::Daily;
+            if !state.show_conversation {
+                state.panes.clear();
+                state.panes.push(ConversationPane::default());
+                state.show_conversation = true;
             }
+            state.active_pane_index = None;
+            if state.panes.len() == 1 {
+                preview_conversation_in_pane(state);
+            }
+        }
         KeyCode::Char('/') => {
             state.search_mode = true;
             state.search_input.move_end();
         }
-        KeyCode::Tab | KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('3') => {
+        KeyCode::Tab
+        | KeyCode::Char('1')
+        | KeyCode::Char('2')
+        | KeyCode::Char('3')
+        | KeyCode::Char('4') => {
             if state.show_summary || state.generating_summary {
                 state.clear_summary();
             }
             state.show_dashboard_detail = false;
             state.show_insights_detail = false;
             state.show_detail = false;
+            state.session_detail_override = None;
+            state.session_detail_live_extra = None;
             state.daily_breakdown_focus = false;
             state.daily_breakdown_scroll = 0;
+            // Order: Dashboard → Live → Daily → Insights.
             state.tab = match key.code {
                 KeyCode::Char('1') => Tab::Dashboard,
-                KeyCode::Char('2') => Tab::Daily,
-                KeyCode::Char('3') => Tab::Insights,
+                KeyCode::Char('2') => Tab::Live,
+                KeyCode::Char('3') => Tab::Daily,
+                KeyCode::Char('4') => Tab::Insights,
                 KeyCode::Tab => match state.tab {
-                    Tab::Dashboard => Tab::Daily,
+                    Tab::Dashboard => Tab::Live,
+                    Tab::Live => Tab::Daily,
                     Tab::Daily => Tab::Insights,
                     Tab::Insights => Tab::Dashboard,
                 },
@@ -990,6 +1162,8 @@ pub(crate) fn handle_default_key(
                 } else if state.selected_session > 0 {
                     state.selected_session -= 1;
                 }
+            } else if state.tab == Tab::Live {
+                state.live_selected = state.live_selected.saturating_sub(1);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -1017,6 +1191,11 @@ pub(crate) fn handle_default_key(
                     if state.selected_session < max {
                         state.selected_session += 1;
                     }
+                }
+            } else if state.tab == Tab::Live {
+                let n = crate::live_visible_count(state);
+                if state.live_selected + 1 < n {
+                    state.live_selected += 1;
                 }
             }
         }
@@ -1094,35 +1273,31 @@ pub(crate) fn handle_default_key(
                 handlers::tasks::start_session_summary(state, session, true);
             }
         }
-        KeyCode::Char('R')
-            if state.tab == Tab::Daily => {
-                let selected_day = state.selected_day;
-                let selected_session = state.selected_session;
-                if let Some((actual_idx, session)) =
-                    crate::current_selected_session_with_index(state)
-                    && state.updating_task.is_none()
-                {
-                    handlers::tasks::start_jsonl_regen(
-                        state,
-                        session,
-                        selected_day,
-                        selected_session,
-                        actual_idx,
-                    );
-                }
+        KeyCode::Char('R') if state.tab == Tab::Daily => {
+            let selected_day = state.selected_day;
+            let selected_session = state.selected_session;
+            if let Some((actual_idx, session)) = crate::current_selected_session_with_index(state)
+                && state.updating_task.is_none()
+            {
+                handlers::tasks::start_jsonl_regen(
+                    state,
+                    session,
+                    selected_day,
+                    selected_session,
+                    actual_idx,
+                );
             }
-        KeyCode::Char('b')
-            if state.tab == Tab::Daily => {
-                state.daily_breakdown_focus = !state.daily_breakdown_focus;
-                if state.daily_breakdown_focus {
-                    state.daily_breakdown_scroll = 0;
-                }
+        }
+        KeyCode::Char('b') if state.tab == Tab::Daily => {
+            state.daily_breakdown_focus = !state.daily_breakdown_focus;
+            if state.daily_breakdown_focus {
+                state.daily_breakdown_scroll = 0;
             }
-        KeyCode::Char('t')
-            if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
-                state.selected_day = 0;
-                state.selected_session = 0;
-            }
+        }
+        KeyCode::Char('t') if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
+            state.selected_day = 0;
+            state.selected_session = 0;
+        }
         KeyCode::Char('i') => {
             if state.tab == Tab::Daily {
                 state.show_detail = true;
@@ -1173,8 +1348,7 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             let max_server = servers.len().saturating_sub(1);
             let cur_server = servers.get(state.mcp_selected_server);
             let cur_tool_count = cur_server.map_or(0, |s| crate::mcp_tool_count(state, s));
-            let cur_expanded =
-                cur_server.is_some_and(|s| state.mcp_expanded_servers.contains(s));
+            let cur_expanded = cur_server.is_some_and(|s| state.mcp_expanded_servers.contains(s));
             match state.mcp_selected_tool {
                 None if cur_expanded && cur_tool_count > 0 => {
                     state.mcp_selected_tool = Some(0);
@@ -1204,24 +1378,52 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
                     if state.mcp_selected_server > 0 {
                         state.mcp_selected_server -= 1;
                         let new_server = servers.get(state.mcp_selected_server);
-                        let expanded = new_server
-                            .is_some_and(|s| state.mcp_expanded_servers.contains(s));
-                        let count =
-                            new_server.map_or(0, |s| crate::mcp_tool_count(state, s));
-                        state.mcp_selected_tool =
-                            if expanded && count > 0 { Some(count - 1) } else { None };
+                        let expanded =
+                            new_server.is_some_and(|s| state.mcp_expanded_servers.contains(s));
+                        let count = new_server.map_or(0, |s| crate::mcp_tool_count(state, s));
+                        state.mcp_selected_tool = if expanded && count > 0 {
+                            Some(count - 1)
+                        } else {
+                            None
+                        };
                     }
                 }
             }
             crate::adjust_mcp_scroll(state, &servers);
         }
+        KeyCode::Enter if state.dashboard_panel == 1 => {
+            // Drill into the focused project. `dashboard_scroll[1]` is the
+            // cursor row in the sorted projects list (Projects panel has a
+            // viewport-decoupled cursor); resolve it back to the raw
+            // `project_name` so the drilldown popup can match it against
+            // `SessionInfo::project_name`.
+            let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
+            // Tiebreaker matches dashboard.rs panel 1 (lint #30) so the same
+            // cursor index lands on the same project across renders.
+            projects.sort_by(|a, b| {
+                b.1.work_tokens
+                    .cmp(&a.1.work_tokens)
+                    .then_with(|| a.0.cmp(b.0))
+            });
+            if let Some((name, _)) = projects.get(state.dashboard_scroll[1]) {
+                state.project_detail_path = (*name).clone();
+                state.project_detail_scroll = 0;
+                state.show_project_detail = true;
+            }
+        }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
             state.show_dashboard_detail = false;
         }
-        KeyCode::Up | KeyCode::Char('k')
-            if state.dashboard_scroll[state.dashboard_panel] > 0 => {
-                state.dashboard_scroll[state.dashboard_panel] -= 1;
-            }
+        KeyCode::Char('w') if state.dashboard_panel == 5 => {
+            state.activity_view_weekly = !state.activity_view_weekly;
+            // Reset scroll so flipping modes always lands the user at the top
+            // of the new dataset; otherwise an out-of-range index from the
+            // longer (daily) list would silently saturate at the end.
+            state.dashboard_scroll[5] = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') if state.dashboard_scroll[state.dashboard_panel] > 0 => {
+            state.dashboard_scroll[state.dashboard_panel] -= 1;
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             let max_items = crate::dashboard_max_items(state);
             let scroll = &mut state.dashboard_scroll[state.dashboard_panel];
@@ -1264,9 +1466,7 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
                 state.mcp_selected_tool = None;
             }
         }
-        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h')
-            if state.dashboard_panel == 3 =>
-        {
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if state.dashboard_panel == 3 => {
             state.tools_detail_section = (state.tools_detail_section + 3) % 4;
             state.dashboard_scroll[state.dashboard_panel] = 0;
             if state.tools_detail_section == 0 {
@@ -1354,48 +1554,43 @@ pub(crate) fn handle_search_mode_key(
             }
             state.search_preview_mode = false;
         }
-        KeyCode::Enter
-            if !state.search_results.is_empty() => {
-                let result = state.search_results[state.search_selected].clone();
-                let query = state.search_input.text.clone();
-                let is_content =
-                    matches!(result.match_type, search::SearchMatchType::Content);
-                if state.search_saved_state.is_none() {
-                    state.search_saved_state = Some((
-                        state.tab,
-                        state.selected_day,
-                        state.selected_session,
-                        state.show_conversation,
-                    ));
-                }
-                state.selected_day = result.day_idx;
-                state.selected_session = result.session_idx;
-                state.tab = Tab::Daily;
-                state.search_mode = false;
-                state.search_preview_mode = true;
-                state.search_task = None;
-                state.searching = false;
-                open_conversation_in_pane(state);
-                if is_content
-                    && let Some(idx) = state.active_pane_index
-                    && let Some(pane) = state.panes.get_mut(idx)
-                {
-                    pane.search_input.set(query);
-                    pane.search_mode = true;
-                }
+        KeyCode::Enter if !state.search_results.is_empty() => {
+            let result = state.search_results[state.search_selected].clone();
+            let query = state.search_input.text.clone();
+            let is_content = matches!(result.match_type, search::SearchMatchType::Content);
+            if state.search_saved_state.is_none() {
+                state.search_saved_state = Some((
+                    state.tab,
+                    state.selected_day,
+                    state.selected_session,
+                    state.show_conversation,
+                ));
             }
-        KeyCode::Down
-            if !state.search_results.is_empty() => {
-                state.search_selected =
-                    (state.search_selected + 1) % state.search_results.len();
+            state.selected_day = result.day_idx;
+            state.selected_session = result.session_idx;
+            state.tab = Tab::Daily;
+            state.search_mode = false;
+            state.search_preview_mode = true;
+            state.search_task = None;
+            state.searching = false;
+            open_conversation_in_pane(state);
+            if is_content
+                && let Some(idx) = state.active_pane_index
+                && let Some(pane) = state.panes.get_mut(idx)
+            {
+                pane.search_input.set(query);
+                pane.search_mode = true;
             }
-        KeyCode::Up
-            if !state.search_results.is_empty() => {
-                state.search_selected = state
-                    .search_selected
-                    .checked_sub(1)
-                    .unwrap_or(state.search_results.len() - 1);
-            }
+        }
+        KeyCode::Down if !state.search_results.is_empty() => {
+            state.search_selected = (state.search_selected + 1) % state.search_results.len();
+        }
+        KeyCode::Up if !state.search_results.is_empty() => {
+            state.search_selected = state
+                .search_selected
+                .checked_sub(1)
+                .unwrap_or(state.search_results.len() - 1);
+        }
         KeyCode::Backspace => {
             state.search_input.delete_back();
             state.search_results =
@@ -1434,14 +1629,12 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
             state.show_project_popup = false;
         }
-        KeyCode::Up | KeyCode::Char('k')
-            if state.project_popup_selected > 0 => {
-                state.project_popup_selected -= 1;
-            }
-        KeyCode::Down | KeyCode::Char('j')
-            if state.project_popup_selected < total - 1 => {
-                state.project_popup_selected += 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') if state.project_popup_selected > 0 => {
+            state.project_popup_selected -= 1;
+        }
+        KeyCode::Down | KeyCode::Char('j') if state.project_popup_selected < total - 1 => {
+            state.project_popup_selected += 1;
+        }
         KeyCode::Enter => {
             if state.project_popup_selected == 0 {
                 state.project_filter = None;
