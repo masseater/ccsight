@@ -43,6 +43,7 @@
 #   28  Shell commands via `format!` must use `posix_shell_quote`
 #   29  Atomic tmp+rename must `sync_all` before rename
 #   30  HashMap-sourced single-key sort needs `.then_with(...)` tiebreaker
+#   31  No leading `Line::from("")` in popup content vecs (title sits on border)
 
 set -e
 
@@ -784,6 +785,44 @@ if [ -n "$NONDET_SORT$NONDET_SORT_KEY" ]; then
     echo "ERROR: single-key sort without tiebreaker. If the source is a HashMap, tied values shuffle between frames. Add \`.then_with(|| a.0.cmp(b.0))\` for stable ordering, or annotate with \`// lint-ok: deterministic-source\`:"
     [ -n "$NONDET_SORT" ] && echo "$NONDET_SORT"
     [ -n "$NONDET_SORT_KEY" ] && echo "$NONDET_SORT_KEY"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 31. Popup content vecs must not start with a blank `Line::from("")`.
+# The popup title is rendered onto the top border line itself, so any
+# leading empty Line shifts every section down one row and visually
+# desyncs the popup from its siblings (Dashboard / Insights / Tools
+# detail popups all begin with substantive content). This has bitten
+# the per-project popup, Live preview, Help popup, and Insights detail
+# at different times — same diagnosis every time: someone added an
+# initial blank "for breathing room" without seeing it doubled up.
+#
+# Pattern: `vec![Line::from("")` followed by `,` or `]` (single- or
+# multi-element vec where blank is the first item).
+# Exempt: `vec![Line::from(""); N]` (deliberate N-row padding — the
+# `;` distinguishes the repeat form).
+LEADING_BLANK_LINE=$(python3 -c "
+import os, re
+# Match: vec![Line::from(\"\")<sep>  where <sep> is comma or close-bracket
+# (not semicolon — that is the repeat form vec![Line::from(\"\"); N]).
+pat = re.compile(r'vec!\[Line::from\(\"\"\)\s*[,\]]')
+hits = []
+for root, _, files in os.walk('src/ui'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                if 'lint-ok: leading-blank' in line:
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$LEADING_BLANK_LINE" ]; then
+    echo "ERROR: popup content starts with \`Line::from(\"\")\`. The title sits on the top border; a leading blank desyncs this popup from its siblings. Drop the empty Line (use \`Vec::new()\` and push content), or annotate with \`// lint-ok: leading-blank\`:"
+    echo "$LEADING_BLANK_LINE"
     ERRORS=$((ERRORS + 1))
 fi
 

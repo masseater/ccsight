@@ -9,6 +9,11 @@ permissions:
 
 jobs:
   verify:
+    # See ci.yml: rustsec/audit-check needs `checks: write`, and the
+    # caller's permissions cap the reusable workflow's request.
+    permissions:
+      contents: read
+      checks: write
     uses: ./.github/workflows/verify.yml
 
   build:

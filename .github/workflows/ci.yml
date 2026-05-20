@@ -7,4 +7,10 @@ on:
 
 jobs:
   verify:
+    # rustsec/audit-check inside verify.yml posts a check run; the reusable
+    # workflow's own `permissions:` block only sets a ceiling — the caller
+    # must grant the same set or the call is rejected with "checks: none".
+    permissions:
+      contents: read
+      checks: write
     uses: ./.github/workflows/verify.yml

@@ -4895,7 +4895,7 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
             .border_style(Style::default().fg(theme::PRIMARY))
             .title(Span::styled(
                 " Filter Period ",
-                Style::default().fg(theme::PRIMARY),
+                Style::default().fg(theme::PRIMARY).bold(),
             ))
             .title_bottom(Line::from(footer).style(Style::default().fg(theme::DIM))),
     );
@@ -5030,7 +5030,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
             .border_style(Style::default().fg(theme::PRIMARY))
             .title(Span::styled(
                 " Filter Project ",
-                Style::default().fg(theme::PRIMARY),
+                Style::default().fg(theme::PRIMARY).bold(),
             ))
             .title_bottom(Line::from(footer).style(Style::default().fg(theme::DIM))),
     );
@@ -5249,7 +5249,10 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     let label_dim = Style::default().fg(theme::DIM);
     let primary_bold = Style::default().fg(theme::PRIMARY).bold();
 
-    let mut content: Vec<Line> = vec![Line::from("")];
+    // No leading blank: the title is rendered on the top border line, so a
+    // `Line::from("")` here would push every section down one row from the
+    // convention used by Dashboard / Insights / Tools detail popups.
+    let mut content: Vec<Line> = Vec::new();
 
     // Summary header. All four totals are lifetime (across every day the
     // project has been active), made explicit by the section title.
@@ -5451,11 +5454,34 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         )));
     }
 
-    let max_scroll = content
-        .len()
-        .saturating_sub(popup_height.saturating_sub(2) as usize);
+    let visible_height = popup_height.saturating_sub(2) as usize;
+    let max_scroll = content.len().saturating_sub(visible_height);
     let scroll = state.project_detail_scroll.min(max_scroll);
     state.project_detail_scroll = scroll;
+
+    // Footer aligned with the other detail popups (CLAUDE.md "Footer /
+    // title_bottom Format"): `key: action` with colon+space, `▲▼` for the
+    // can-scroll indicator (not `↑↓` — those are reserved for keybind
+    // hints), and a position chip `[N/M project-label]` mirroring
+    // `insights_detail`'s `[1/4] Metrics`.
+    let can_scroll_up = scroll > 0;
+    let can_scroll_down = scroll + visible_height < content.len();
+    let scroll_indicator = if can_scroll_up && can_scroll_down {
+        " ▲▼ "
+    } else if can_scroll_up {
+        " ▲ "
+    } else if can_scroll_down {
+        " ▼ "
+    } else {
+        ""
+    };
+    let project_total = state.stats.project_stats.len();
+    let project_pos = state.dashboard_scroll[1] + 1;
+    let position_chip = if project_total > 0 {
+        format!(" [{project_pos}/{project_total} {label}] ")
+    } else {
+        String::new()
+    };
 
     let title = format!(" Project · {label} ");
     let block = Block::default()
@@ -5465,10 +5491,14 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             title,
             Style::default().fg(theme::PRIMARY).bold(),
         ))
-        .title_bottom(Line::from(Span::styled(
-            " ↑↓:scroll  Enter/q/Esc:back ",
-            Style::default().fg(theme::DIM),
-        )));
+        .title_bottom(Line::from(vec![
+            Span::styled(
+                " ↑↓: scroll  Enter: back  q: close ",
+                Style::default().fg(theme::DIM),
+            ),
+            Span::styled(scroll_indicator, Style::default().fg(theme::WARNING)),
+            Span::styled(position_chip, Style::default().fg(theme::PRIMARY)),
+        ]));
     let paragraph = ratatui::widgets::Paragraph::new(content)
         .scroll((scroll as u16, 0))
         .block(block);

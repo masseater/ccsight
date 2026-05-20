@@ -176,9 +176,15 @@ mod tests {
         for (g, s, name) in pairs {
             let max = g.max(s);
             let diff = g.abs_diff(s);
-            // 0.1% tolerance, with a 1024-token floor so a small absolute
-            // delta on a near-empty corpus isn't a false negative.
-            let allowed = (max / 1000).max(1024);
+            // 0.5% tolerance, with a 1024-token floor so a small absolute
+            // delta on a near-empty corpus isn't a false negative. Dev
+            // envs run this against live JSONLs that the user's active
+            // Claude Code session is actively writing to; the gap between
+            // the two aggregator passes can land a few hundred K tokens
+            // of cache writes. Real regressions (skip_tokens / dedup
+            // divergence) produced multi-megatoken gaps on each metric,
+            // so 0.5% still catches them.
+            let allowed = (max / 200).max(1024);
             assert!(
                 diff <= allowed,
                 "{name}: grouper={g} stats={s} diff={diff} > allowed={allowed} \
