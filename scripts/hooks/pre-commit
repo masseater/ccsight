@@ -14,6 +14,12 @@ set -e
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+echo "[pre-commit] cargo fmt -- --check ..."
+if ! cargo fmt -- --check 2>&1; then
+    echo "[pre-commit] FAILED: formatter drift. Run 'cargo fmt' and re-stage."
+    exit 1
+fi
+
 echo "[pre-commit] cargo test ..."
 if ! cargo test --quiet 2>&1; then
     echo "[pre-commit] FAILED: cargo test reported failures."

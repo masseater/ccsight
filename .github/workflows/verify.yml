@@ -21,6 +21,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install shellcheck
         # tmux is pre-installed on GitHub's macOS runners
+      - run: cargo fmt -- --check
       - run: cargo test --locked
       - run: cargo clippy --locked -- -D warnings
       # Release build catches release-only issues (link errors, conditional

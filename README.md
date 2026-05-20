@@ -1,18 +1,31 @@
 # ccsight
 
-A Rust TUI for viewing Claude Code session logs with statistics, cost analysis, and conversation browsing.
+Claude Code session analytics TUI. Browse what's running now, drill into a day,
+reconcile spend across projects and models, and search every past conversation
+— all from the terminal, against your local `~/.claude/` logs.
 
 ## Features
 
-- **Dashboard**: Costs, tokens, projects, models, tools, languages, heatmap, hourly patterns
-- **Live**: Currently-running and recently-paused sessions with status glyphs, copy-resume command, snapshot recovery so you can find what you had open after a host reboot
-- **Daily View**: Day-by-day sessions with activity graph, breakdown, conversation viewer
-- **Insights**: Metrics, today vs average, weekly/monthly trends with detail popups
-- **Conversation**: Multi-pane browsing with syntax highlighting, search, copy
-- **Search**: Full-text search across all sessions (tantivy, multilingual)
+- **Dashboard**: API-equivalent cost estimate (what your usage would cost at
+  list-price API rates, with 5m vs 1h cache-write TTL accounted separately),
+  daily/monthly breakdown, top projects with sparklines and drilldown popup,
+  per-model spend, tool / language / activity heatmap, hourly patterns
+- **Live**: Currently-running and recently-paused sessions with status glyphs,
+  copy-resume command (`cd … && claude -r …`), snapshot recovery so you can
+  find what you had open after a host reboot
+- **Daily View**: Day-by-day sessions with activity graph, project/model/tool
+  breakdown, conversation viewer
+- **Insights**: Metrics (cost, sessions, tokens, cache hit rate, 5m TTL share,
+  tool success, summary coverage, subagent overhead), today vs average,
+  weekly/monthly trends — each with a detail popup
+- **Conversation**: Multi-pane browsing with syntax highlighting, in-pane
+  search, copy-to-clipboard
+- **Search**: Full-text search across all sessions (tantivy ngram, multilingual)
 - **Pin**: Mark important sessions, browse across dates
-- **MCP Server**: query ccsight from other Claude clients (`--mcp`)
-- **Caching**: Fast startup via on-disk cache and full-text index
+- **MCP Server**: Query ccsight from other Claude clients (`--mcp` — exposes
+  `stats`, `sessions`, `search`, `live_sessions` tools)
+- **Caching**: Fast startup via on-disk cache (`~/.ccsight/cache.json`) and
+  incremental full-text index update
 
 ## Installation
 

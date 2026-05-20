@@ -1,9 +1,9 @@
 [package]
 name = "ccsight"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.87"
-description = "Claude Code log viewer with integrated statistics and daily summaries"
+description = "Claude Code session analytics TUI"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/esorae/ccsight"
 keywords = ["claude", "tui", "analytics", "cli"]

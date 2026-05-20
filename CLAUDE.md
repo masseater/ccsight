@@ -7,13 +7,15 @@ See [README.md](README.md) for usage. Press `?` in TUI for key bindings.
 ```bash
 cargo build --release        # Build
 cargo run                    # Run TUI
+cargo fmt                    # Format (gate: `cargo fmt -- --check`)
 cargo test                   # Run tests
 cargo clippy -- -D warnings  # Lint (warnings are errors)
 bash scripts/lint.sh         # Project lint (UI patterns, safety)
 bash scripts/install-hooks.sh   # One-time pre-commit hook setup
 ```
 
-The pre-commit hook runs the three checks above on every commit.
+The pre-commit hook runs `cargo fmt -- --check`, `cargo test`, `cargo clippy`,
+and `bash scripts/lint.sh` on every commit. CI runs the same set.
 
 ## Smoke test (tmux)
 

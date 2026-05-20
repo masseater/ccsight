@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "ccsight"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "arboard",

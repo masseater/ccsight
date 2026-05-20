@@ -62,7 +62,7 @@ use crate::infrastructure::FileDiscovery;
 
 #[derive(Parser, Debug)]
 #[command(name = "ccsight")]
-#[command(author, version, about = "Claude Code log viewer with statistics", long_about = None)]
+#[command(author, version, about = "Claude Code session analytics TUI", long_about = None)]
 struct Args {
     /// Maximum number of session files to load (0 = all)
     #[arg(short, long, default_value = "0")]
