@@ -25,8 +25,8 @@ struct LoadedData {
 
 fn load_fresh_data(limit: usize) -> LoadedData {
     let files = FileDiscovery::find_jsonl_files_with_limit(limit).unwrap_or_default();
-    let cache = crate::infrastructure::Cache::load().ok();
-    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &cache);
+    let mut cache = crate::infrastructure::Cache::load().ok();
+    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
     build_loaded_data(daily_groups)
 }
 
@@ -91,7 +91,7 @@ struct LiveSessionsParams {
     )]
     project: Option<String>,
     #[schemars(
-        description = "Filter by status tier: \"busy\" (process actively responding), \"warm\" (idle, last touched within 30 min), \"idle\" (alive but quiet), \"paused\" (process gone, JSONL within 24h or in snapshot). Omit for all."
+        description = "Filter by status tier: \"busy\" (process actively responding), \"today\" (alive, touched today in local calendar), \"older\" (alive but not touched today), \"paused\" (process gone, JSONL within 24h or in snapshot). Omit for all."
     )]
     status: Option<String>,
 }
@@ -605,15 +605,14 @@ impl CcsightServer {
     }
 
     #[tool(
-        description = "List currently running and recently disconnected Claude Code sessions. Sources: ~/.claude/sessions/<pid>.json (PID liveness verified), ~/.claude/projects/**/*.jsonl mtime (24h window), and ccsight's snapshot of previously-alive session IDs. Each row reports session_id, cwd, project, status tier (busy/warm/idle/paused), age (seconds since last update), pid (0 for paused), today's tokens/cost, model, ai_title, and last user-message preview. Use the `live` tab semantics to find what's open right now or what was running before a reboot. All timestamps local timezone."
+        description = "List currently running and recently disconnected Claude Code sessions. Sources: ~/.claude/sessions/<pid>.json (PID liveness verified), ~/.claude/projects/**/*.jsonl mtime (24h window), and ccsight's snapshot of previously-alive session IDs. Each row reports session_id, cwd, project, status tier (busy/today/older/paused), age (seconds since last update), pid (0 for paused), today's tokens/cost, model, ai_title, and last user-message preview. Use the `live` tab semantics to find what's open right now or what was running before a reboot. All timestamps local timezone."
     )]
     fn live_sessions(
         &self,
         Parameters(params): Parameters<LiveSessionsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         use crate::infrastructure::live_sessions::{
-            LiveSession, WARM_THRESHOLD_SECS, discover_live, discover_recently_paused,
-            mark_was_recently_live,
+            LiveSession, discover_live, discover_recently_paused, mark_was_recently_live,
         };
         use crate::infrastructure::live_snapshot::LiveSnapshot;
 
@@ -626,17 +625,15 @@ impl CcsightServer {
             std::time::SystemTime::now(),
         );
         let snapshot = LiveSnapshot::load();
-        // MCP is a one-shot read; it doesn't observe alive→dead transitions
-        // across its own poll cycles, so use `now` as the horizon. Every
-        // snapshot match qualifies as `⟳` (the previous flag semantics).
-        // Currently-alive sessions are already filtered out of `paused`.
-        let horizon = chrono::Utc::now();
-        mark_was_recently_live(&mut paused, &snapshot, horizon);
+        // MCP has no run of its own; reuse the most recent TUI ccsight's
+        // anchor via the helper.
+        let anchor = snapshot.prior_run_anchor();
+        mark_was_recently_live(&mut paused, &snapshot, anchor);
         let paused_ids: std::collections::HashSet<String> =
             paused.iter().map(|s| s.session_id.clone()).collect();
-        let recovered = snapshot.recover_missing(&active_ids, &paused_ids, horizon);
+        let recovered = snapshot.recover_missing(&active_ids, &paused_ids, anchor);
         paused.extend(recovered);
-        mark_was_recently_live(&mut paused, &snapshot, horizon);
+        mark_was_recently_live(&mut paused, &snapshot, anchor);
 
         // Lookup table from `daily_groups` so we can enrich each live row
         // with ai_title / last_user_message / tokens / cost / model. Build
@@ -659,15 +656,15 @@ impl CcsightServer {
             } else if s.status.as_deref() == Some("busy") {
                 "busy"
             } else {
-                let secs = s
-                    .updated_at
-                    .or(s.jsonl_mtime)
+                let t = s
+                    .jsonl_mtime
+                    .or(s.updated_at)
                     .or(s.started_at)
-                    .map_or(0, |t| (now - t).num_seconds().max(0));
-                if secs < WARM_THRESHOLD_SECS {
-                    "warm"
+                    .unwrap_or(now);
+                if crate::infrastructure::live_sessions::is_today(t, now) {
+                    "today"
                 } else {
-                    "idle"
+                    "older"
                 }
             }
         };

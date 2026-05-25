@@ -298,7 +298,7 @@ mod project_label_tests {
             .iter()
             .map(|n| make_session(n, None, Some("main")))
             .collect();
-        let mut state = AppState::new_initial(0);
+        let mut state = AppState::new_initial(0, None);
         state.original_daily_groups = vec![DailyGroup {
             date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(), // lint-ok: date-literal
             sessions,
@@ -462,13 +462,10 @@ pub struct AppState {
         )>,
     >,
     pub live_last_update: Option<std::time::Instant>,
-    /// UTC time at which the current ccsight process started. Used by the
-    /// live snapshot polling thread to distinguish "previously alive,
-    /// inherited from a prior run" (entries with `last_seen < app_start_time`
-    /// → `⟳` candidates) from "alive then closed mid-run" (entries stamped
-    /// during this run → ordinary `⏸`). Set once at app boot and never
-    /// mutated afterwards.
-    pub app_start_time: chrono::DateTime<chrono::Utc>,
+    /// Anchor for the `⟳ from last ccsight run` cluster check. Copied from
+    /// the on-disk snapshot once at boot and frozen; must not be touched by
+    /// in-run polling, otherwise the marker expires after the first refresh.
+    pub prior_run_last_refresh: Option<chrono::DateTime<chrono::Utc>>,
     /// Per-project drilldown popup. Opened from the Projects detail popup
     /// (panel 1) via Enter on the focused row. `project_detail_path` is the
     /// raw project_name (matching `SessionInfo::project_name` for lookup).
@@ -658,7 +655,10 @@ impl AppState {
     /// `loading = true`, `tab = Dashboard`, the persisted pin list, and the
     /// retention warning derived from the user config. `data_limit` is the
     /// CLI `--limit` value carried into the data-load thread.
-    pub(crate) fn new_initial(data_limit: usize) -> Self {
+    pub(crate) fn new_initial(
+        data_limit: usize,
+        prior_run_last_refresh: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
         Self {
             needs_draw: true,
             tab: Tab::Dashboard,
@@ -684,7 +684,7 @@ impl AppState {
             live_scroll: 0,
             live_sessions_task: None,
             live_last_update: None,
-            app_start_time: chrono::Utc::now(),
+            prior_run_last_refresh,
             show_project_detail: false,
             project_detail_path: String::new(),
             project_detail_scroll: 0,

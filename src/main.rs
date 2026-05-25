@@ -189,7 +189,10 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
     // block on `defaults read NSGlobalDomain AppleLanguages` (macOS).
     summary::prefetch_user_language();
 
-    let mut state = AppState::new_initial(limit);
+    // Freeze the prior run's anchor before any poll can rewrite the snapshot.
+    let prior_run_last_refresh =
+        infrastructure::live_snapshot::LiveSnapshot::load().prior_run_anchor();
+    let mut state = AppState::new_initial(limit, prior_run_last_refresh);
 
     execute!(io::stdout(), BeginSynchronizedUpdate)?;
     let completed = terminal.draw(|f| ui::draw(f, &mut state))?;
@@ -344,7 +347,11 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                 .is_none_or(|last| last.elapsed() > std::time::Duration::from_secs(5));
             if should_poll {
                 let (tx, rx) = mpsc::channel();
-                let app_start_time = state.app_start_time;
+                // The anchor is captured at boot only; do NOT recompute it
+                // from the loaded snapshot inside the thread. `refresh()`
+                // below rewrites `last_refresh_at`, which would drift the
+                // anchor to the current run and expire ⟳ on poll #2.
+                let prior_run_anchor = state.prior_run_last_refresh;
                 thread::spawn(move || {
                     let active = infrastructure::live_sessions::discover_live();
                     let active_ids: std::collections::HashSet<String> =
@@ -359,10 +366,9 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     // 1. Load prior snapshot (still on disk from prev poll /
                     //    prev ccsight run).
                     // 2. Mark `was_recently_live` on paused rows already
-                    //    found via JSONL mtime (24h window). The
-                    //    `app_start_time` filter excludes sessions stamped
-                    //    in the current run so manual mid-run closes don't
-                    //    appear as `⟳`.
+                    //    found via JSONL mtime (24h window). The anchor
+                    //    is the prior run's frozen last-heartbeat — sessions
+                    //    stamped during this run can never sit on it.
                     // 3. Recover snapshot rows whose JSONL mtime fell
                     //    outside the 24h window (Friday→Monday case) and
                     //    append them to paused.
@@ -372,17 +378,17 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     infrastructure::live_sessions::mark_was_recently_live(
                         &mut paused,
                         &snapshot,
-                        app_start_time,
+                        prior_run_anchor,
                     );
                     let paused_ids: std::collections::HashSet<String> =
                         paused.iter().map(|s| s.session_id.clone()).collect();
                     let recovered =
-                        snapshot.recover_missing(&active_ids, &paused_ids, app_start_time);
+                        snapshot.recover_missing(&active_ids, &paused_ids, prior_run_anchor);
                     paused.extend(recovered);
                     infrastructure::live_sessions::mark_was_recently_live(
                         &mut paused,
                         &snapshot,
-                        app_start_time,
+                        prior_run_anchor,
                     );
                     snapshot.refresh(&active);
                     snapshot.save();
@@ -1072,9 +1078,10 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     let file_count = files.len();
     let cache = crate::infrastructure::Cache::load()
         .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
-    let cache_for_grouper = Some(cache.clone());
+    let mut cache_for_grouper = Some(cache.clone());
     let (stats, cache_stats) = StatsAggregator::aggregate_with_shared_cache(&files, cache);
-    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &cache_for_grouper);
+    let daily_groups =
+        DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache_for_grouper);
 
     let calculator = CostCalculator::global();
     let model_costs = calculator.calculate_costs_by_model(&stats.model_tokens);

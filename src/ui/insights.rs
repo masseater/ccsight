@@ -181,7 +181,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
             },
         ),
         (
-            format!("${:.1}/day", avg_cost_per_day.max(0.0)),
+            format!("${:.2}/day", avg_cost_per_day.max(0.0)),
             "cost",
             theme::SECONDARY,
         ),
@@ -221,7 +221,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         if i == 0 && (cache_5m + cache_1h) > 0 && (row1_chunks[i].width as usize) >= 22 {
             spans.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
             spans.push(Span::styled(
-                format!("{cache_5m_share:.0}% 5m"),
+                format!("{cache_5m_share:.1}% 5m"),
                 Style::default().fg(theme::SECONDARY),
             ));
         }
@@ -730,7 +730,10 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
                 // Projection only adds information when more than one day
                 // remains; at month-end forecast collapses to current_cost.
                 if days_elapsed < days_in_month {
-                    spans.push(Span::styled(" · proj ", Style::default().fg(theme::DIM)));
+                    spans.push(Span::styled(
+                        " · forecast: ",
+                        Style::default().fg(theme::DIM),
+                    ));
                     spans.push(Span::styled(
                         format!("${:.0}", forecast.max(0.0)),
                         Style::default().fg(theme::WARM),
@@ -1050,7 +1053,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 Span::styled(subagent_session_suffix, Style::default().fg(theme::DIM)),
                 Span::styled(
                     format!(
-                        "  ${:.1}/day  {}/day  {}/ses  {avg_dur_str}/ses",
+                        "  ${:.2}/day  {}/day  {}/ses  {avg_dur_str}/ses",
                         avg_cost_per_day.max(0.0),
                         crate::format_number(tokens_per_day),
                         crate::format_number(tokens_per_session)
@@ -1223,7 +1226,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         state,
                         trend_today,
                         trend_days,
-                        "Tokens/sess ",
+                        "Tokens/ses  ",
                         super::tokens_per_session_value,
                         |v| crate::format_number(v as u64),
                     ),
@@ -1269,11 +1272,10 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     .max(0.01);
                 for (model, cost) in state.model_costs.iter().take(5) {
                     let ratio = *cost / max_cost;
-                    let pct = if total_cost > 0.0 {
-                        (*cost / total_cost * 100.0) as u32
-                    } else {
-                        0
-                    };
+                    let pct_label = crate::text::format_pct(
+                        (*cost * 1_000_000.0) as u64,
+                        (total_cost * 1_000_000.0) as u64,
+                    );
                     let filled = (ratio * bar_max as f64).round() as usize;
                     let intensity = (ratio * 0.7 + 0.3).min(1.0);
                     let bar_color = ratatui::style::Color::Rgb(
@@ -1299,7 +1301,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                             format!(" {:>6}", super::format_cost(*cost, 0)),
                             Style::default().fg(theme::WARM),
                         ),
-                        Span::styled(format!(" {pct:>2}% $"), Style::default().fg(theme::DIM)),
+                        Span::styled(format!(" {pct_label:>4}"), Style::default().fg(theme::DIM)),
                     ]));
                 }
                 lines.push(sep.clone());
@@ -1940,7 +1942,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         Style::default().fg(theme::SEPARATOR),
                     ),
                     Span::styled(
-                        format!(" {:>5}/d", crate::format_number(avg)),
+                        format!(" {:>5}/day", crate::format_number(avg)),
                         Style::default().fg(theme::PRIMARY),
                     ),
                     Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
@@ -2144,8 +2146,10 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                         Style::default().fg(theme::PRIMARY),
                     ));
                     if days_elapsed < days_in_month {
-                        summary_spans
-                            .push(Span::styled(" · proj ", Style::default().fg(theme::DIM)));
+                        summary_spans.push(Span::styled(
+                            " · forecast: ",
+                            Style::default().fg(theme::DIM),
+                        ));
                         summary_spans.push(Span::styled(
                             format!("${:.0}", forecast.max(0.0)),
                             Style::default().fg(theme::WARM),
@@ -2199,7 +2203,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     Style::default().fg(theme::PRIMARY).bold(),
                 ))
                 .title_bottom(Line::from(vec![
-                    Span::styled(" ←→:switch  i/q:close ", Style::default().fg(theme::DIM)),
+                    Span::styled(" ←→: switch  i/q: close ", Style::default().fg(theme::DIM)),
                     Span::styled(
                         format!("[{}/4] {} ", current_panel + 1, panel_label),
                         Style::default().fg(theme::PRIMARY),

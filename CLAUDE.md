@@ -60,22 +60,17 @@ before fixing — fixes often fan out into multiple sites that share a value.
 `ls src/` shows the file tree; this section only covers modules whose purpose
 isn't obvious from the filename.
 
-| Module | Why it exists |
-|--------|---------------|
-| `aggregator/mod.rs` | `extract_session_model` walks entries reverse so mid-session `/model` switches are reflected in the badge. |
-| `aggregator/pricing.rs` | `models_without_pricing` set — models absent from the pricing table are surfaced (Overview `*`, Insights, MCP `stats.pricing_gap`) instead of silently $0. |
-| `aggregator/tool_category.rs` | Classifies every tool key into `BuiltIn` / `Mcp` / `Skill` / `Agent` / `Command`. UI order: **Tools (Built-in + MCP) → Skills → Commands → Subagents**. `format_tool_short` strips the `skill:` / `agent:` / `command:` prefix (sections already convey category). |
-| `infrastructure/mcp_config.rs` | Joins `~/.claude.json` + plugin `.mcp.json` with observed `tool_usage`. `is_underutilized(now, 30)` is the canonical "stale" predicate. Servers in logs but absent from current config are **inactive**, not stale. |
-| `infrastructure/resource_config.rs` | `discover_configured_resources()` walks `~/.claude/{skills,commands,agents}/` plus enabled plugin paths so the Tools popup can show 0-call rows for installed-but-unused entries. |
-| `infrastructure/cowork_source.rs` | Claude Desktop Cowork audit logs (Anthropic-private format — undocumented, may break between Claude Desktop releases). Discovery is silent on parse failure so per-file errors don't crash the TUI. |
-| `infrastructure/search_index.rs` | tantivy ngram(2,3) index at `~/.ccsight/index/`. `update_or_build()` handles fresh / incremental / reuse. |
-| `infrastructure/state_dir.rs` | Single source of truth for on-disk state paths under `~/.ccsight/`. `migrate_legacy_state_dirs()` is called at startup to relocate pre-1.1 paths. |
-| `infrastructure/live_sessions.rs` | Discovers active Claude Code processes via `~/.claude/sessions/<pid>.json` + PID liveness, plus paused sessions via JSONL mtime. `WARM_THRESHOLD_SECS` is the single source of truth shared between the sort tier and the row glyph. |
-| `infrastructure/live_snapshot.rs` | Persists "session_id last seen alive" so that after a host reboot (every Claude Code process killed) `recover_missing()` can bring those rows back into the paused list with the `⟳` glyph. |
-| `handlers/mcp_popup.rs` | Tools-tab cursor row math. Coord origin must match the body slicing in `dashboard.rs::draw_dashboard_detail_popup` (see doc comment). |
-| `shell.rs` | `posix_shell_quote` — the only sanctioned way to embed user-derived strings into `cd ... && claude -r ...` resume commands. Lint #28 enforces. |
-| `state.rs` | `AppState`, `ConversationPane`, `TextInput`. Adding a field is compiler-checked at every `AppState { ... }` literal. |
-| `test_helpers.rs` | `#[cfg(test)]` fixtures. `create_test_state()` returns an `AppState` with deterministic token / cost values. |
+| Module | Non-obvious invariant |
+|--------|------------------------|
+| `aggregator/mod.rs` | `extract_session_model` walks entries reverse — mid-session `/model` switches must reflect in the badge. |
+| `aggregator/pricing.rs` | `models_without_pricing` surfaces unpriced models (`*` mark) instead of silently rendering $0. |
+| `aggregator/tool_category.rs` | UI section order: **Tools → Skills → Commands → Subagents**. `format_tool_short` strips category prefix (section already conveys it). |
+| `infrastructure/mcp_config.rs` | `is_underutilized(now, 30)` is the canonical "stale" predicate. Servers absent from current config are **inactive**, not stale. |
+| `infrastructure/live_sessions.rs` | `is_today()` is the single source of truth shared between sort tier and row glyph (busy / today / older). |
+| `infrastructure/live_snapshot.rs` | `last_refresh_at` anchors the `⟳` cluster; **must be frozen at boot in `AppState::prior_run_last_refresh`** — re-deriving mid-run silently drops markers. |
+| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `Stats::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field. |
+| `shell.rs` | `posix_shell_quote` is the only sanctioned interpolation for `cd ... && claude -r ...`. Lint #28 enforces. |
+| `state.rs` | Adding a field is compiler-checked at every `AppState { ... }` literal site (3+ places). |
 
 ## Rules
 
@@ -167,25 +162,25 @@ describe fixture arithmetic that is part of the assertion contract.
 
 Pick the lowest layer that exercises what you changed.
 
-## Tools detail popup
+**`cargo clippy -- -D warnings` (CI gate) does NOT check `#[cfg(test)]` code.**
+Unused vars and dead_code in test blocks slip through. After touching test
+files run `cargo clippy --release --tests -- -D warnings` locally before
+committing.
 
-Tab order: **0=Tools, 1=Skills, 2=Commands, 3=Subagents** (`tools_detail_section`).
-The Tools tab merges Built-in tools and MCP servers into one expandable list;
-the other three each render their own category. Every tab also surfaces
-"configured but never used" entries as zero-call rows (`░░░ 0 0% · never` in
-`LABEL_SUBTLE`) sourced from `state.mcp_status` (Tools) or
-`state.configured_resources` (Skills / Commands / Subagents).
+## Verifying logic changes
 
-Cursor / scroll math has to agree across four sites:
+Green unit tests are not proof that a fix lands in production. For changes
+that depend on on-disk state (snapshot, cache, ~/.claude files), open the
+actual files and verify the fix engages:
 
-1. Body layout in `dashboard.rs::draw_dashboard_detail_popup` active==0
-2. Group enumeration in `mcp_popup::collect_mcp_servers`
-3. `mcp_pre_server_offset` (header row count)
-4. `dashboard::tool_usage_line_count` (scroll bound = rendered rows)
+- `~/.ccsight/live_snapshot.json` — dump with `python3 -c "import json; ..."`
+- `~/.claude/sessions/*.json` — `ls -la` + `cat <pid>.json`, check `kill -0`
+- `~/.claude/projects/*/<id>.jsonl` — `wc -l`, `head -1` / `tail -1`
 
-Stale = configured & `is_underutilized(now, 30)`. This single predicate powers
-the preview legend, the popup `⚠`, and the Tier 3 alert — never re-implement
-the threshold inline (lint #19).
+The conversation history has several incidents where a fix passed all unit
+tests but did nothing on real data because the test fixtures didn't match
+the on-disk shape. When in doubt, dump the actual file before claiming the
+fix worked.
 
 ## Key Patterns
 

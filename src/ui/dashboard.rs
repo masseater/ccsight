@@ -639,11 +639,7 @@ fn draw_top_projects(
         .skip(scroll)
         .take(visible_height)
         .map(|(i, (name, stats))| {
-            let percentage = if total_tokens > 0 {
-                (stats.work_tokens as f64 / total_tokens as f64 * 100.0) as u32
-            } else {
-                0
-            };
+            let pct_str = crate::text::format_pct(stats.work_tokens, total_tokens);
             let dir_name = state.project_label(name);
             let tokens_str = crate::format_number(stats.work_tokens);
 
@@ -651,7 +647,7 @@ fn draw_top_projects(
                 Cell::from(format!("{}.", i + 1)).style(Style::default().fg(theme::DIM)),
                 Cell::from(dir_name),
                 Cell::from(tokens_str).style(Style::default().fg(theme::PRIMARY)),
-                Cell::from(format!("{percentage}%")).style(Style::default().fg(theme::MUTED)),
+                Cell::from(pct_str).style(Style::default().fg(theme::MUTED)),
             ])
         })
         .collect();
@@ -739,11 +735,7 @@ fn draw_model_tokens(
         .take(visible_height)
         .map(|(i, (name, tokens, _cost))| {
             let rank = format!("{}.", i + 1);
-            let pct = if total_tokens > 0 {
-                format!("{:.0}%", *tokens as f64 / total_tokens as f64 * 100.0)
-            } else {
-                "0%".to_string()
-            };
+            let pct = crate::text::format_pct(*tokens, total_tokens);
             Row::new(vec![
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
                 Cell::from(super::truncate_with_ellipsis(name, name_w)),
@@ -1339,11 +1331,7 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
         .take(visible_height)
         .map(|(i, (name, count, is_unknown))| {
             let rank = format!("{}.", i + 1);
-            let percentage = if total_usage > 0 {
-                (*count as f64 / total_usage as f64 * 100.0) as u32
-            } else {
-                0
-            };
+            let pct_str = crate::text::format_pct(*count as u64, total_usage as u64);
             // Unknown extensions render dimmer so they're visually
             // distinguishable from the named language categories.
             let name_style = if *is_unknown {
@@ -1355,7 +1343,7 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
                 Cell::from(rank).style(Style::default().fg(theme::DIM)),
                 Cell::from(super::truncate_with_ellipsis(name, name_w)).style(name_style),
                 Cell::from(count.to_string()).style(Style::default().fg(theme::PRIMARY)),
-                Cell::from(format!("{percentage}%")).style(Style::default().fg(theme::MUTED)),
+                Cell::from(pct_str).style(Style::default().fg(theme::MUTED)),
             ])
         })
         .collect();
@@ -1427,7 +1415,7 @@ fn draw_recent_costs(
         .skip(scroll)
         .take(visible_height)
         .map(|(i, (date, cost))| {
-            let date_str = date.format("%m-%d(%a)").to_string();
+            let date_str = date.format("%m-%d (%a)").to_string();
             let cost_display = cost.max(0.0);
             let cost_str = super::format_cost(cost_display, cost_precision);
             let tokens: u64 =
@@ -1539,7 +1527,7 @@ where
 }
 
 /// Mirror of `ACTIVITY_HEADER_ROWS` for the Costs detail popup. Header carries
-/// MTD / forecast / MoM delta + top-model composition, then a separator.
+/// this-month spend / forecast / MoM delta + top-model composition, then a separator.
 pub(crate) const COSTS_HEADER_ROWS: usize = 5;
 
 /// Header block above the Daily Costs breakdown: month-to-date spend,
@@ -1547,9 +1535,9 @@ pub(crate) const COSTS_HEADER_ROWS: usize = 5;
 /// top model contributors for the current month. Outlier callouts are
 /// surfaced inline as the user scrolls (not in the header) so the
 /// composition row stays readable.
-/// `today` is injected so the header math (MTD, forecast, MoM) is testable
-/// without reading the wall clock; the top-level draw function passes
-/// `chrono::Local::now().date_naive()` at the only production site.
+/// `today` is injected so the header math (this-month / forecast / MoM) is
+/// testable without reading the wall clock; the top-level draw function
+/// passes `chrono::Local::now().date_naive()` at the only production site.
 pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> Vec<Line<'static>> {
     use chrono::{Datelike, NaiveDate};
 
@@ -1607,18 +1595,18 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
     };
 
     let summary = vec![
-        Span::styled("  MTD ", Style::default().fg(theme::DIM)),
+        Span::styled("  this mo: ", Style::default().fg(theme::DIM)),
         Span::styled(
             super::format_cost(mtd_cost, 0),
             Style::default()
                 .fg(theme::PRIMARY)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · Forecast ", Style::default().fg(theme::DIM)),
+        Span::styled(" · forecast: ", Style::default().fg(theme::DIM)),
         Span::styled(super::format_cost(forecast, 0), cost_style(forecast)),
         Span::styled(
             format!(
-                " ({days_remaining}d left @ {}/d)  ",
+                " ({days_remaining}d left @ {}/day)  ",
                 super::format_cost(run_rate, 0)
             ),
             Style::default().fg(theme::DIM),
@@ -2018,7 +2006,7 @@ pub(crate) fn weekly_activity(state: &AppState) -> Vec<WeeklyBucket> {
 
 /// Append a month-summary divider line for the popup body. Same layout for
 /// the Daily Costs and Daily Activity detail popups: `── YY-MM  Nd  $cost
-/// tokens  avg $X/d ──...`. Width-aware trailing fill.
+/// tokens  avg $X/day ──...`. Width-aware trailing fill.
 fn push_month_divider_line(
     lines: &mut Vec<Line<'static>>,
     year: i32,
@@ -2030,7 +2018,7 @@ fn push_month_divider_line(
 ) {
     let avg_per_day = if days > 0 { cost / days as f64 } else { 0.0 };
     let label = format!(
-        "{:02}-{:02}  {}d  ${:.0}  {}  avg ${:.0}/d",
+        "{:02}-{:02}  {}d  ${:.0}  {}  avg ${:.0}/day",
         year % 100,
         month,
         days,
@@ -2122,7 +2110,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         _ => 0,
     };
     let items_per_screen = match state.dashboard_panel {
-        // Panel 0 reserves the top rows for the MTD/forecast/composition
+        // Panel 0 reserves the top rows for the this-month/forecast/composition
         // header; panel 5 likewise reserves rows for streak/dow header.
         0 => visible_height.saturating_sub(COSTS_HEADER_ROWS),
         1 => visible_height / 3,
@@ -2228,7 +2216,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
                     Span::styled(
-                        format!("{}({})", date, date.format("%a")),
+                        format!("{} ({})", date, date.format("%a")),
                         Style::default().fg(theme::LABEL_MUTED),
                     ),
                     Span::raw(" "),
@@ -3088,12 +3076,10 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     // resulting fraction is always full and carries no
                     // information; the share vs grand total appears in the
                     // summary line above, so suppress this column here.
-                    let pct: Option<u32> = if agg.is_builtin {
+                    let pct_str: Option<String> = if agg.is_builtin {
                         None
-                    } else if pct_denom > 0 {
-                        Some((agg.calls as f64 / pct_denom as f64 * 100.0) as u32)
                     } else {
-                        Some(0)
+                        Some(crate::text::format_pct(agg.calls as u64, pct_denom as u64))
                     };
                     let filled = (ratio * bar_width as f64).round() as usize;
                     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
@@ -3174,8 +3160,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             Style::default().fg(theme::LABEL_MUTED),
                         ),
                         Span::styled(
-                            match pct {
-                                Some(p) => format!(" {p:>2}%"),
+                            match &pct_str {
+                                Some(s) => format!(" {s:>3}"),
                                 None => "    ".to_string(),
                             },
                             Style::default().fg(theme::DIM),
@@ -3495,11 +3481,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     (90.0 + 90.0 * intensity) as u8,
                 );
                 let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
-                let pct = if total_usage > 0 {
-                    (count as f64 / total_usage as f64 * 100.0) as u32
-                } else {
-                    0
-                };
+                let pct_str = crate::text::format_pct(count as u64, total_usage as u64);
                 let name_label = truncate(&display_name, name_width);
                 let name_color = if is_known {
                     theme::LABEL_MUTED
@@ -3522,7 +3504,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         format!(" {count:>5}"),
                         Style::default().fg(theme::TEXT_BRIGHT),
                     ),
-                    Span::styled(format!(" {pct:>3}%"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {pct_str:>4}"), Style::default().fg(theme::DIM)),
                 ]));
 
                 if is_known
@@ -3703,7 +3685,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
                     Span::styled(
-                        format!("{}({})", date, date.format("%a")),
+                        format!("{} ({})", date, date.format("%a")),
                         Style::default().fg(theme::LABEL_MUTED),
                     ),
                     Span::raw(" "),
@@ -3856,7 +3838,7 @@ mod tests {
         assert!(text.contains("$706"));
         assert!(text.contains("2.24M"));
         // 706 / 3 = 235.33 → ${:.0} → 235
-        assert!(text.contains("avg $235/d"), "got: {text}");
+        assert!(text.contains("avg $235/day"), "got: {text}");
     }
 
     #[test]
@@ -3865,7 +3847,7 @@ mod tests {
         push_month_divider_line(&mut lines, 2026, 5, 0, 0.0, 0, 80);
         let text = line_text(&lines[0]);
         assert!(text.contains("0d"));
-        assert!(text.contains("avg $0/d"));
+        assert!(text.contains("avg $0/day"));
     }
 
     #[test]

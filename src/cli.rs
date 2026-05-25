@@ -49,8 +49,8 @@ pub fn show_daily_costs(limit: usize) {
         return;
     }
 
-    let cache = crate::infrastructure::Cache::load().ok();
-    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &cache);
+    let mut cache = crate::infrastructure::Cache::load().ok();
+    let daily_groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
     let calculator = CostCalculator::global();
 
     let use_color = std::io::stdout().is_terminal();

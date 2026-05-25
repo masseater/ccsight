@@ -15,12 +15,13 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-/// Idle-but-recently-touched window. A live session that hasn't completed a
-/// new message within this many seconds drops from "warm" (🟡) to "idle"
-/// (◎). 30 minutes covers a typical continuous work block (left a tab open
-/// while grabbing a coffee) without dragging in sessions left open
-/// overnight. Single source of truth for the sort tier and the row glyph.
-pub const WARM_THRESHOLD_SECS: i64 = 30 * 60;
+/// True when `t` falls on the same local-calendar date as `now`. Used by
+/// the live-session sort tier and the row glyph (`◉` today vs `○` older).
+/// Local timezone matches the user's mental model — "did I work on this
+/// today?" means today in their wall clock, not UTC.
+pub fn is_today(t: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    t.with_timezone(&chrono::Local).date_naive() == now.with_timezone(&chrono::Local).date_naive()
+}
 
 /// Per-process metadata as written by Claude Code into
 /// `~/.claude/sessions/<pid>.json`. Field names match the JSON schema; some
@@ -172,16 +173,19 @@ pub fn discover_live() -> Vec<LiveSession> {
             was_recently_live: false,
         });
     }
-    // Tier 1: status — busy first, then "warm" (idle but recently touched),
-    // then long-idle. Tier 2: age descending within each tier.
+    // Tier 1: status — busy first, then today (touched today), then older.
+    // Tier 2: age descending within each tier.
     let zero_ts = DateTime::<Utc>::UNIX_EPOCH;
     let now = chrono::Utc::now();
-    let warm_threshold = chrono::Duration::seconds(WARM_THRESHOLD_SECS);
     out.sort_by_key(|s| {
-        let ts = s.updated_at.or(s.started_at).unwrap_or(zero_ts);
+        let ts = s
+            .jsonl_mtime
+            .or(s.updated_at)
+            .or(s.started_at)
+            .unwrap_or(zero_ts);
         let tier: u8 = if s.status.as_deref() == Some("busy") {
             0
-        } else if (now - ts) < warm_threshold {
+        } else if is_today(ts, now) {
             1
         } else {
             2
@@ -280,32 +284,19 @@ pub fn discover_recently_paused(
 pub fn mark_was_recently_live(
     paused: &mut [LiveSession],
     snapshot: &super::live_snapshot::LiveSnapshot,
-    app_start_time: DateTime<Utc>,
+    prior_run_anchor: Option<DateTime<Utc>>,
 ) {
-    // "From last ccsight run" means alive at the END of the most recent
-    // prior run — not "alive in any past run". Each `refresh()` stamps
-    // currently-alive sessions with the same `now`, so the final poll's
-    // `now` is reflected as the maximum `last_seen` across the snapshot.
-    // Sessions sharing that timestamp (within a small tolerance) were the
-    // surviving-alive set at run end; older `last_seen` values came from
-    // either earlier runs or mid-run deaths.
-    let Some(max_last_seen) = snapshot
-        .sessions
-        .values()
-        .filter(|e| e.last_seen < app_start_time)
-        .map(|e| e.last_seen)
-        .max()
-    else {
+    // Anchor = prior ccsight run's last `refresh()` moment. Sessions alive
+    // at that poll share that exact timestamp; mid-prior-run deaths keep
+    // their earlier stamp and fall outside the 1s tolerance window.
+    let Some(anchor) = prior_run_anchor else {
         return;
     };
-    // Tolerance covers graceful-shutdown skew where the final poll's stamp
-    // can land a few seconds apart across rapid concurrent updates.
-    let cluster_window = chrono::Duration::seconds(60);
-    let cluster_floor = max_last_seen - cluster_window;
+    let cluster_floor = anchor - chrono::Duration::seconds(1);
 
     for entry in paused.iter_mut() {
         if let Some(snap_entry) = snapshot.sessions.get(&entry.session_id) {
-            if snap_entry.last_seen >= cluster_floor && snap_entry.last_seen < app_start_time {
+            if snap_entry.last_seen >= cluster_floor && snap_entry.last_seen <= anchor {
                 entry.was_recently_live = true;
                 // Stamp `updated_at` with the snapshot's `last_seen` so the
                 // row age reflects "when ccsight last saw this alive".
@@ -365,10 +356,9 @@ mod tests {
                 name: None,
             },
         );
-        // App started 60s ago; the snapshot stamp is 120s ago (= prior run).
-        let app_start_time = Utc::now() - chrono::Duration::seconds(60);
+        let anchor = snap.prior_run_anchor();
 
-        mark_was_recently_live(&mut paused_list, &snap, app_start_time);
+        mark_was_recently_live(&mut paused_list, &snap, anchor);
 
         assert_eq!(paused_list[0].session_id, "in_snapshot");
         assert!(paused_list[0].was_recently_live);
@@ -377,14 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn mark_skips_entries_stamped_during_current_run() {
-        // Manual-kill case: the snapshot has an entry, but it was stamped
-        // by the current ccsight run (last_seen > app_start_time). That
-        // means ccsight observed this session alive then watched it
-        // disappear — not a `⟳` candidate.
+    fn mark_skips_entries_stamped_after_prior_anchor() {
+        // Manual-kill case: snapshot has an entry whose stamp is *newer*
+        // than the prior run's heartbeat (= would have been stamped during
+        // the current run if marking were re-derived). Anchor is fixed at
+        // the prior heartbeat — the entry sits outside the cluster.
         let mut paused_list = vec![paused("manually_closed", 30, false)];
         let mut snap = super::super::live_snapshot::LiveSnapshot::default();
-        let app_start_time = Utc::now() - chrono::Duration::seconds(120);
+        snap.last_refresh_at = Some(Utc::now() - chrono::Duration::seconds(120));
         snap.sessions.insert(
             "manually_closed".to_string(),
             super::super::live_snapshot::SnapshotEntry {
@@ -395,10 +385,11 @@ mod tests {
                 name: None,
             },
         );
-        mark_was_recently_live(&mut paused_list, &snap, app_start_time);
+        let anchor = snap.prior_run_anchor();
+        mark_was_recently_live(&mut paused_list, &snap, anchor);
         assert!(
             !paused_list[0].was_recently_live,
-            "session stamped within current run must not be flagged ⟳"
+            "session stamped after the prior heartbeat must not be flagged ⟳"
         );
     }
 
@@ -434,10 +425,11 @@ mod tests {
             },
         );
 
-        mark_was_recently_live(&mut paused_list, &snap, app_start);
+        let anchor = snap.prior_run_anchor();
+        mark_was_recently_live(&mut paused_list, &snap, anchor);
 
-        // recent (matches max_last_seen) → flagged.
-        // old (3h ago, outside the 60s cluster window) → not flagged.
+        // recent (matches anchor) → flagged.
+        // old (3h ago, outside the cluster window) → not flagged.
         let recent = paused_list
             .iter()
             .find(|p| p.session_id == "recent")
@@ -445,19 +437,137 @@ mod tests {
         let old = paused_list.iter().find(|p| p.session_id == "old").unwrap();
         assert!(
             recent.was_recently_live,
-            "session at max_last_seen should be flagged ⟳"
+            "session at anchor should be flagged ⟳"
         );
         assert!(
             !old.was_recently_live,
-            "session from an older run (last_seen ≠ max_last_seen) must not be flagged ⟳"
+            "session from an older run (last_seen outside anchor cluster) must not be flagged ⟳"
         );
     }
 
     #[test]
-    fn warm_threshold_is_thirty_minutes() {
-        // Single source of truth: glyph + sort tier read from this constant.
-        // If someone bumps it without updating the help-popup legend, this
-        // test keeps the values aligned.
-        assert_eq!(WARM_THRESHOLD_SECS, 30 * 60);
+    fn mark_excludes_sessions_that_died_one_poll_before_exit() {
+        // A session stamped one poll-cycle before exit (mid-run death) must
+        // not enter the cluster — only sessions on the anchor itself count
+        // as "alive at exit".
+        let mut paused_list = vec![
+            paused("survivor", 1, false),
+            paused("died_mid_run", 1, false),
+        ];
+        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
+        let app_start = Utc::now();
+        let final_poll = app_start - chrono::Duration::seconds(120);
+        let previous_poll = final_poll - chrono::Duration::seconds(5);
+        snap.sessions.insert(
+            "survivor".to_string(),
+            super::super::live_snapshot::SnapshotEntry {
+                session_id: "survivor".to_string(),
+                last_seen: final_poll,
+                cwd: PathBuf::from("/tmp"),
+                jsonl_path: Some(PathBuf::from("/tmp/survivor.jsonl")),
+                name: None,
+            },
+        );
+        snap.sessions.insert(
+            "died_mid_run".to_string(),
+            super::super::live_snapshot::SnapshotEntry {
+                session_id: "died_mid_run".to_string(),
+                last_seen: previous_poll,
+                cwd: PathBuf::from("/tmp"),
+                jsonl_path: Some(PathBuf::from("/tmp/died.jsonl")),
+                name: None,
+            },
+        );
+
+        let anchor = snap.prior_run_anchor();
+        mark_was_recently_live(&mut paused_list, &snap, anchor);
+
+        let survivor = paused_list
+            .iter()
+            .find(|p| p.session_id == "survivor")
+            .unwrap();
+        let died = paused_list
+            .iter()
+            .find(|p| p.session_id == "died_mid_run")
+            .unwrap();
+        assert!(survivor.was_recently_live);
+        assert!(
+            !died.was_recently_live,
+            "died_mid_run must not be flagged — was stamped 5s before the final poll"
+        );
+    }
+
+    #[test]
+    fn recomputing_anchor_after_refresh_corrupts_marking() {
+        // Pin the anti-pattern: callers must capture the anchor at boot
+        // (into `AppState::prior_run_last_refresh`) and never re-derive it
+        // mid-run. After the polling thread's `refresh()`, the snapshot's
+        // `last_refresh_at` jumps to the current run, so a recomputed
+        // anchor sits on current-run time — every prior session falls out
+        // of the cluster and silently loses its `⟳`.
+        let prior_exit = Utc::now() - chrono::Duration::minutes(30);
+        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
+        snap.last_refresh_at = Some(prior_exit);
+        snap.sessions.insert(
+            "alive_at_prior_exit".to_string(),
+            super::super::live_snapshot::SnapshotEntry {
+                session_id: "alive_at_prior_exit".to_string(),
+                last_seen: prior_exit,
+                cwd: PathBuf::from("/tmp"),
+                jsonl_path: Some(PathBuf::from("/tmp/alive.jsonl")),
+                name: None,
+            },
+        );
+
+        let frozen_anchor = snap.prior_run_anchor();
+        assert_eq!(frozen_anchor, Some(prior_exit));
+
+        snap.refresh(&[]);
+        // `prior_run_anchor()`'s primary path needs `last_refresh_at < Utc::now()`.
+        // On low-resolution clocks under parallel test load, the back-to-back
+        // `now()` calls in refresh + prior_run_anchor can land on the same
+        // microsecond, dropping to the fallback. A 1ms sleep gives the clock
+        // room to advance so the anti-pattern reliably surfaces.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let stale_anchor = snap.prior_run_anchor();
+        assert_ne!(
+            stale_anchor, frozen_anchor,
+            "refresh must visibly move the (incorrectly) recomputed anchor"
+        );
+
+        // Frozen anchor → session correctly flagged ⟳.
+        let mut paused_frozen = vec![paused("alive_at_prior_exit", 30, false)];
+        mark_was_recently_live(&mut paused_frozen, &snap, frozen_anchor);
+        assert!(
+            paused_frozen[0].was_recently_live,
+            "frozen anchor flags the prior-exit-alive session"
+        );
+
+        // Stale anchor → marker silently dropped (the bug we prevent).
+        let mut paused_stale = vec![paused("alive_at_prior_exit", 30, false)];
+        mark_was_recently_live(&mut paused_stale, &snap, stale_anchor);
+        assert!(
+            !paused_stale[0].was_recently_live,
+            "stale anchor sits on the current run and drops the marker"
+        );
+    }
+
+    #[test]
+    fn is_today_uses_local_calendar_date() {
+        use chrono::{Local, TimeZone};
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 22, 14, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let same_morning = Local
+            .with_ymd_and_hms(2026, 5, 22, 0, 30, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let yesterday_late = Local
+            .with_ymd_and_hms(2026, 5, 21, 23, 59, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(super::is_today(same_morning, now));
+        assert!(!super::is_today(yesterday_late, now));
     }
 }

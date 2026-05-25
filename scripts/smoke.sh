@@ -10,7 +10,7 @@
 #
 # Watch the captures for: rightmost column truncation, popup borders without
 # `border_style`, `▼/▶` arrow inversion, "Searching..." stuck after Enter,
-# Live row glyphs (🟢/🟡/◎/⏸/⟳) reflecting actual session state.
+# Live row glyphs (🟢/◉/○/⏸/⟳) reflecting actual session state.
 
 set -e
 
@@ -41,7 +41,7 @@ tmux send-keys -t ccsight_smoke 'p' && sleep 0.5 && tmux send-keys -t ccsight_sm
 
 # Live tab → session navigation + info popup.
 # Captures cover: tab badge format, 3-line row layout, glyph palette
-# (🟢/🟡/◎/⏸/⟳), `[i]` button, session detail popup (PID line).
+# (🟢/◉/○/⏸/⟳), `[i]` button, session detail popup (PID line).
 tmux send-keys -t ccsight_smoke '2' && sleep 1
 tmux capture-pane -t ccsight_smoke -p > /tmp/ccsight_live.txt
 tmux send-keys -t ccsight_smoke 'j' && sleep 0.3  # move cursor down

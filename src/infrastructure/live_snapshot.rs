@@ -3,16 +3,16 @@
 //! After a host restart kills every Claude Code process, the
 //! `~/.claude/sessions/<pid>.json` files may or may not survive. This file
 //! is our own backup record: every poll, we refresh the snapshot with the
-//! currently-alive set (session_id, cwd, jsonl path, name, last_seen). Next
-//! time ccsight starts:
+//! currently-alive set (session_id, cwd, jsonl path, name, last_seen) and
+//! stamp `last_refresh_at` as the run's heartbeat. Next time ccsight starts,
+//! the prior run's heartbeat anchors the `⟳` cluster check:
 //!
-//! 1. Paused entries whose `session_id` is in the snapshot get a `⟳` glyph
-//!    so "I had this open before the reboot" is visible at a glance.
-//! 2. Sessions in the snapshot whose JSONL is older than the paused-window
-//!    (e.g. touched Friday afternoon, looking at it Monday) get pulled back
-//!    into the paused list anyway via `recover_missing` — the snapshot
-//!    knows the cwd / jsonl_path so we don't lose them just because their
-//!    mtime fell out of the 24h JSONL scan.
+//! 1. Paused entries stamped in the prior run's final-poll cluster
+//!    (`last_seen` within 1s of `last_refresh_at`) get a `⟳` glyph.
+//! 2. Snapshot entries in that same cluster whose JSONL fell outside the
+//!    24h paused scan (Friday→Monday case) are pulled back via
+//!    `recover_missing` — the snapshot knows cwd / jsonl_path so we don't
+//!    lose them just because mtime aged out.
 //!
 //! Retention: 30d. Covers most long holidays (golden week, year-end) plus
 //! buffer. File size stays well under 100KB for typical usage.
@@ -42,6 +42,13 @@ pub struct LiveSnapshot {
     /// duplicates collapse to the most-recent observation.
     #[serde(default)]
     pub sessions: HashMap<String, SnapshotEntry>,
+    /// Wall-clock moment of the most recent `refresh()`. Read at the next
+    /// ccsight startup as "the prior run's last heartbeat" — the authoritative
+    /// anchor for the `⟳` cluster check (cannot be inferred from session
+    /// stamps alone, since mid-run deaths leave orphan stamps).
+    /// `Option` is for backward-compat with snapshots predating this field.
+    #[serde(default)]
+    pub last_refresh_at: Option<DateTime<Utc>>,
 }
 
 impl LiveSnapshot {
@@ -97,14 +104,10 @@ impl LiveSnapshot {
         Ok(())
     }
 
-    /// Stamp every alive session with `now`, then drop entries older than
-    /// 30d so the file stays bounded. The "abruptly lost vs user-closed"
-    /// distinction lives in the caller: `mark_was_recently_live` and
-    /// `recover_missing` compare each entry's `last_seen` against the
-    /// current ccsight run's start time, so manual-kill detection works
-    /// without pruning observed-dead entries here. Keeping dead entries
-    /// preserves the `⟳` flag for the entire current run instead of
-    /// expiring it after the first poll cycle.
+    /// Stamp alive sessions with `now`, set `last_refresh_at`, prune
+    /// entries older than 30d. Dead entries stay so the next run's anchor
+    /// check (`mark_was_recently_live` / `recover_missing`) can compare
+    /// their `last_seen` against the frozen heartbeat.
     pub fn refresh(&mut self, alive: &[LiveSession]) {
         let now = Utc::now();
         for s in alive {
@@ -121,6 +124,31 @@ impl LiveSnapshot {
         }
         let cutoff = now - chrono::Duration::days(30);
         self.sessions.retain(|_, e| e.last_seen >= cutoff);
+        self.last_refresh_at = Some(now);
+    }
+
+    /// Cluster anchor for `mark_was_recently_live` / `recover_missing`.
+    /// Prefers `last_refresh_at`; falls back to `max(last_seen)` when the
+    /// field is absent (old-format snapshot). The fallback is best-effort
+    /// — it can pick up an orphan mid-run-death stamp — and exists so a
+    /// post-upgrade first run still surfaces `⟳` markers.
+    ///
+    /// Must be called at boot only; the result is frozen into
+    /// `AppState::prior_run_last_refresh`. Recomputing mid-run after the
+    /// polling thread's `refresh()` returns a value from the *current*
+    /// run instead — see the anti-pattern test in `live_sessions::tests`.
+    pub fn prior_run_anchor(&self) -> Option<DateTime<Utc>> {
+        let now = Utc::now();
+        if let Some(t) = self.last_refresh_at
+            && t < now
+        {
+            return Some(t);
+        }
+        self.sessions
+            .values()
+            .filter(|e| e.last_seen < now)
+            .map(|e| e.last_seen)
+            .max()
     }
 
     /// Build pseudo-paused `LiveSession` entries from snapshot rows whose
@@ -132,17 +160,20 @@ impl LiveSnapshot {
         &self,
         active_ids: &HashSet<String>,
         paused_ids: &HashSet<String>,
-        app_start_time: DateTime<Utc>,
+        prior_run_anchor: Option<DateTime<Utc>>,
     ) -> Vec<LiveSession> {
+        // Anchor must be frozen by the caller (AppState) at boot; otherwise
+        // an in-run refresh would drag the cluster forward and expire ⟳.
+        let Some(anchor) = prior_run_anchor else {
+            return Vec::new();
+        };
+        let cluster_floor = anchor - chrono::Duration::seconds(1);
         let mut out = Vec::new();
         for entry in self.sessions.values() {
             if active_ids.contains(&entry.session_id) || paused_ids.contains(&entry.session_id) {
                 continue;
             }
-            // Same filter as `mark_was_recently_live`: only entries
-            // stamped before the current run survive a previous ccsight
-            // session and qualify as `⟳`.
-            if entry.last_seen >= app_start_time {
+            if entry.last_seen < cluster_floor || entry.last_seen > anchor {
                 continue;
             }
             let Some(jsonl) = entry.jsonl_path.as_ref() else {
@@ -262,10 +293,8 @@ mod tests {
 
         let active = std::collections::HashSet::new();
         let paused = std::collections::HashSet::new();
-        // Snapshot entries are stamped 120s ago; treat the current run as
-        // having started 60s ago so they qualify as "from a prior run".
-        let app_start_time = Utc::now() - chrono::Duration::seconds(60);
-        let recovered = snap.recover_missing(&active, &paused, app_start_time);
+        let anchor = snap.prior_run_anchor();
+        let recovered = snap.recover_missing(&active, &paused, anchor);
 
         assert_eq!(
             recovered.len(),
@@ -276,6 +305,179 @@ mod tests {
         assert!(recovered[0].was_recently_live);
 
         let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn recover_missing_only_pulls_in_latest_run_cluster() {
+        // Regression: prior to the cluster filter, `recover_missing` pulled
+        // in *every* snapshot row whose `last_seen < app_start_time`. With a
+        // long-lived snapshot containing entries from multiple historical
+        // runs, that meant week-old sessions reappeared as `⟳ from last
+        // ccsight run` even though the most recent prior run never saw them.
+        let tmpdir =
+            std::env::temp_dir().join(format!("ccsight_snap_cluster_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let recent = tmpdir.join("recent.jsonl");
+        let old = tmpdir.join("old.jsonl");
+        std::fs::write(&recent, b"{}").unwrap();
+        std::fs::write(&old, b"{}").unwrap();
+
+        let mut snap = LiveSnapshot::default();
+        // Most recent prior run's final poll = -120s.
+        snap.sessions.insert(
+            "recent".to_string(),
+            SnapshotEntry {
+                session_id: "recent".to_string(),
+                last_seen: Utc::now() - chrono::Duration::seconds(120),
+                cwd: tmpdir.clone(),
+                jsonl_path: Some(recent.clone()),
+                name: None,
+            },
+        );
+        // Older run, hours earlier. Even though its JSONL is still on disk
+        // and `last_seen < app_start_time`, it does NOT belong to "the
+        // last ccsight run".
+        snap.sessions.insert(
+            "old_run".to_string(),
+            SnapshotEntry {
+                session_id: "old_run".to_string(),
+                last_seen: Utc::now() - chrono::Duration::hours(6),
+                cwd: tmpdir.clone(),
+                jsonl_path: Some(old.clone()),
+                name: None,
+            },
+        );
+
+        let active = std::collections::HashSet::new();
+        let paused = std::collections::HashSet::new();
+        let anchor = snap.prior_run_anchor();
+        let recovered = snap.recover_missing(&active, &paused, anchor);
+
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the latest prior run's cluster should be recovered"
+        );
+        assert_eq!(recovered[0].session_id, "recent");
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn recover_missing_uses_last_refresh_at_when_present() {
+        // Distinguishes the primary path from the fallback. Setup: prior
+        // ccsight exited at T0 with NO sessions alive — only a mid-run
+        // death orphan remains in the snapshot. `last_refresh_at = T0`
+        // anchors the cluster on T0, so the orphan must NOT be recovered.
+        // (Fallback would anchor on the orphan stamp and wrongly pull it
+        // back; this test pins that the primary path takes precedence.)
+        let tmpdir =
+            std::env::temp_dir().join(format!("ccsight_snap_primary_path_{}", std::process::id()));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let orphan_jsonl = tmpdir.join("orphan.jsonl");
+        std::fs::write(&orphan_jsonl, b"{}").unwrap();
+
+        let mut snap = LiveSnapshot::default();
+        let prior_exit = Utc::now() - chrono::Duration::seconds(120);
+        let mid_death = prior_exit - chrono::Duration::minutes(20);
+        snap.last_refresh_at = Some(prior_exit);
+        snap.sessions.insert(
+            "orphan".to_string(),
+            SnapshotEntry {
+                session_id: "orphan".to_string(),
+                last_seen: mid_death,
+                cwd: tmpdir.clone(),
+                jsonl_path: Some(orphan_jsonl.clone()),
+                name: None,
+            },
+        );
+
+        let active = std::collections::HashSet::new();
+        let paused = std::collections::HashSet::new();
+        let anchor = snap.prior_run_anchor();
+        assert_eq!(anchor, Some(prior_exit));
+        let recovered = snap.recover_missing(&active, &paused, anchor);
+        assert!(
+            recovered.is_empty(),
+            "orphan mid-run-death must NOT be recovered when last_refresh_at anchors elsewhere"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn prior_run_anchor_prefers_last_refresh_at_over_max_heuristic() {
+        // Two prior sessions: a survivor stamped at prior exit, and a
+        // mid-run-death stamped 22m earlier. Anchor must follow
+        // `last_refresh_at`, not `max(last_seen)`, otherwise the mid-run
+        // death gets mistaken for the exit cluster.
+        let mut snap = LiveSnapshot::default();
+        let prior_exit = Utc::now() - chrono::Duration::minutes(60);
+        let mid_run_death = prior_exit - chrono::Duration::minutes(22);
+        snap.last_refresh_at = Some(prior_exit);
+        // Survivor stamped at the actual prior exit moment.
+        snap.sessions.insert(
+            "survivor".to_string(),
+            SnapshotEntry {
+                session_id: "survivor".to_string(),
+                last_seen: prior_exit,
+                cwd: PathBuf::from("/tmp"),
+                jsonl_path: Some(PathBuf::from("/tmp/survivor.jsonl")),
+                name: None,
+            },
+        );
+        // Mid-run death — last stamped 22m before prior run ended.
+        snap.sessions.insert(
+            "mid_run_death".to_string(),
+            SnapshotEntry {
+                session_id: "mid_run_death".to_string(),
+                last_seen: mid_run_death,
+                cwd: PathBuf::from("/tmp"),
+                jsonl_path: Some(PathBuf::from("/tmp/mid.jsonl")),
+                name: None,
+            },
+        );
+        let anchor = snap.prior_run_anchor();
+        assert_eq!(
+            anchor,
+            Some(prior_exit),
+            "anchor must come from last_refresh_at, not max(last_seen)"
+        );
+    }
+
+    #[test]
+    fn prior_run_anchor_falls_back_to_max_when_field_absent() {
+        // Old-format snapshot path: `last_refresh_at == None` triggers the
+        // max-stamp-below-app-start fallback so the post-upgrade first run
+        // still surfaces some ⟳ markers.
+        let mut snap = LiveSnapshot::default();
+        snap.last_refresh_at = None;
+        let stamp = Utc::now() - chrono::Duration::minutes(10);
+        snap.sessions.insert(
+            "any".to_string(),
+            SnapshotEntry {
+                session_id: "any".to_string(),
+                last_seen: stamp,
+                cwd: PathBuf::from("/tmp"),
+                jsonl_path: None,
+                name: None,
+            },
+        );
+        let anchor = snap.prior_run_anchor();
+        assert_eq!(anchor, Some(stamp));
+    }
+
+    #[test]
+    fn refresh_writes_last_refresh_at() {
+        // Each refresh must stamp the field so the next ccsight process
+        // reads an authoritative anchor instead of degrading to the fallback.
+        let mut snap = LiveSnapshot::default();
+        assert!(snap.last_refresh_at.is_none());
+        let before = Utc::now();
+        snap.refresh(&[]);
+        let after = Utc::now();
+        let t = snap.last_refresh_at.expect("refresh must populate field");
+        assert!(t >= before && t <= after);
     }
 
     #[cfg(unix)]

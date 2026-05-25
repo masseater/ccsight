@@ -1099,7 +1099,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     frame,
                     area,
                     session,
-                    " Space:pin  s:summary  r:regen  ↑↓:scroll  i/Esc:close ",
+                    " Space: pin  s: summary  r: regen  ↑↓: scroll  i/Esc: close ",
                     pinned,
                     state.session_detail_scroll,
                     &state.project_labels,
@@ -1482,26 +1482,20 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     // Active section. Mirror the paused header layout: bold "(N)" count
     // followed by a dim status breakdown. Same precedence as
-    // `render_live_row` glyph selection (busy → warm → idle) so the row
+    // `render_live_row` glyph selection (busy → today → older) so the row
     // glyphs and the header counts can never disagree.
-    let warm_threshold_secs = crate::infrastructure::live_sessions::WARM_THRESHOLD_SECS;
     let mut busy_n = 0usize;
-    let mut warm_n = 0usize;
-    let mut idle_n = 0usize;
+    let mut today_n = 0usize;
+    let mut older_n = 0usize;
     for s in &active_visible {
         if s.status.as_deref() == Some("busy") {
             busy_n += 1;
         } else {
-            let last = s
-                .updated_at
-                .or(s.jsonl_mtime)
-                .or(s.started_at)
-                .unwrap_or(now);
-            let secs = (now - last).num_seconds().max(0);
-            if secs < warm_threshold_secs {
-                warm_n += 1;
+            let last = live_session_last_activity(state, s, now);
+            if crate::infrastructure::live_sessions::is_today(last, now) {
+                today_n += 1;
             } else {
-                idle_n += 1;
+                older_n += 1;
             }
         }
     }
@@ -1513,7 +1507,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     )];
     if !active_visible.is_empty() {
         active_header.push(Span::styled(
-            format!("🟢 {busy_n} busy · 🟡 {warm_n} warm · ◎ {idle_n} idle"),
+            format!("🟢 {busy_n} busy · ◉ {today_n} today · ○ {older_n} older"),
             Style::default().fg(theme::DIM),
         ));
     }
@@ -1638,7 +1632,7 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // When the cursor lands on the first row, snap to the very top so the
     // section header and its status-count subtitle stay visible — without
     // this, returning to row 1 from a scrolled state would only reveal the
-    // row and leave the bold "Active now (N) · 🟢/🟡/◎" line hidden above.
+    // row and leave the bold "Active now (N) · 🟢/◉/○" line hidden above.
     state.live_scroll = if state.live_selected == 0 {
         0
     } else if selected_first_line < scroll {
@@ -1701,18 +1695,78 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
     );
 }
 
+/// Compact "start → last" range string for a Live row. Today-only ranges
+/// drop the date prefix to stay narrow; cross-day ranges keep both dates so
+/// the boundary isn't hidden behind a time-only display.
+fn format_session_range(
+    start: chrono::DateTime<chrono::Utc>,
+    last: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let start_local = start.with_timezone(&chrono::Local);
+    let last_local = last.with_timezone(&chrono::Local);
+    let today = now.with_timezone(&chrono::Local).date_naive();
+    let s_date = start_local.date_naive();
+    let l_date = last_local.date_naive();
+    if s_date == l_date {
+        if s_date == today {
+            format!(
+                "[{}–{}]",
+                start_local.format("%H:%M"),
+                last_local.format("%H:%M")
+            )
+        } else {
+            format!(
+                "[{} {}–{}]",
+                s_date.format("%m-%d"),
+                start_local.format("%H:%M"),
+                last_local.format("%H:%M")
+            )
+        }
+    } else {
+        format!(
+            "[{} {}–{} {}]",
+            s_date.format("%m-%d"),
+            start_local.format("%H:%M"),
+            l_date.format("%m-%d"),
+            last_local.format("%H:%M")
+        )
+    }
+}
+
+/// Resolve a live session's "last activity" timestamp. Prefers the JSONL's
+/// last conversation entry (via daily_groups lookup) over filesystem mtime
+/// or the pid file's heartbeat, both of which can run ahead when claude
+/// rewrites metadata (`ai-title`) or the user resumes without sending a
+/// message.
+fn live_session_last_activity(
+    state: &AppState,
+    s: &crate::infrastructure::live_sessions::LiveSession,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let meta_last = s.jsonl_path.as_ref().and_then(|target| {
+        state
+            .original_daily_groups
+            .iter()
+            .find_map(|g| g.sessions.iter().find(|sess| &sess.file_path == target))
+            .map(|sess| sess.day_last_timestamp)
+    });
+    meta_last
+        .or(s.updated_at)
+        .or(s.jsonl_mtime)
+        .or(s.started_at)
+        .unwrap_or(now)
+}
+
 /// Compact age string for live-session list rows (4-6 chars wide). Used in
 /// both the Live tab and the conv-view session list so the same session
 /// reads the same length in both surfaces.
 fn short_age(
+    state: &AppState,
     s: &crate::infrastructure::live_sessions::LiveSession,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
-    let last = s
-        .updated_at
-        .or(s.jsonl_mtime)
-        .or(s.started_at)
-        .unwrap_or(now);
+    let last = live_session_last_activity(state, s, now);
     let secs = (now - last).num_seconds().max(0);
     // Match `render_live_row`: sub-minute resolution would lie about
     // freshness because the underlying poll only fires every few seconds.
@@ -1741,20 +1795,20 @@ fn render_live_row<'a>(
     row_inner_width: usize,
     row_idx: usize,
 ) -> [Line<'a>; 3] {
-    let last = s
-        .updated_at
-        .or(s.jsonl_mtime)
-        .or(s.started_at)
-        .unwrap_or(now);
+    let session_meta = s.jsonl_path.as_ref().and_then(|target| {
+        state
+            .original_daily_groups
+            .iter()
+            .find_map(|g| g.sessions.iter().find(|sess| &sess.file_path == target))
+    });
+    let last = live_session_last_activity(state, s, now);
     let secs = (now - last).num_seconds().max(0);
 
-    // Active section: three tiers — busy / warm / idle. Threshold lives in
-    // `infrastructure::live_sessions::WARM_THRESHOLD_SECS` so the glyph
-    // boundary and the sort tier never drift apart.
+    // Active section: three tiers — busy / today / older. `is_today` is the
+    // single source of truth shared with the sort logic in `discover_live`.
     // Paused section: `⟳` flags rows that were alive when ccsight last saw
     // them (snapshot match), helping post-restart users find the windows
     // they had open before the reboot.
-    let warm_threshold_secs = crate::infrastructure::live_sessions::WARM_THRESHOLD_SECS;
     let (glyph, glyph_color) = if !is_active_section {
         if s.was_recently_live {
             ("⟳ ", theme::ACCENT)
@@ -1763,15 +1817,15 @@ fn render_live_row<'a>(
         }
     } else if s.status.as_deref() == Some("busy") {
         ("🟢", theme::SUCCESS)
-    } else if secs < warm_threshold_secs {
-        ("🟡", theme::WARNING)
+    } else if crate::infrastructure::live_sessions::is_today(last, now) {
+        ("◉ ", theme::WARNING)
     } else {
-        ("◎ ", theme::LABEL_MUTED)
+        ("○ ", theme::LABEL_MUTED)
     };
     // Polling cadence is coarser than 1s; collapse sub-minute to fixed.
-    // Same age format across all status tiers (busy/warm/idle/paused) so a
-    // 🟢 row and a 🟡 row read the same way — the glyph carries the
-    // status, the age column carries "time since the last JSONL update".
+    // Glyph carries the staleness tier (busy / today / older / paused); the
+    // age column carries "time since the last conversation entry"
+    // (see `live_session_last_activity` for the source precedence).
     let age = if secs < 60 {
         "just now".to_string()
     } else if secs < 3600 {
@@ -1784,16 +1838,6 @@ fn render_live_row<'a>(
 
     let cwd_str = s.cwd.to_string_lossy().to_string();
     let project_label = state.project_label(&cwd_str);
-    let short_id: String = s.session_id.chars().take(8).collect();
-
-    // One lookup pulls everything else (title / branch / tokens / cost /
-    // model / continued / pinned).
-    let session_meta = s.jsonl_path.as_ref().and_then(|target| {
-        state
-            .original_daily_groups
-            .iter()
-            .find_map(|g| g.sessions.iter().find(|sess| &sess.file_path == target))
-    });
 
     let title_from_meta = session_meta.and_then(|m| {
         m.ai_title
@@ -1908,6 +1952,16 @@ fn render_live_row<'a>(
         format!(" {age:>9}  "),
         Style::default().fg(theme::DIM),
     ));
+    // "Started → last" range from the JSONL's first entry to the most recent
+    // observable activity. Only shown when daily_groups can resolve the
+    // session (paused rows recovered via snapshot won't have a meta entry).
+    if let Some(meta) = session_meta {
+        let range = format_session_range(meta.session_first_timestamp, last, now);
+        line1_spans.push(Span::styled(
+            format!("{range}  "),
+            Style::default().fg(theme::LABEL_MUTED),
+        ));
+    }
     line1_spans.push(Span::styled(
         project_label.clone(),
         Style::default().fg(theme::WARM),
@@ -1926,24 +1980,52 @@ fn render_live_row<'a>(
         format!(" {cost_str}"),
         cost_style(session_cost),
     ));
-    if let Some(ms) = model_short {
-        line1_spans.push(Span::styled(
-            format!(" [{ms}]"),
-            Style::default().fg(model_clr),
-        ));
-    }
-    line1_spans.push(Span::styled(
-        format!("  {short_id}…"),
-        Style::default().fg(theme::LABEL_MUTED),
-    ));
-
-    // Pad + `[i]` button: matches Daily's right-aligned 3-cell mouse target.
+    // Model badge is the lowest-priority trailing element — drop it
+    // entirely on rows so tight that even `[i]` would otherwise be clipped.
     let info_btn_width = 3usize;
-    let content_width: usize = line1_spans
+    let pre_model_width: usize = line1_spans
         .iter()
         .map(|sp| unicode_width::UnicodeWidthStr::width(sp.content.as_ref()))
         .sum();
-    let pad = row_inner_width.saturating_sub(content_width + info_btn_width);
+    if let Some(ms) = model_short {
+        let badge = format!(" [{ms}]");
+        let badge_w = unicode_width::UnicodeWidthStr::width(badge.as_str());
+        if pre_model_width + badge_w + info_btn_width <= row_inner_width {
+            line1_spans.push(Span::styled(badge, Style::default().fg(model_clr)));
+        }
+    }
+    // Reserve 3 cols for `[i]` and ≥1 col of separation; the session_id
+    // column flexes to whatever's left so the action button always stays
+    // visible even when projects / titles eat the row. When even a single-
+    // char id won't fit, drop the id span entirely.
+    let prefix_width: usize = line1_spans
+        .iter()
+        .map(|sp| unicode_width::UnicodeWidthStr::width(sp.content.as_ref()))
+        .sum();
+    let id_budget = row_inner_width.saturating_sub(prefix_width + info_btn_width + 3);
+    let id_chars = s.session_id.chars().count();
+    let id_width = if id_budget == 0 {
+        0
+    } else if id_chars <= id_budget {
+        let display = s.session_id.clone();
+        let width = unicode_width::UnicodeWidthStr::width(display.as_str());
+        line1_spans.push(Span::styled(
+            format!("  {display}"),
+            Style::default().fg(theme::LABEL_MUTED),
+        ));
+        width + 2
+    } else {
+        let truncate_to = id_budget.saturating_sub(1).max(1);
+        let mut display: String = s.session_id.chars().take(truncate_to).collect();
+        display.push('…');
+        let width = unicode_width::UnicodeWidthStr::width(display.as_str());
+        line1_spans.push(Span::styled(
+            format!("  {display}"),
+            Style::default().fg(theme::LABEL_MUTED),
+        ));
+        width + 2
+    };
+    let pad = row_inner_width.saturating_sub(prefix_width + id_width + info_btn_width);
     if pad > 0 {
         line1_spans.push(Span::raw(" ".repeat(pad)));
     }
@@ -2416,7 +2498,8 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 } else {
                     0.0
                 };
-                (short, format!("{pct:.0}%"), pct)
+                let label = crate::text::format_pct(**tokens, total_project_tokens);
+                (short, label, pct)
             })
             .collect();
         let model_items: Vec<_> = sorted_models
@@ -2428,7 +2511,8 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 } else {
                     0.0
                 };
-                (short, format!("{pct:.0}%"), pct)
+                let label = crate::text::format_pct(**tokens, total_model_tokens);
+                (short, label, pct)
             })
             .collect();
         let tool_items: Vec<_> = sorted_tools
@@ -2878,28 +2962,24 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
                     })
                     .or_else(|| s.name.clone());
                 let now = chrono::Utc::now();
-                let secs = s
-                    .updated_at
-                    .or(s.jsonl_mtime)
-                    .or(s.started_at)
-                    .map_or(0, |t| (now - t).num_seconds().max(0));
-                // Mirror render_live_row: 5-tier glyph (busy / warm / idle /
+                let last = live_session_last_activity(state, s, now);
+                // Mirror render_live_row: 5-tier glyph (busy / today / older /
                 // snapshot-recovered paused / paused) so the conv-pane list
                 // tells the same story as the Live tab itself.
                 let glyph = if !is_active {
                     if s.was_recently_live { "⟳" } else { "⏸" }
                 } else if s.status.as_deref() == Some("busy") {
                     "🟢"
-                } else if secs < crate::infrastructure::live_sessions::WARM_THRESHOLD_SECS {
-                    "🟡"
+                } else if crate::infrastructure::live_sessions::is_today(last, now) {
+                    "◉"
                 } else {
-                    "◎"
+                    "○"
                 };
                 let pinned = s
                     .jsonl_path
                     .as_ref()
                     .is_some_and(|p| state.pins.is_pinned(p));
-                let time_label = format!("{glyph} {}", short_age(s, now));
+                let time_label = format!("{glyph} {}", short_age(state, s, now));
                 SessionDisplay {
                     file_path: s.jsonl_path.clone().unwrap_or_default(),
                     time_or_date: time_label,
@@ -3950,9 +4030,9 @@ fn draw_summary(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let title = if state.generating_summary {
         format!(" Generating: {target_info} ")
     } else if target_info.is_empty() {
-        " Summary [q:close ↑↓:scroll r:regenerate] ".to_string()
+        " Summary [q: close  ↑↓: scroll  r: regenerate] ".to_string()
     } else {
-        format!(" {target_info} [q:close ↑↓:scroll r:regenerate] ")
+        format!(" {target_info} [q: close  ↑↓: scroll  r: regenerate] ")
     };
 
     let block = Block::default()
@@ -4594,7 +4674,7 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         frame,
         area,
         &session,
-        " Space:pin  s:summary  r:regen  ↑↓:scroll  i/Esc:close ",
+        " Space: pin  s: summary  r: regen  ↑↓: scroll  i/Esc: close ",
         pinned,
         state.session_detail_scroll,
         &state.project_labels,
@@ -5559,14 +5639,12 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Span::styled("  Live ", Style::default().fg(theme::WARM).bold()),
             Span::styled("(Tab 2)", Style::default().fg(theme::DIM)),
         ]),
-        Line::from("  ↑/↓ j/k       Select session (busy → warm → idle → paused)"),
+        Line::from("  ↑/↓ j/k       Select session (busy → today → older → paused)"),
         Line::from("  Enter         Open conversation in pane"),
         Line::from("  i             Session details (includes pid / status)"),
         Line::from("  Space         Pin / unpin (same as Daily)"),
         Line::from("  y             Copy `cd ... && claude -r UUID` to clipboard"),
-        Line::from(
-            "  Glyphs        🟢 busy · 🟡 warm (<30m) · ◎ idle · ⏸ paused · ⟳ snapshot match",
-        ),
+        Line::from("  Glyphs        🟢 busy · ◉ today · ○ older · ⏸ paused · ⟳ snapshot match"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  Daily ", Style::default().fg(theme::WARM).bold()),
@@ -6005,6 +6083,111 @@ mod tests {
     }
 
     #[test]
+    fn format_session_range_today_drops_date() {
+        use chrono::{Local, TimeZone};
+        let now_local = Local
+            .with_ymd_and_hms(2026, 5, 21, 18, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let start = Local
+            .with_ymd_and_hms(2026, 5, 21, 12, 30, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let last = Local
+            .with_ymd_and_hms(2026, 5, 21, 15, 45, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = super::format_session_range(start, last, now_local);
+        assert_eq!(s, "[12:30–15:45]");
+    }
+
+    #[test]
+    fn format_session_range_past_same_day_keeps_one_date() {
+        use chrono::{Local, TimeZone};
+        let now_local = Local
+            .with_ymd_and_hms(2026, 5, 21, 18, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let start = Local
+            .with_ymd_and_hms(2026, 5, 19, 9, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let last = Local
+            .with_ymd_and_hms(2026, 5, 19, 11, 30, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = super::format_session_range(start, last, now_local);
+        assert_eq!(s, "[05-19 09:00–11:30]");
+    }
+
+    #[test]
+    fn live_session_last_activity_prefers_meta_last_over_pid_heartbeat() {
+        use chrono::TimeZone;
+        use std::path::PathBuf;
+        // Simulate the bug case: pid file's `updated_at` = recent (process
+        // re-activated), but JSONL's last conversation entry is days
+        // earlier. The age column must reflect the conversation, not the
+        // heartbeat.
+        let jsonl = PathBuf::from("/tmp/test-83297480.jsonl");
+        let conv_last = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 19, 10, 50, 0)
+            .unwrap();
+        let heartbeat = chrono::Utc.with_ymd_and_hms(2026, 5, 21, 8, 32, 0).unwrap();
+
+        let mut state = create_test_state();
+        state.original_daily_groups.clear();
+        let mut sess = crate::test_helpers::helpers::make_session("tmp", None, Some("main"));
+        sess.file_path = jsonl.clone();
+        sess.day_last_timestamp = conv_last;
+        state
+            .original_daily_groups
+            .push(crate::aggregator::DailyGroup {
+                date: chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap(), // lint-ok: date-literal
+                sessions: vec![sess],
+            });
+
+        let live = crate::infrastructure::live_sessions::LiveSession {
+            session_id: "83297480".to_string(),
+            jsonl_path: Some(jsonl),
+            cwd: PathBuf::from("/tmp"),
+            name: None,
+            status: None,
+            pid: 0,
+            started_at: None,
+            updated_at: Some(heartbeat),
+            jsonl_mtime: Some(heartbeat),
+            is_live: true,
+            was_recently_live: false,
+        };
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 22, 0, 0, 0).unwrap();
+        let resolved = super::live_session_last_activity(&state, &live, now);
+        assert_eq!(
+            resolved, conv_last,
+            "meta.day_last_timestamp must beat updated_at / jsonl_mtime"
+        );
+    }
+
+    #[test]
+    fn format_session_range_cross_day_shows_both_dates() {
+        use chrono::{Local, TimeZone};
+        let now_local = Local
+            .with_ymd_and_hms(2026, 5, 21, 18, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let start = Local
+            .with_ymd_and_hms(2026, 5, 20, 20, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let last = Local
+            .with_ymd_and_hms(2026, 5, 21, 10, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let s = super::format_session_range(start, last, now_local);
+        assert_eq!(s, "[05-20 20:00–05-21 10:00]");
+    }
+
+    #[test]
     fn test_shorten_model_name_opus() {
         assert_eq!(
             crate::aggregator::normalize_model_name("claude-opus-4-5-20251101"),
@@ -6370,7 +6553,7 @@ mod tests {
             live_scroll: 0,
             live_sessions_task: None,
             live_last_update: None,
-            app_start_time: chrono::Utc::now(),
+            prior_run_last_refresh: None,
             show_project_detail: false,
             project_detail_path: String::new(),
             project_detail_scroll: 0,
@@ -7371,10 +7554,10 @@ mod tests {
             text.contains("80.0% summary"),
             "should show completion rate 80.0%"
         );
-        // avg_cost_per_day = 100.0 / 10 = $10.0
+        // avg_cost_per_day = 100.0 / 10 = $10.00
         assert!(
-            text.contains("$10.0/day cost"),
-            "should show $10.0/day cost"
+            text.contains("$10.00/day cost"),
+            "should show $10.00/day cost"
         );
         // tokens_per_day = 60000 / 10 = 6000
         assert!(
@@ -7761,19 +7944,26 @@ mod tests {
     }
 
     #[test]
-    fn test_live_tab_renders_with_busy_warm_idle_glyphs() {
+    fn test_live_tab_renders_with_busy_today_older_glyphs() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Live;
+        // 30s ago = busy. 1h ago = still today (local calendar). 48h ago =
+        // definitely older. Avoid 24h offset which races the midnight boundary.
+        let mut today_row = live_session_fixture("bbbb-today", "/Users/me/repo-today", None, 3600);
+        today_row.is_live = true;
+        let mut older_row = live_session_fixture("cccc-older", "/Users/me/repo-older", None, 0);
+        older_row.is_live = true;
+        older_row.updated_at = Some(chrono::Utc::now() - chrono::Duration::hours(48));
         state.live_active = vec![
             live_session_fixture("aaaa-busy", "/Users/me/repo-busy", Some("busy"), 30),
-            live_session_fixture("bbbb-warm", "/Users/me/repo-warm", None, 5 * 60),
-            live_session_fixture("cccc-idle", "/Users/me/repo-idle", None, 3600),
+            today_row,
+            older_row,
         ];
         let text = render_to_text(&mut state, 140, 50);
         assert!(text.contains("Active now (3)"), "section header: {text}");
         assert!(text.contains("🟢"), "busy glyph missing: {text}");
-        assert!(text.contains("🟡"), "warm glyph missing: {text}");
-        assert!(text.contains("◎"), "idle glyph missing: {text}");
+        assert!(text.contains("◉"), "today glyph missing: {text}");
+        assert!(text.contains("○"), "older glyph missing: {text}");
     }
 
     #[test]

@@ -78,7 +78,7 @@ pub struct DailyGrouper;
 impl DailyGrouper {
     pub fn group_by_date_with_shared_cache(
         files: &[PathBuf],
-        cache: &Option<Cache>,
+        cache: &mut Option<Cache>,
     ) -> Vec<DailyGroup> {
         let mut date_map: HashMap<NaiveDate, Vec<SessionInfo>> = HashMap::new();
 
@@ -96,7 +96,7 @@ impl DailyGrouper {
         // those hashes' tokens dropped from totals entirely. Files no
         // longer on disk are excluded by the same `is_valid` check.
         let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(c) = cache {
+        if let Some(c) = cache.as_ref() {
             for file in files {
                 if c.is_valid(file)
                     && let Some(cached) = c.get(file)
@@ -115,11 +115,22 @@ impl DailyGrouper {
         let mut sorted_files: Vec<&PathBuf> = files.iter().collect();
         sorted_files.sort();
 
+        let mut parsed_any = false;
         for file in &sorted_files {
-            let sessions_by_date = Self::get_sessions_by_date(file, cache, &mut global_seen);
+            let (sessions_by_date, parsed) =
+                Self::get_sessions_by_date(file, cache, &mut global_seen);
+            if parsed {
+                parsed_any = true;
+            }
             for (date, session) in sessions_by_date {
                 date_map.entry(date).or_default().push(session);
             }
+        }
+
+        // Save only when we actually parsed something — pure cache-hit runs
+        // skip the I/O so warm `--daily` stays fast.
+        if parsed_any && let Some(c) = cache.as_ref() {
+            let _ = c.save();
         }
 
         for sessions in date_map.values_mut() {
@@ -143,10 +154,10 @@ impl DailyGrouper {
 
     fn get_sessions_by_date(
         file: &Path,
-        cache: &Option<Cache>,
+        cache: &mut Option<Cache>,
         global_seen: &mut std::collections::HashSet<String>,
-    ) -> Vec<(NaiveDate, SessionInfo)> {
-        if let Some(c) = cache
+    ) -> (Vec<(NaiveDate, SessionInfo)>, bool) {
+        if let Some(c) = cache.as_ref()
             && c.is_valid(file)
             && let Some(cached) = c.get(file)
             && !cached.daily_stats.is_empty()
@@ -154,10 +165,11 @@ impl DailyGrouper {
             // Cache hit: hashes are already in `global_seen`
             // from the pre-load pass at the top of
             // `group_by_date_with_shared_cache`.
-            return Self::build_sessions_from_cache(file, cached);
+            return (Self::build_sessions_from_cache(file, cached), false);
         }
 
-        Self::parse_and_build_sessions(file, cache, global_seen)
+        let sessions = Self::parse_and_build_sessions(file, cache, global_seen);
+        (sessions, true)
     }
 
     fn build_sessions_from_cache(
@@ -220,7 +232,7 @@ impl DailyGrouper {
 
     fn parse_and_build_sessions(
         file: &Path,
-        cache: &Option<Cache>,
+        cache: &mut Option<Cache>,
         global_seen: &mut std::collections::HashSet<String>,
     ) -> Vec<(NaiveDate, SessionInfo)> {
         let Ok(entries) = JsonlParser::parse_file(file) else {
@@ -334,6 +346,17 @@ impl DailyGrouper {
         let model = super::extract_session_model(&entries);
 
         let mut daily_stats: HashMap<NaiveDate, DailyStats> = HashMap::new();
+        // Hashes credited to THIS file (passed the cross-file dedup check
+        // below). Stored in the cache so the next run's pre-load pass
+        // restores them to global_seen without re-parsing every file.
+        let mut file_unique_hashes: Vec<String> = Vec::new();
+        // Per-file rollups needed by Stats (TUI). Computed during the same
+        // entry walk so the cache entry is complete on first write — no
+        // partial / fix-up pass needed.
+        let mut file_tool_error_count: usize = 0;
+        let mut file_tool_success_count: usize = 0;
+        let mut file_model_usage: HashMap<String, usize> = HashMap::new();
+        let session_id_from_entries = entries.first().and_then(|e| e.session_id.clone());
 
         for entry in &entries {
             if let Some(ts) = entry.timestamp {
@@ -376,40 +399,57 @@ impl DailyGrouper {
                         }
                     } else if matches!(message.role, crate::domain::Role::Assistant) {
                         stats.assistant_msgs += 1;
+                        if let Some(ref m) = message.model {
+                            *file_model_usage.entry(m.clone()).or_insert(0) += 1;
+                        }
                     }
                     if let MessageContent::Blocks(ref blocks) = message.content {
                         for block in blocks {
-                            if let crate::domain::ContentBlock::ToolUse { name, input, .. } = block
-                            {
-                                let key = crate::aggregator::tool_usage_key(name, input);
-                                *stats.tool_usage.entry(key).or_insert(0) += 1;
-                                let extensions =
-                                    StatsAggregator::extract_extensions_from_tool_input(
-                                        name, input,
-                                    );
-                                if extensions.is_empty() {
-                                    // Special filenames (Dockerfile, Makefile, etc.) carry a
-                                    // language but no extension — count them under language only.
-                                    if let Some(lang) =
-                                        StatsAggregator::extract_language_from_tool_input(
+                            match block {
+                                crate::domain::ContentBlock::ToolUse { name, input, .. } => {
+                                    let key = crate::aggregator::tool_usage_key(name, input);
+                                    *stats.tool_usage.entry(key).or_insert(0) += 1;
+                                    let extensions =
+                                        StatsAggregator::extract_extensions_from_tool_input(
                                             name, input,
-                                        )
-                                    {
-                                        *stats
-                                            .language_usage
-                                            .entry(lang.to_string())
-                                            .or_insert(0) += 1;
-                                    }
-                                } else {
-                                    for ext in extensions {
-                                        let lang = crate::aggregator::language::for_extension(&ext);
-                                        *stats.extension_usage.entry(ext).or_insert(0) += 1;
-                                        *stats
-                                            .language_usage
-                                            .entry(lang.to_string())
-                                            .or_insert(0) += 1;
+                                        );
+                                    if extensions.is_empty() {
+                                        // Special filenames (Dockerfile, Makefile, etc.) carry a
+                                        // language but no extension — count them under language only.
+                                        if let Some(lang) =
+                                            StatsAggregator::extract_language_from_tool_input(
+                                                name, input,
+                                            )
+                                        {
+                                            *stats
+                                                .language_usage
+                                                .entry(lang.to_string())
+                                                .or_insert(0) += 1;
+                                        }
+                                    } else {
+                                        for ext in extensions {
+                                            let lang =
+                                                crate::aggregator::language::for_extension(&ext);
+                                            *stats.extension_usage.entry(ext).or_insert(0) += 1;
+                                            *stats
+                                                .language_usage
+                                                .entry(lang.to_string())
+                                                .or_insert(0) += 1;
+                                        }
                                     }
                                 }
+                                crate::domain::ContentBlock::ToolResult { is_error, .. } => {
+                                    // Tool result counts are per-file, not
+                                    // hash-deduped — matches stats.rs so a
+                                    // cache entry written here produces the
+                                    // same numbers as a fresh Stats parse.
+                                    if *is_error {
+                                        file_tool_error_count += 1;
+                                    } else {
+                                        file_tool_success_count += 1;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -419,9 +459,10 @@ impl DailyGrouper {
                         // multiple JSONLs (resume / branch) should bill
                         // once. Skip if another file already credited it.
                         if let Some(hash) = crate::parser::JsonlParser::entry_hash(entry) {
-                            if !global_seen.insert(hash) {
+                            if !global_seen.insert(hash.clone()) {
                                 continue;
                             }
+                            file_unique_hashes.push(hash);
                         }
                         let model_key = message
                             .model
@@ -447,6 +488,138 @@ impl DailyGrouper {
                     }
                 }
             }
+        }
+
+        // Write a full cache entry. Per-FILE rollups (cache_creation_tokens
+        // totals, weekday activity, tool error/success, ...) are derived
+        // from daily_stats + per-entry counters so both Stats and
+        // DailyGrouper hit the same cache without re-parsing.
+        if let Some(c) = cache.as_mut() {
+            use chrono::Datelike;
+            let mut cached_daily: HashMap<String, crate::infrastructure::CachedDailyStats> =
+                HashMap::new();
+            // Per-FILE accumulators, summed from per-day stats.
+            let mut file_input_tokens: u64 = 0;
+            let mut file_output_tokens: u64 = 0;
+            let mut file_cache_creation_tokens: u64 = 0;
+            let mut file_cache_creation_5m_tokens: u64 = 0;
+            let mut file_cache_creation_1h_tokens: u64 = 0;
+            let mut file_cache_read_tokens: u64 = 0;
+            let mut file_tool_usage: HashMap<String, usize> = HashMap::new();
+            let mut file_model_tokens: HashMap<String, TokenStats> = HashMap::new();
+            let mut file_hourly_activity: HashMap<u8, u64> = HashMap::new();
+            let mut file_hourly_work_activity: HashMap<u8, u64> = HashMap::new();
+            let mut file_weekday_activity: HashMap<u8, u64> = HashMap::new();
+            let mut file_weekday_work_activity: HashMap<u8, u64> = HashMap::new();
+            let mut file_language_usage: HashMap<String, usize> = HashMap::new();
+            let mut file_extension_usage: HashMap<String, usize> = HashMap::new();
+            for (date, ds) in &daily_stats {
+                file_input_tokens += ds.input_tokens;
+                file_output_tokens += ds.output_tokens;
+                // Sum cache breakdowns from per-day tokens_by_model.
+                let mut day_tokens_total = ds.input_tokens + ds.output_tokens;
+                for (model, ts) in &ds.tokens_by_model {
+                    file_cache_creation_tokens += ts.cache_creation_tokens;
+                    file_cache_creation_5m_tokens += ts.cache_creation_5m_tokens;
+                    file_cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
+                    file_cache_read_tokens += ts.cache_read_tokens;
+                    day_tokens_total += ts.cache_creation_tokens + ts.cache_read_tokens;
+                    let agg = file_model_tokens.entry(model.clone()).or_default();
+                    agg.input_tokens += ts.input_tokens;
+                    agg.output_tokens += ts.output_tokens;
+                    agg.cache_creation_tokens += ts.cache_creation_tokens;
+                    agg.cache_creation_5m_tokens += ts.cache_creation_5m_tokens;
+                    agg.cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
+                    agg.cache_read_tokens += ts.cache_read_tokens;
+                }
+                for (k, v) in &ds.tool_usage {
+                    *file_tool_usage.entry(k.clone()).or_insert(0) += v;
+                }
+                for (k, v) in &ds.language_usage {
+                    *file_language_usage.entry(k.clone()).or_insert(0) += v;
+                }
+                for (k, v) in &ds.extension_usage {
+                    *file_extension_usage.entry(k.clone()).or_insert(0) += v;
+                }
+                for (h, v) in &ds.hourly_activity {
+                    *file_hourly_activity.entry(*h).or_insert(0) += v;
+                }
+                for (h, v) in &ds.hourly_work_activity {
+                    *file_hourly_work_activity.entry(*h).or_insert(0) += v;
+                }
+                // Weekday rollup: attribute each day's totals to its weekday.
+                let weekday = date.weekday().num_days_from_monday() as u8;
+                *file_weekday_activity.entry(weekday).or_insert(0) += day_tokens_total;
+                *file_weekday_work_activity.entry(weekday).or_insert(0) +=
+                    ds.input_tokens + ds.output_tokens;
+
+                cached_daily.insert(
+                    date.to_string(),
+                    crate::infrastructure::CachedDailyStats {
+                        first_timestamp: Some(ds.first_timestamp),
+                        last_timestamp: Some(ds.last_timestamp),
+                        input_tokens: ds.input_tokens,
+                        output_tokens: ds.output_tokens,
+                        tokens_by_model: ds.tokens_by_model.clone(),
+                        hourly_activity: ds.hourly_activity.clone(),
+                        hourly_work_activity: ds.hourly_work_activity.clone(),
+                        tool_usage: ds.tool_usage.clone(),
+                        language_usage: ds.language_usage.clone(),
+                        extension_usage: ds.extension_usage.clone(),
+                        user_msgs: ds.user_msgs,
+                        assistant_msgs: ds.assistant_msgs,
+                    },
+                );
+            }
+            let last_ts = daily_stats.values().map(|d| d.last_timestamp).max();
+            let session_duration_mins = last_ts.map(|l| (l - session_first).num_minutes());
+            let full_entry = crate::infrastructure::CachedFileStats {
+                modified_secs: std::fs::metadata(file)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs())
+                    })
+                    .unwrap_or(0),
+                file_size: std::fs::metadata(file).map_or(0, |m| m.len()),
+                entry_count: entries.len(),
+                input_tokens: file_input_tokens,
+                output_tokens: file_output_tokens,
+                cache_creation_tokens: file_cache_creation_tokens,
+                cache_read_tokens: file_cache_read_tokens,
+                cache_creation_5m_tokens: file_cache_creation_5m_tokens,
+                cache_creation_1h_tokens: file_cache_creation_1h_tokens,
+                unique_hashes: file_unique_hashes,
+                tool_usage: file_tool_usage,
+                model_usage: file_model_usage,
+                model_tokens: file_model_tokens,
+                session_date: Some(session_start_date),
+                project_name: Some(project_name.clone()),
+                session_id: session_id_from_entries,
+                git_branch: git_branch.clone(),
+                first_timestamp: Some(session_first),
+                last_timestamp: last_ts,
+                summary: summary.clone(),
+                custom_title: custom_title.clone(),
+                ai_title: ai_title.clone(),
+                last_user_message: last_user_message.clone(),
+                first_user_message: first_user_message.clone(),
+                model: model.clone(),
+                is_subagent,
+                daily_stats: cached_daily,
+                hourly_activity: file_hourly_activity,
+                hourly_work_activity: file_hourly_work_activity,
+                weekday_activity: file_weekday_activity,
+                weekday_work_activity: file_weekday_work_activity,
+                tool_error_count: file_tool_error_count,
+                tool_success_count: file_tool_success_count,
+                session_duration_mins,
+                language_usage: file_language_usage,
+                extension_usage: file_extension_usage,
+            };
+            c.insert(file, full_entry);
         }
 
         daily_stats
@@ -1093,7 +1266,7 @@ mod tests {
 
         let sessions = DailyGrouper::parse_and_build_sessions(
             &path,
-            &None,
+            &mut None,
             &mut std::collections::HashSet::new(),
         );
         std::fs::remove_file(&path).ok();
@@ -1107,6 +1280,190 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_build_sessions_writes_full_cache_entry() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("ccsight_partial_cache_test_{id}.jsonl"));
+
+        let entries = vec![
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-25T10:00:00Z",
+                "cwd": "/Users/test/projects/myproject",
+                "message": {"role": "user", "content": "hello"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-02-25T10:01:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": "hi",
+                    "model": "claude-sonnet-4-20250514",
+                    "usage": {"input_tokens": 100, "output_tokens": 50}
+                }
+            }),
+        ];
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for e in &entries {
+                writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+            }
+        }
+
+        let mut cache = Some(crate::infrastructure::Cache::new_empty());
+        let _ = DailyGrouper::parse_and_build_sessions(
+            &path,
+            &mut cache,
+            &mut std::collections::HashSet::new(),
+        );
+        std::fs::remove_file(&path).ok();
+
+        let entry = cache.as_ref().unwrap().get(&path).expect("cache entry");
+        assert!(
+            !entry.daily_stats.is_empty(),
+            "per-day stats must be populated"
+        );
+        // Per-FILE rollups are derived from daily_stats so Stats and
+        // DailyGrouper share the same cache.
+        assert_eq!(entry.input_tokens, 100);
+        assert_eq!(entry.output_tokens, 50);
+        assert_eq!(entry.entry_count, 2);
+    }
+
+    #[test]
+    fn cache_round_trip_dailygrouper_to_stats_matches_fresh_parse() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("ccsight_roundtrip_test_{id}.jsonl"));
+
+        let entries = vec![
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-25T10:00:00Z",
+                "sessionId": "rt-session-1",
+                "cwd": "/Users/test/projects/myproject",
+                "message": {"role": "user", "content": "hello"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-02-25T10:01:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tu_1",
+                        "name": "Bash",
+                        "input": {"command": "ls"}
+                    }],
+                    "model": "claude-sonnet-4-20250514",
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cache_creation_input_tokens": 200,
+                        "cache_read_input_tokens": 300
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-25T10:02:00Z",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": "ok",
+                    "is_error": false
+                }]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-02-25T10:03:00Z",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_2",
+                    "content": "fail",
+                    "is_error": true
+                }]}
+            }),
+        ];
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for e in &entries {
+                writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+            }
+        }
+
+        // Path 1: DailyGrouper parses, writes cache entry.
+        let mut cache_a = Some(crate::infrastructure::Cache::new_empty());
+        let _ = DailyGrouper::parse_and_build_sessions(
+            &path,
+            &mut cache_a,
+            &mut std::collections::HashSet::new(),
+        );
+        let entry_from_grouper = cache_a
+            .as_ref()
+            .unwrap()
+            .get(&path)
+            .expect("grouper entry")
+            .clone();
+
+        // Path 2: Stats parses the same file from scratch.
+        let mut cache_b = crate::infrastructure::Cache::new_empty();
+        let (_stats, _) =
+            StatsAggregator::aggregate_with_shared_cache(&[path.clone()], cache_b.clone());
+        let _ = cache_b;
+        let cache_b_loaded = crate::infrastructure::Cache::load()
+            .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());
+        // Stats's aggregate writes to ~/.ccsight; load it back. If it's not
+        // there (test environment), skip the cross-check — the per-field
+        // assertions below still validate the grouper-written entry.
+        let entry_from_stats = cache_b_loaded.get(&path).cloned();
+
+        std::fs::remove_file(&path).ok();
+
+        // Per-FILE rollups must reflect tool counts even when only the
+        // DailyGrouper wrote the entry — Stats's reader path depends on
+        // these fields.
+        assert_eq!(entry_from_grouper.tool_success_count, 1);
+        assert_eq!(entry_from_grouper.tool_error_count, 1);
+        assert_eq!(entry_from_grouper.input_tokens, 100);
+        assert_eq!(entry_from_grouper.output_tokens, 50);
+        assert_eq!(entry_from_grouper.cache_creation_tokens, 200);
+        assert_eq!(entry_from_grouper.cache_read_tokens, 300);
+        assert_eq!(entry_from_grouper.weekday_activity.len(), 1);
+        assert!(
+            entry_from_grouper
+                .model_usage
+                .contains_key("claude-sonnet-4-20250514")
+        );
+
+        // Cross-path comparison when Stats's cache landed on disk.
+        if let Some(stats_entry) = entry_from_stats {
+            assert_eq!(
+                stats_entry.tool_success_count,
+                entry_from_grouper.tool_success_count
+            );
+            assert_eq!(
+                stats_entry.tool_error_count,
+                entry_from_grouper.tool_error_count
+            );
+            assert_eq!(stats_entry.input_tokens, entry_from_grouper.input_tokens);
+            assert_eq!(stats_entry.output_tokens, entry_from_grouper.output_tokens);
+            assert_eq!(
+                stats_entry.cache_creation_tokens,
+                entry_from_grouper.cache_creation_tokens
+            );
+            assert_eq!(
+                stats_entry.cache_read_tokens,
+                entry_from_grouper.cache_read_tokens
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_and_build_sessions_empty_file() {
         let path = std::env::temp_dir().join("ccsight_grouping_empty.jsonl");
         {
@@ -1114,7 +1471,7 @@ mod tests {
         }
         let sessions = DailyGrouper::parse_and_build_sessions(
             &path,
-            &None,
+            &mut None,
             &mut std::collections::HashSet::new(),
         );
         std::fs::remove_file(&path).ok();
@@ -1139,7 +1496,7 @@ mod tests {
         }
         let sessions = DailyGrouper::parse_and_build_sessions(
             &path,
-            &None,
+            &mut None,
             &mut std::collections::HashSet::new(),
         );
         std::fs::remove_file(&path).ok();

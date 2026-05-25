@@ -99,6 +99,22 @@ pub fn wrap_text_with_continuation(text: &str, max_width: usize) -> (Vec<String>
     (lines, flags)
 }
 
+/// Render a `part / total` ratio as an integer percentage. When the raw
+/// share is non-zero but rounds down to zero, returns the `less-than`
+/// indicator so tiny non-zero rows in ranked panels (Projects, Languages)
+/// stay distinguishable from true zeroes.
+pub fn format_pct(part: u64, total: u64) -> String {
+    if part == 0 || total == 0 {
+        return "0%".to_string();
+    }
+    let pct = (part as f64 / total as f64 * 100.0) as u32;
+    if pct == 0 {
+        "<1%".to_string()
+    } else {
+        format!("{pct}%")
+    }
+}
+
 pub fn format_number(n: u64) -> String {
     let (divisor, suffix) = match n {
         n if n >= 1_000_000_000_000 => (1_000_000_000_000.0, "T"),
@@ -187,6 +203,28 @@ mod tests {
     #[test]
     fn test_format_number_small() {
         assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn format_pct_zero_part_renders_zero() {
+        assert_eq!(format_pct(0, 100), "0%");
+    }
+
+    #[test]
+    fn format_pct_zero_total_renders_zero() {
+        assert_eq!(format_pct(50, 0), "0%");
+    }
+
+    #[test]
+    fn format_pct_sub_one_percent_uses_less_than_glyph() {
+        // 5 / 1000 = 0.5% → rounds to 0%; should surface as <1% so it's
+        // distinguishable from a true 0% row.
+        assert_eq!(format_pct(5, 1000), "<1%");
+    }
+
+    #[test]
+    fn format_pct_normal_integer_share() {
+        assert_eq!(format_pct(250, 1000), "25%");
     }
 
     #[test]

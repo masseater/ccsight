@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 31;
+const CACHE_VERSION: u32 = 33;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {

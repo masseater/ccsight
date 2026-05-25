@@ -826,6 +826,149 @@ if [ -n "$LEADING_BLANK_LINE" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
+# 32. Cross-surface rate-unit consistency: `/day` (not `/d`) in format strings.
+# Dashboard and Insights compute per-day rates; the displayed suffix has to
+# agree across surfaces or the same metric reads differently between tabs.
+# Pattern: `/d` immediately followed by a string-terminator or whitespace
+# inside a string literal (catches `"avg ${X}/d"`, `"X/d "`, `"X/d)"`).
+# Annotate legitimate uses with `// lint-ok: rate-suffix-d`.
+RATE_SUFFIX_D=$(python3 -c "
+import os, re
+# /d preceded by a value-like character (digit, } from interpolation,
+# K/M/B unit suffix) and followed by a string terminator. Filters out
+# paths like '~/projects/d' and key abbrevs like 'u/d Page scroll'.
+pat = re.compile(r'[\\d\\}KMBkT]/d[\"\\s\\),\\]]')
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                if 'lint-ok: rate-suffix-d' in line:
+                    continue
+                stripped = line.lstrip()
+                if stripped.startswith('//') or stripped.startswith('///'):
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$RATE_SUFFIX_D" ]; then
+    echo "ERROR: per-day rate suffix \`/d\` (use \`/day\` for cross-surface consistency):"
+    echo "$RATE_SUFFIX_D"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 33. Session unit: `/ses` (3-char) — `/sess` (4-char) breaks alignment with
+# the Insights metrics card's existing column width budget.
+SESS_SUFFIX=$(python3 -c "
+import os, re
+pat = re.compile(r'/sess\\b')
+hits = []
+for root, _, files in os.walk('src/ui'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                stripped = line.lstrip()
+                if stripped.startswith('//') or stripped.startswith('///'):
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$SESS_SUFFIX" ]; then
+    echo "ERROR: session-rate suffix \`/sess\` (use \`/ses\`):"
+    echo "$SESS_SUFFIX"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 34. Compact date with weekday needs a separator between date and \`(%a)\`.
+# Daily header uses \`%Y-%m-%d (%a)\` (space + paren); Dashboard \`%m-%d(%a)\`
+# (no space) reads as a typo and breaks visual rhythm. Use either form with
+# the space — short (\`%m-%d (%a)\`) or full (\`%Y-%m-%d (%a)\`).
+WEEKDAY_NO_SPACE=$(python3 -c "
+import os, re
+pat = re.compile(r'%[Yymd][^\"]*%[md]\(%a\)')
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                stripped = line.lstrip()
+                if stripped.startswith('//') or stripped.startswith('///'):
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$WEEKDAY_NO_SPACE" ]; then
+    echo "ERROR: date+weekday with no separator (use \"... (%a)\" with a space):"
+    echo "$WEEKDAY_NO_SPACE"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 35. Short date format: slash form (\`%m/%d\`) drifts from the dash form
+# used everywhere else (\`%m-%d\`). Keep one form so date columns line up
+# the same way on every surface.
+SLASH_DATE=$(python3 -c "
+import os, re
+pat = re.compile(r'%-?m/%-?d')
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                stripped = line.lstrip()
+                if stripped.startswith('//') or stripped.startswith('///'):
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$SLASH_DATE" ]; then
+    echo "ERROR: short date uses slash form (use \"%m-%d\" / \"%Y-%m-%d\"):"
+    echo "$SLASH_DATE"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 36. Cost precision: \`\${:.1}\` / \`\${:.3+}\` violates the Cost Precision
+# rule (only \`:.0\` for compact, \`:.2\` for detailed). 1-decimal cost is
+# visually neither — read confusion with timestamps in dense rows.
+COST_PRECISION=$(python3 -c "
+import os, re
+pat = re.compile(r'\\\$\{:\.([13456789])\}')
+hits = []
+for root, _, files in os.walk('src/ui'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                stripped = line.lstrip()
+                if stripped.startswith('//') or stripped.startswith('///'):
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$COST_PRECISION" ]; then
+    echo "ERROR: cost precision other than :.0 or :.2 (per Cost Precision rule):"
+    echo "$COST_PRECISION"
+    ERRORS=$((ERRORS + 1))
+fi
+
 if [ $ERRORS -eq 0 ]; then
     echo "Lint: OK"
 else

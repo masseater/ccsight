@@ -996,8 +996,13 @@ pub(crate) fn handle_default_key(
             let jsonl = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
             if let Some(jsonl) = jsonl {
                 // Replace the active pane (or push one) with the selected JSONL.
+                // `active_pane_index` controls keyboard focus — without setting
+                // it explicitly in the empty-panes branch, Enter would open the
+                // pane but leave focus on the session list, so j/k still
+                // navigated sessions instead of scrolling messages.
                 if state.panes.is_empty() {
                     state.panes.push(ConversationPane::load_from(&jsonl));
+                    state.active_pane_index = Some(0);
                 } else {
                     let idx = state.active_pane_index.unwrap_or(0);
                     state.panes[idx] = ConversationPane::load_from(&jsonl);

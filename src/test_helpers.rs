@@ -110,7 +110,7 @@ pub mod helpers {
             live_scroll: 0,
             live_sessions_task: None,
             live_last_update: None,
-            app_start_time: chrono::Utc::now(),
+            prior_run_last_refresh: None,
             show_project_detail: false,
             project_detail_path: String::new(),
             project_detail_scroll: 0,
