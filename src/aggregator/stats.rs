@@ -103,7 +103,7 @@ pub struct ProjectStats {
     pub work_tokens: u64,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -447,12 +447,11 @@ impl StatsAggregator {
             + cached.cache_read_tokens;
         let session_work_tokens = cached.input_tokens + cached.output_tokens;
 
-        // Subagent sessions are excluded so the Projects panel's count /
-        // tokens reads as "user-driven activity" — matching the cost number
-        // (computed via `user_sessions()`) and the filtered-rebuild path.
-        if let Some(name) = project_name
-            && !cached.is_subagent
-        {
+        // Subagents are included so the per-project total matches the
+        // Project filter popup (the single source of truth for "all activity
+        // attributed to this project"). Sum-of-projects then reconciles with
+        // the Overview cost number, which also includes subagents.
+        if let Some(name) = project_name {
             let project = stats.project_stats.entry(name.clone()).or_default();
             project.sessions += 1;
             project.tokens += session_tokens;
@@ -761,12 +760,9 @@ impl StatsAggregator {
             + file_stats.cache_read_tokens;
         let session_work_tokens = file_stats.input_tokens + file_stats.output_tokens;
 
-        // See the matching merge_cached_stats block: subagent sessions are
-        // excluded so `project_stats` stays consistent with the filtered-
-        // rebuild path and with how cost is computed downstream.
-        if let Some(name) = project_name
-            && !file_stats.is_subagent
-        {
+        // Mirror of `merge_cached_stats`: subagents are included so the
+        // per-project total matches the Project filter popup.
+        if let Some(name) = project_name {
             let project = stats.project_stats.entry(name.clone()).or_default();
             project.sessions += 1;
             project.tokens += session_tokens;
@@ -1356,10 +1352,10 @@ mod tests {
 
     #[test]
     fn test_add_session_adoption_mcp_server_sessions_deduped_per_session() {
-        // Regression: a session that hits two tools from the SAME MCP server must
-        // increment `mcp_server_sessions[<server>]` only once. Previously the only
-        // per-server metric was summed from per-tool `tool_sessions`, which double-
-        // counted sessions that used multiple tools from the same server.
+        // A session that hits two tools from the SAME MCP server must
+        // increment `mcp_server_sessions[<server>]` only once. Summing
+        // per-tool `tool_sessions` would double-count sessions that used
+        // multiple tools from the same server.
         let mut stats = Stats::default();
         let day1 = keys(&[
             "mcp__server1__action1",

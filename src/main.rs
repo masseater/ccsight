@@ -10,6 +10,7 @@ mod mcp;
 mod parser;
 mod pins;
 mod search;
+mod search_history;
 mod shell;
 mod state;
 mod summary;
@@ -76,6 +77,14 @@ struct Args {
     #[arg(long)]
     daily: bool,
 
+    /// Show weekly (ISO Mon-Sun) cost summary and exit
+    #[arg(long)]
+    weekly: bool,
+
+    /// Show monthly cost summary and exit
+    #[arg(long)]
+    monthly: bool,
+
     /// Run as MCP server (stdio transport)
     #[arg(long)]
     mcp: bool,
@@ -133,13 +142,26 @@ fn main() -> io::Result<()> {
         if infrastructure::SearchIndex::clear_index().is_ok() {
             println!("Search index cleared");
         }
-        if !args.daily && !args.mcp && !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        if !args.daily
+            && !args.weekly
+            && !args.monthly
+            && !args.mcp
+            && !std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
             return Ok(());
         }
     }
 
     if args.daily {
         cli::show_daily_costs(args.limit);
+        return Ok(());
+    }
+    if args.weekly {
+        cli::show_weekly_costs(args.limit);
+        return Ok(());
+    }
+    if args.monthly {
+        cli::show_monthly_costs(args.limit);
         return Ok(());
     }
 
@@ -299,9 +321,11 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         state.search_selected = 0;
                         start_index_build(&mut state);
                         if state.search_mode && !state.search_input.text.is_empty() {
+                            let ctx_owned = build_search_filter_ctx(&state);
                             state.search_results = search::perform_search(
                                 &state.daily_groups,
                                 &state.search_input.text,
+                                &ctx_owned.as_ref(),
                             );
                             start_content_search(&mut state);
                         }
@@ -623,6 +647,10 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 )
                             })
                             .collect();
+                        let (filters, _) =
+                            crate::search::parse_search_query(&state.search_input.text);
+                        let ctx_owned = build_search_filter_ctx(&state);
+                        let ctx = ctx_owned.as_ref();
                         for mut result in content_results {
                             if let Some(path) = result.session_path.as_ref() {
                                 let Some(&(day_idx, session_idx)) = path_lookup.get(path) else {
@@ -631,9 +659,42 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 result.day_idx = day_idx;
                                 result.session_idx = session_idx;
                             }
-                            if !state.search_results.iter().any(|r| {
-                                r.day_idx == result.day_idx && r.session_idx == result.session_idx
-                            }) {
+                            // Filter step on top of the tantivy / file-content
+                            // hits — same predicates as `perform_search`.
+                            let group = state.daily_groups.get(result.day_idx);
+                            let session = group.and_then(|g| {
+                                g.sessions
+                                    .iter()
+                                    .filter(|s| !s.is_subagent)
+                                    .nth(result.session_idx)
+                            });
+                            let Some(group) = group else { continue };
+                            let Some(session) = session else { continue };
+                            if !crate::search::period_matches_for_filter(
+                                group.date,
+                                filters.period,
+                                ctx.today,
+                            ) {
+                                continue;
+                            }
+                            if !crate::search::session_passes_filters(session, &filters, &ctx) {
+                                continue;
+                            }
+                            // Dedupe by file_path so a multi-day session
+                            // doesn't appear once per day in the result
+                            // list. perform_search already deduped its
+                            // own output; this guard catches tantivy hits
+                            // that arrive after.
+                            let already = state.search_results.iter().any(|r| {
+                                let other = state.daily_groups.get(r.day_idx).and_then(|g| {
+                                    g.sessions
+                                        .iter()
+                                        .filter(|s| !s.is_subagent)
+                                        .nth(r.session_idx)
+                                });
+                                other.is_some_and(|o| o.file_path == session.file_path)
+                            });
+                            if !already {
                                 state.search_results.push(result);
                             }
                         }
@@ -802,8 +863,12 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         for c in text.chars() {
                             state.search_input.insert_char(c);
                         }
-                        state.search_results =
-                            search::perform_search(&state.daily_groups, &state.search_input.text);
+                        let ctx_owned = build_search_filter_ctx(&state);
+                        state.search_results = search::perform_search(
+                            &state.daily_groups,
+                            &state.search_input.text,
+                            &ctx_owned.as_ref(),
+                        );
                         state.search_selected = 0;
                         start_content_search(&mut state);
                     } else if state.filter_input_mode {
@@ -860,6 +925,16 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         handlers::keyboard::handle_project_popup_key(&mut state, key);
                     } else if state.show_summary {
                         handlers::keyboard::handle_summary_popup_key(&mut state, key);
+                    } else if state.show_detail {
+                        // Session Detail popup wins over the conversation
+                        // view dispatch so its footer keys (r/R/s/S, ↑↓
+                        // scrolls the popup, i toggles closed) are reachable
+                        // when the popup is opened from inside the conv
+                        // view. The conv handler's `show_detail` branches
+                        // (Esc close, Space pin) are duplicated in
+                        // `handle_session_detail_key`, so we don't lose any
+                        // behaviour by routing here first.
+                        handlers::keyboard::handle_session_detail_key(&mut state, key);
                     } else if state.show_conversation {
                         handlers::keyboard::handle_conversation_key(
                             &mut state,
@@ -869,8 +944,6 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             get_conv_session_file,
                             get_conv_session_count,
                         );
-                    } else if state.show_detail {
-                        handlers::keyboard::handle_session_detail_key(&mut state, key);
                     } else if state.search_mode {
                         handlers::keyboard::handle_search_mode_key(
                             &mut state,
@@ -909,8 +982,8 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 /// - `handlers::mouse::handle_mouse_scroll` — block scroll if popup is scrollable
 ///
 /// Compiler doesn't enforce this; reviewing the 4 fns side-by-side is the
-/// standing rule. (Earlier mechanically-enforced lint had too many false
-/// positives — some popups legitimately ignore double-click or scroll.)
+/// standing rule. A mechanical lint produces too many false positives —
+/// some popups legitimately ignore double-click or scroll.
 pub(crate) fn dismiss_overlay(state: &mut AppState) {
     if state.show_help {
         state.show_help = false;
@@ -941,8 +1014,9 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
         return;
     }
     if state.search_mode {
+        // Keep `search_input.text` so a follow-up `/` restores the
+        // previous query — same trade-off as the keyboard Esc handler.
         state.search_mode = false;
-        state.search_input.clear();
         state.search_results.clear();
         state.search_selected = 0;
         state.search_task = None;
@@ -1093,9 +1167,14 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     // back to `total_cost` (Overview). Filtering `!is_subagent` here would
     // make the two totals disagree even though they share the same label.
     // Subagent dispatch is a real spend and belongs on the day it ran.
+    //
+    // Days where every session has zero tokens (API errors, canceled prompts,
+    // system-only timestamps) are dropped — they live in `daily_groups` for
+    // the Daily tab's session view, but a zero-cost row in the Costs panel
+    // reads as noise alongside real spend.
     let daily_costs: Vec<(NaiveDate, f64)> = daily_groups
         .iter()
-        .map(|group| {
+        .filter_map(|group| {
             let day_cost: f64 = group
                 .sessions
                 .iter()
@@ -1107,7 +1186,15 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
                     })
                 })
                 .sum();
-            (group.date, day_cost)
+            let day_billable_tokens: u64 = group
+                .sessions
+                .iter()
+                .flat_map(|s| s.day_tokens_by_model.values())
+                .map(|t| {
+                    t.input_tokens + t.output_tokens + t.cache_creation_tokens + t.cache_read_tokens
+                })
+                .sum();
+            (day_billable_tokens > 0).then_some((group.date, day_cost))
         })
         .collect();
 
@@ -1124,15 +1211,71 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     })
 }
 
-fn start_content_search(state: &mut AppState) {
+/// Snapshot the path sets a search-filter run needs from live/paused
+/// session lists. Called per keystroke (cheap — these lists hold ~tens of
+/// entries) so `filter:live` always reflects the latest poll.
+pub(crate) fn build_search_filter_ctx(state: &AppState) -> SearchFilterCtxOwned {
+    let today = chrono::Local::now().date_naive();
+    let mut live = std::collections::HashSet::new();
+    let mut busy = std::collections::HashSet::new();
+    let mut paused = std::collections::HashSet::new();
+    for s in &state.live_active {
+        if let Some(p) = &s.jsonl_path {
+            live.insert(p.clone());
+            if s.status.as_deref() == Some("busy") {
+                busy.insert(p.clone());
+            }
+        }
+    }
+    for s in &state.live_paused {
+        if let Some(p) = &s.jsonl_path {
+            paused.insert(p.clone());
+        }
+    }
+    SearchFilterCtxOwned {
+        today,
+        live,
+        busy,
+        paused,
+    }
+}
+
+pub(crate) struct SearchFilterCtxOwned {
+    today: chrono::NaiveDate,
+    live: std::collections::HashSet<PathBuf>,
+    busy: std::collections::HashSet<PathBuf>,
+    paused: std::collections::HashSet<PathBuf>,
+}
+
+impl SearchFilterCtxOwned {
+    pub(crate) fn as_ref(&self) -> search::SearchFiltersContext<'_> {
+        search::SearchFiltersContext {
+            today: self.today,
+            live_paths: &self.live,
+            busy_paths: &self.busy,
+            paused_paths: &self.paused,
+        }
+    }
+}
+
+pub(crate) fn start_content_search(state: &mut AppState) {
     state.search_task = None;
     state.searching = false;
 
-    if state.search_input.text.len() < 2 {
+    // The tantivy index only knows about message content — filter tokens
+    // (`filter:live`, `project:X` etc.) would be matched as literal text
+    // and yield zero hits. Strip them out before issuing the search; the
+    // filter step is applied to the returned results downstream.
+    let (_, free_text) = crate::search::parse_search_query(&state.search_input.text);
+    if free_text.len() < 2 {
         return;
     }
 
-    let query = state.search_input.text.clone();
+    let query = free_text;
+    // Stash the FULL raw input as the task key so the receive path can
+    // detect stale results by comparing against the current input
+    // (which the user may have edited further while the worker ran).
+    let task_key = state.search_input.text.clone();
 
     if let Some(ref index) = state.search_index {
         // Run tantivy search off the UI thread — with a few thousand
@@ -1145,7 +1288,7 @@ fn start_content_search(state: &mut AppState) {
         let index = std::sync::Arc::clone(index);
         let (tx, rx) = mpsc::channel();
         state.searching = true;
-        state.search_task = Some((rx, query.clone()));
+        state.search_task = Some((rx, task_key.clone()));
         std::thread::spawn(move || {
             let results = index.search(&query, 200, 50);
             let _ = tx.send(results);

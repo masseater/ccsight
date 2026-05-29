@@ -29,8 +29,16 @@ pub struct ConversationMessage {
     pub role: String,
     pub blocks: Vec<ConversationBlock>,
     pub timestamp: Option<String>,
+    /// Raw UTC timestamp used to compute the previous-message gap (response
+    /// latency). Kept separately from the human-readable `timestamp` string
+    /// so the renderer doesn't have to re-parse.
+    pub timestamp_utc: Option<chrono::DateTime<chrono::Utc>>,
     pub model: Option<String>,
     pub tokens: Option<(u64, u64)>,
+    /// Full per-message usage (input / output / 5m cw / 1h cw / read) so
+    /// the conv pane can compute per-turn cost without losing the
+    /// 1h-vs-5m cache split that drives ~half of subscription spend.
+    pub usage: Option<crate::aggregator::stats::TokenStats>,
 }
 
 #[derive(Debug)]
@@ -151,15 +159,38 @@ pub fn load_conversation(
             let timestamp = e
                 .timestamp
                 .map(|ts| ts.with_timezone(&Local).format("%H:%M:%S").to_string());
+            let timestamp_utc = e.timestamp;
 
-            let tokens = message.usage.map(|u| (u.input_tokens, u.output_tokens));
+            let tokens = message
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens));
+            // Mirror the per-TTL split logic in aggregator::stats::TokenStats::add:
+            // prefer the structured cache_creation object (1h / 5m); fall back to
+            // the flat field at 5m rate for older JSONLs.
+            let usage = message.usage.as_ref().map(|u| {
+                let (m5, m1) = u.cache_creation.as_ref().map_or_else(
+                    || (u.cache_creation_input_tokens, 0),
+                    |c| (c.ephemeral_5m_input_tokens, c.ephemeral_1h_input_tokens),
+                );
+                crate::aggregator::stats::TokenStats {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_creation_tokens: u.cache_creation_input_tokens,
+                    cache_read_tokens: u.cache_read_input_tokens,
+                    cache_creation_5m_tokens: m5,
+                    cache_creation_1h_tokens: m1,
+                }
+            });
 
             Some(ConversationMessage {
                 role,
                 blocks,
                 timestamp,
+                timestamp_utc,
                 model: message.model,
                 tokens,
+                usage,
             })
         })
         .collect();

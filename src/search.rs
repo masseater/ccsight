@@ -1,8 +1,184 @@
+use std::collections::HashSet;
 use std::path::Path;
+
+use chrono::NaiveDate;
 
 use crate::aggregator::DailyGroup;
 use crate::domain::{EntryType, Role};
 use crate::parser::JsonlParser;
+
+/// Inline filter tokens parsed out of the search query. Live state /
+/// period filters are enum-valued (only one of each can be active); the
+/// property filters (project / model / branch) are substring needles.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub state: Option<SessionStateFilter>,
+    pub period: Option<PeriodFilter>,
+    pub project: Option<String>,
+    pub model: Option<String>,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStateFilter {
+    Live,
+    Paused,
+    Busy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodFilter {
+    Today,
+    Week,
+    Month,
+    /// Exact-date pinpoint, used by `filter:date:YYYY-MM-DD`.
+    On(NaiveDate),
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        self.state.is_none()
+            && self.period.is_none()
+            && self.project.is_none()
+            && self.model.is_none()
+            && self.branch.is_none()
+    }
+}
+
+/// Context the filter step needs that lives outside `daily_groups` — the
+/// in-memory live/paused session lists (joined by `file_path`) and today's
+/// local calendar date for the period filters.
+pub struct SearchFiltersContext<'a> {
+    pub today: NaiveDate,
+    pub live_paths: &'a HashSet<std::path::PathBuf>,
+    pub busy_paths: &'a HashSet<std::path::PathBuf>,
+    pub paused_paths: &'a HashSet<std::path::PathBuf>,
+}
+
+/// Strip `filter:KEY` / `project:X` / `model:X` / `branch:X` tokens out of
+/// the raw query and return the remaining free text. Unknown tokens fall
+/// through as free text so users typing a colon mid-word aren't punished.
+pub fn parse_search_query(input: &str) -> (SearchFilters, String) {
+    let mut filters = SearchFilters::default();
+    let mut free_tokens: Vec<&str> = Vec::new();
+    for token in input.split_whitespace() {
+        if let Some((key, value)) = token.split_once(':') {
+            let key_lower = key.to_ascii_lowercase();
+            let value_lower = value.to_ascii_lowercase();
+            match key_lower.as_str() {
+                "filter" => match value_lower.as_str() {
+                    "live" => filters.state = Some(SessionStateFilter::Live),
+                    "paused" => filters.state = Some(SessionStateFilter::Paused),
+                    "busy" => filters.state = Some(SessionStateFilter::Busy),
+                    "today" => filters.period = Some(PeriodFilter::Today),
+                    "week" => filters.period = Some(PeriodFilter::Week),
+                    "month" => filters.period = Some(PeriodFilter::Month),
+                    // `filter:date:YYYY-MM-DD` — value carries the
+                    // sub-prefix `date:` then the parseable date string.
+                    v if v.starts_with("date:") => {
+                        let raw = &v["date:".len()..];
+                        if let Ok(d) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+                            filters.period = Some(PeriodFilter::On(d));
+                        } else {
+                            free_tokens.push(token);
+                        }
+                    }
+                    _ => free_tokens.push(token),
+                },
+                "project" if !value.is_empty() => filters.project = Some(value.to_string()),
+                "model" if !value.is_empty() => filters.model = Some(value.to_string()),
+                "branch" if !value.is_empty() => filters.branch = Some(value.to_string()),
+                _ => free_tokens.push(token),
+            }
+        } else {
+            free_tokens.push(token);
+        }
+    }
+    (filters, free_tokens.join(" "))
+}
+
+/// Public re-export of `period_matches` for callers that already have the
+/// remapped `(day_idx, session_idx)` and just want to apply the filter
+/// step (e.g. the tantivy-result poll in `main.rs`).
+pub fn period_matches_for_filter(
+    day: NaiveDate,
+    period: Option<PeriodFilter>,
+    today: NaiveDate,
+) -> bool {
+    period_matches(day, period, today)
+}
+
+/// Public re-export of the per-session filter predicate. Same caveat as
+/// `period_matches_for_filter`.
+pub fn session_passes_filters(
+    session: &crate::aggregator::SessionInfo,
+    filters: &SearchFilters,
+    ctx: &SearchFiltersContext,
+) -> bool {
+    session_matches_filters(session, filters, ctx)
+}
+
+/// True when the day satisfies the period filter. `None` = pass.
+fn period_matches(day: NaiveDate, period: Option<PeriodFilter>, today: NaiveDate) -> bool {
+    match period {
+        None => true,
+        Some(PeriodFilter::Today) => day == today,
+        Some(PeriodFilter::Week) => {
+            let diff = (today - day).num_days();
+            (0..=6).contains(&diff)
+        }
+        Some(PeriodFilter::Month) => {
+            let diff = (today - day).num_days();
+            (0..=29).contains(&diff)
+        }
+        Some(PeriodFilter::On(target)) => day == target,
+    }
+}
+
+fn session_matches_filters(
+    session: &crate::aggregator::SessionInfo,
+    filters: &SearchFilters,
+    ctx: &SearchFiltersContext,
+) -> bool {
+    if let Some(state) = filters.state {
+        let path = &session.file_path;
+        let ok = match state {
+            SessionStateFilter::Live => ctx.live_paths.contains(path),
+            SessionStateFilter::Busy => ctx.busy_paths.contains(path),
+            SessionStateFilter::Paused => ctx.paused_paths.contains(path),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(p) = &filters.project {
+        let needle = p.to_lowercase();
+        if !session.project_name.to_lowercase().contains(&needle) {
+            return false;
+        }
+    }
+    if let Some(m) = &filters.model {
+        let needle = m.to_lowercase();
+        let hit = session
+            .model
+            .as_ref()
+            .is_some_and(|s| s.to_lowercase().contains(&needle));
+        if !hit {
+            return false;
+        }
+    }
+    if let Some(b) = &filters.branch {
+        let needle = b.to_lowercase();
+        let hit = session
+            .git_branch
+            .as_ref()
+            .is_some_and(|s| s.to_lowercase().contains(&needle));
+        if !hit {
+            return false;
+        }
+    }
+    true
+}
 
 #[derive(Clone)]
 pub struct SearchResult {
@@ -32,16 +208,51 @@ pub enum SearchMatchType {
     Content,
 }
 
-pub fn perform_search(daily_groups: &[DailyGroup], query: &str) -> Vec<SearchResult> {
-    if query.is_empty() {
+pub fn perform_search(
+    daily_groups: &[DailyGroup],
+    query: &str,
+    ctx: &SearchFiltersContext,
+) -> Vec<SearchResult> {
+    let (filters, free_text) = parse_search_query(query);
+    if filters.is_empty() && free_text.is_empty() {
         return Vec::new();
     }
 
-    let query_lower = query.to_lowercase();
+    let query_lower = free_text.to_lowercase();
+    let no_text = free_text.is_empty();
     let mut results = Vec::new();
+    // Dedupe: one row per session (keyed on file_path) even when the same
+    // session shows up under multiple days. `daily_groups` is iterated
+    // newest-first, so the first hit per path is the most-recent day —
+    // exactly what a user clicking into "the live ccsight session" wants
+    // to land on. Without this, filter:live returns N×days rows when the
+    // user expects N rows.
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
 
     for (day_idx, group) in daily_groups.iter().enumerate() {
+        if !period_matches(group.date, filters.period, ctx.today) {
+            continue;
+        }
         for (session_idx, session) in group.sessions.iter().filter(|s| !s.is_subagent).enumerate() {
+            if !session_matches_filters(session, &filters, ctx) {
+                continue;
+            }
+            if !seen.insert(session.file_path.clone()) {
+                continue;
+            }
+            // Filter-only query (no free text): include every session that
+            // passed the filter step, newest-first via the existing
+            // daily_groups order.
+            if no_text {
+                results.push(SearchResult {
+                    day_idx,
+                    session_idx,
+                    snippet: None,
+                    match_type: SearchMatchType::ProjectName,
+                    session_path: None,
+                });
+                continue;
+            }
             if session.project_name.to_lowercase().contains(&query_lower) {
                 // The project column is already on line 1, so a snippet that
                 // re-prints the project name would just duplicate it. Set
@@ -229,6 +440,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_filter_live() {
+        let (f, free) = parse_search_query("filter:live");
+        assert_eq!(f.state, Some(SessionStateFilter::Live));
+        assert_eq!(free, "");
+    }
+
+    #[test]
+    fn parse_filter_with_free_text() {
+        let (f, free) = parse_search_query("filter:today mcp setup");
+        assert_eq!(f.period, Some(PeriodFilter::Today));
+        assert_eq!(free, "mcp setup");
+    }
+
+    #[test]
+    fn parse_property_filters() {
+        let (f, free) = parse_search_query("project:ccsight branch:main model:opus");
+        assert_eq!(f.project.as_deref(), Some("ccsight"));
+        assert_eq!(f.branch.as_deref(), Some("main"));
+        assert_eq!(f.model.as_deref(), Some("opus"));
+        assert_eq!(free, "");
+    }
+
+    #[test]
+    fn parse_unknown_filter_value_falls_through() {
+        let (f, free) = parse_search_query("filter:nonsense actual");
+        assert!(f.is_empty());
+        assert_eq!(free, "filter:nonsense actual");
+    }
+
+    #[test]
+    fn parse_url_with_colon_kept_as_free_text() {
+        let (f, free) = parse_search_query("https://example.com/path");
+        assert!(f.is_empty());
+        assert_eq!(free, "https://example.com/path");
+    }
+
+    #[test]
     fn test_extract_snippet_with_newlines() {
         let text = "line1\nline2\nline3 target line4\nline5";
         let result = extract_snippet(text, "target", 30);
@@ -258,6 +506,35 @@ mod tests {
     use crate::aggregator::DailyGroup;
     use crate::test_helpers::helpers::{make_daily_group, make_session};
     use chrono::NaiveDate;
+
+    /// Default-empty filter context for legacy tests that don't exercise
+    /// the new `filter:` / `project:` / etc. syntax. Today is fixed at the
+    /// epoch so period filters never accidentally match a real date.
+    fn empty_ctx() -> (
+        std::collections::HashSet<std::path::PathBuf>,
+        std::collections::HashSet<std::path::PathBuf>,
+        std::collections::HashSet<std::path::PathBuf>,
+    ) {
+        (
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        )
+    }
+    fn ctx<'a>(
+        sets: &'a (
+            std::collections::HashSet<std::path::PathBuf>,
+            std::collections::HashSet<std::path::PathBuf>,
+            std::collections::HashSet<std::path::PathBuf>,
+        ),
+    ) -> SearchFiltersContext<'a> {
+        SearchFiltersContext {
+            today: NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(), // lint-ok: date-literal
+            live_paths: &sets.0,
+            busy_paths: &sets.1,
+            paused_paths: &sets.2,
+        }
+    }
 
     fn make_groups() -> Vec<DailyGroup> {
         vec![
@@ -290,14 +567,18 @@ mod tests {
     #[test]
     fn test_search_empty_query_returns_empty() {
         let groups = make_groups();
-        let results = perform_search(&groups, "");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "", &__ctx);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_by_project_name() {
         let groups = make_groups();
-        let results = perform_search(&groups, "app-a");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "app-a", &__ctx);
         assert_eq!(results.len(), 2);
         assert!(matches!(
             results[0].match_type,
@@ -312,14 +593,18 @@ mod tests {
     #[test]
     fn test_search_by_project_name_case_insensitive() {
         let groups = make_groups();
-        let results = perform_search(&groups, "APP-A");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "APP-A", &__ctx);
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_search_by_summary() {
         let groups = make_groups();
-        let results = perform_search(&groups, "login bug");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "login bug", &__ctx);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].match_type, SearchMatchType::Summary));
         assert_eq!(results[0].day_idx, 0);
@@ -330,7 +615,9 @@ mod tests {
     #[test]
     fn test_search_by_git_branch() {
         let groups = make_groups();
-        let results = perform_search(&groups, "feature/project");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "feature/project", &__ctx);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].match_type, SearchMatchType::GitBranch));
         assert_eq!(results[0].session_idx, 0);
@@ -339,7 +626,9 @@ mod tests {
     #[test]
     fn test_search_by_date() {
         let groups = make_groups();
-        let results = perform_search(&groups, "2026-02-25"); // lint-ok: date-literal
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "2026-02-25", &__ctx); // lint-ok: date-literal
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].match_type, SearchMatchType::Date));
         assert_eq!(results[0].day_idx, 1);
@@ -348,7 +637,9 @@ mod tests {
     #[test]
     fn test_search_by_partial_date() {
         let groups = make_groups();
-        let results = perform_search(&groups, "2026-02");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "2026-02", &__ctx);
         assert_eq!(results.len(), 3);
         assert!(
             results
@@ -367,7 +658,9 @@ mod tests {
                 None,
             )],
         )];
-        let results = perform_search(&groups, "myapp");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "myapp", &__ctx);
         assert_eq!(
             results.len(),
             1,
@@ -382,14 +675,18 @@ mod tests {
     #[test]
     fn test_search_no_match() {
         let groups = make_groups();
-        let results = perform_search(&groups, "nonexistent-xyz");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "nonexistent-xyz", &__ctx);
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_search_indices_correct_with_multiple_sessions() {
         let groups = make_groups();
-        let results = perform_search(&groups, "other-app");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "other-app", &__ctx);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].day_idx, 0);
         assert_eq!(results[0].session_idx, 1);
@@ -398,7 +695,9 @@ mod tests {
     #[test]
     fn test_search_content_match_does_not_duplicate_metadata_match() {
         let groups = make_groups();
-        let meta_results = perform_search(&groups, "app-a");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let meta_results = perform_search(&groups, "app-a", &__ctx);
         assert_eq!(meta_results.len(), 2);
         let already_matched = meta_results
             .iter()
@@ -412,7 +711,9 @@ mod tests {
     #[test]
     fn test_search_date_matches_all_sessions_in_day() {
         let groups = make_groups();
-        let results = perform_search(&groups, "2026-02-24"); // lint-ok: date-literal
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "2026-02-24", &__ctx); // lint-ok: date-literal
         assert_eq!(
             results.len(),
             2,
@@ -433,7 +734,9 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), // lint-ok: date-literal
             vec![make_session("~/projects/x", Some(&long_summary), None)],
         )];
-        let results = perform_search(&groups, "target");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "target", &__ctx);
         assert_eq!(results.len(), 1);
         let snippet = results[0].snippet.as_ref().unwrap();
         assert!(snippet.contains("target"));
@@ -456,7 +759,9 @@ mod tests {
                 make_session("~/projects/main-project", None, None),
             ],
         )];
-        let results = perform_search(&groups, "main-project");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "main-project", &__ctx);
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].session_idx, 0,
@@ -474,7 +779,9 @@ mod tests {
                 s
             }],
         )];
-        let results = perform_search(&groups, "agent-task");
+        let __c = empty_ctx();
+        let __ctx = ctx(&__c);
+        let results = perform_search(&groups, "agent-task", &__ctx);
         assert_eq!(results.len(), 0, "subagent sessions should be excluded");
     }
 }

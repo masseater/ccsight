@@ -202,7 +202,7 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
     ])
     .block(Block::default().borders(Borders::NONE));
 
-    let active_days = state.daily_groups.len();
+    let active_days = state.active_days();
     let days_card = Paragraph::new(vec![
         Line::from(Span::styled(
             format!("{active_days}"),
@@ -211,8 +211,11 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
-        Line::from(Span::styled("days", Style::default().fg(theme::DIM)))
-            .alignment(Alignment::Center),
+        Line::from(Span::styled(
+            "active days",
+            Style::default().fg(theme::DIM),
+        ))
+        .alignment(Alignment::Center),
     ])
     .block(Block::default().borders(Borders::NONE));
 
@@ -491,9 +494,9 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
     };
 
     let actual_end = display_end.min(today);
-    // ISO 8601 separator (`-`) for YY-MM, matching the Monthly graph labels.
-    // Previously used `/` which conflicted with the rest of the project's
-    // date-style rule (no locale-dependent slashes in numeric date forms).
+    // ISO 8601 separator (`-`) for YY-MM, matching the Monthly graph labels
+    // and the project-wide date-style rule (no locale-dependent slashes in
+    // numeric date forms).
     let marker = if selected { '◈' } else { '◇' };
     let title = format!(
         " {marker} Activity {}-{} - {}-{}",
@@ -621,14 +624,11 @@ fn draw_top_projects(
     scroll: usize,
 ) {
     let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-    // Tiebreaker on name (lint #30) — without it, projects with identical
-    // token counts shuffle between frames since HashMap iteration is
-    // randomized per-instance.
-    projects.sort_by(|a, b| {
-        b.1.work_tokens
-            .cmp(&a.1.work_tokens)
-            .then_with(|| a.0.cmp(b.0))
-    });
+    // Sort goes through `state.sort_projects` (single source of truth) so
+    // the panel draw, detail popup, keyboard Enter, and mouse double-click
+    // all index into the same list. Alphabetical tiebreaker (lint #30) is
+    // inside the helper.
+    state.sort_projects(&mut projects);
 
     let total_tokens: u64 = projects.iter().map(|(_, s)| s.work_tokens).sum();
     let (visible_height, _, scroll) = calc_scroll(area.height, projects.len(), scroll, 2);
@@ -668,10 +668,11 @@ fn draw_top_projects(
     // instead of the misleading `1/1` that the previous `.max(1)` produced.
     let total = projects.len();
     let pos = if total == 0 { 0 } else { scroll + 1 };
+    let sort_label = state.dashboard_projects_sort.label();
     let title = if selected {
-        format!(" ◈ Projects {pos}/{total} ")
+        format!(" ◈ Projects {pos}/{total} · {sort_label} (s) ")
     } else {
-        format!(" ◇ Projects {pos}/{total}")
+        format!(" ◇ Projects {pos}/{total} · {sort_label}")
     };
 
     let table = Table::new(
@@ -713,9 +714,10 @@ fn draw_model_tokens(
             (name.clone(), work_tokens, cost)
         })
         .collect();
-    // Tiebreaker on model name keeps tied-token models stable; source is a
-    // Vec assembled from HashMap iteration upstream so ties would shuffle.
-    models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Sort goes through `state.sort_models` so the panel and the detail
+    // popup share one comparator. Alphabetical tiebreaker keeps tied rows
+    // stable across frames (HashMap iteration is randomized).
+    state.sort_models(&mut models);
 
     let total_tokens: u64 = models.iter().map(|(_, t, _)| *t).sum();
 
@@ -758,18 +760,13 @@ fn draw_model_tokens(
         Style::default().fg(theme::DIM)
     };
 
+    let sort_label = state.dashboard_models_sort.label();
+    let pos = if models.is_empty() { 0 } else { scroll + 1 };
+    let total = models.len();
     let title = if selected {
-        format!(
-            " ◈ Models {}/{}",
-            if models.is_empty() { 0 } else { scroll + 1 },
-            models.len()
-        )
+        format!(" ◈ Models {pos}/{total} · {sort_label} (s) ")
     } else {
-        format!(
-            " ◇ Models {}/{}",
-            if models.is_empty() { 0 } else { scroll + 1 },
-            models.len()
-        )
+        format!(" ◇ Models {pos}/{total} · {sort_label}")
     };
 
     let table = Table::new(
@@ -883,17 +880,17 @@ fn draw_tool_usage(
     // Each entry: (section_index, label, uniq_count, uniq_unit, total_calls, color)
     // Order matches the popup tabs: Tools → Skills → Commands → Subagents.
     // Built-in and MCP are merged into "Tools" mirroring the popup body.
-    // `tools_uniq` counts groups the same way the popup does: Built-in is one
-    // expandable group (not 31 individual tools) plus one row per MCP server.
-    // Earlier the preview used `builtin.len() + mcp_servers.len()` which made
-    // the same word "groups" mean two different things across views.
+    // `tools_uniq` counts groups the same way the popup does: Built-in is
+    // one expandable group (not 31 individual tools) plus one row per MCP
+    // server. Counting individual built-in tools would make the same word
+    // "groups" mean two different things across views.
     let tools_uniq = usize::from(!builtin.is_empty()) + mcp_servers.len();
     let tools_total_calls = builtin_total + mcp_total;
     // Skills / Commands / Subagents preview counts include configured-but-
     // unused entries so they match the popup body's row count exactly.
-    // Without this the same word "uniq" meant 13 in the preview and 24 in the
-    // popup for Skills, etc. — same regression class as the original
-    // `tools_uniq` mismatch fixed earlier.
+    // Counting only entries with calls would make the same word "uniq"
+    // disagree between the preview and the popup, matching the regression
+    // pattern that `tools_uniq` also avoids.
     let extra_skill = state
         .configured_resources
         .skills
@@ -916,10 +913,9 @@ fn draw_tool_usage(
     let commands_uniq = command.len() + extra_command;
     let subagents_uniq = agent.len() + extra_agent;
     // Colors come from `theme::CAT_*` (single source of truth) — the same
-    // Tools color is used by the popup tab so clicking the preview row and
-    // landing in the popup feels visually contiguous. Earlier this used
-    // theme::ACCENT (cyan) for Tools, which clashed with the popup tab's
-    // green and made the transition feel like switching categories.
+    // Tools color flows from the preview row into the popup tab so the
+    // transition feels visually contiguous instead of like switching
+    // categories.
     let categories: [(usize, &str, usize, &str, usize, Color); 4] = [
         (
             0,
@@ -1070,10 +1066,9 @@ fn draw_tool_usage(
         let pad = arrow_pos.saturating_sub(used);
         // Arrow always uses the row's canonical category color so the
         // four rows look like one consistent "click to expand" affordance.
-        // Earlier the Tools-row arrow flipped to WARNING when stale > 0 to
-        // attract attention, but that broke the visual rhythm with the other
-        // three rows. Stale signaling is already redundant via the inline
-        // `N stale` suffix and the Tier 3 alert.
+        // Stale signaling lives on the inline `N stale` suffix and the
+        // Tier 3 alert; recoloring the arrow on stale > 0 would break the
+        // visual rhythm with the other three rows for redundant info.
         let arrow_color = *color;
         lines.push(Line::from(vec![
             Span::styled(
@@ -1125,11 +1120,7 @@ fn draw_tool_usage(
             )]));
             let name_w = (inner_width as usize).saturating_sub(15);
             for (name, count) in &top_tools {
-                let pct = if grand_total > 0 {
-                    (*count as f64 / grand_total as f64 * 100.0) as u32
-                } else {
-                    0
-                };
+                let pct = crate::text::format_pct(*count as u64, grand_total as u64);
                 let display: String = (*name).chars().take(name_w).collect();
                 let pad = name_w.saturating_sub(display.chars().count());
                 lines.push(Line::from(vec![
@@ -1142,7 +1133,7 @@ fn draw_tool_usage(
                         format!(" {:>5}", crate::format_number(*count as u64)),
                         Style::default().fg(theme::LABEL_MUTED),
                     ),
-                    Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
                 ]));
             }
         }
@@ -1465,7 +1456,7 @@ fn draw_recent_costs(
         rows,
         [
             Constraint::Length(4),
-            Constraint::Min(10),
+            Constraint::Min(11),
             Constraint::Length(6),
             Constraint::Length(8),
         ],
@@ -1578,20 +1569,14 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
     let forecast = run_rate * days_in_month as f64;
     let days_remaining = days_in_month.saturating_sub(day_of_month);
 
-    let delta_pct = if prev_month_cost > 0.0 {
-        Some(((forecast - prev_month_cost) / prev_month_cost) * 100.0)
+    // Surface the previous month's actual total verbatim so the reader can
+    // compare it against `forecast` directly. A pre-computed percentage of
+    // (forecast / prev - 1) reads like an actual month-over-month delta but
+    // is forecast-projected, which misleads readers about completed activity.
+    let delta_text = if prev_month_cost > 0.0 {
+        format!("→ prev {}", super::format_cost(prev_month_cost, 0))
     } else {
-        None
-    };
-    // Most users run ccsight against a flat-rate subscription; the dollar
-    // figures in this popup are API-equivalent estimates, not actual bills.
-    // Higher usage is therefore a neutral signal (more value extracted from
-    // the plan), so the delta carries no warning/success colouring.
-    let delta_text = match delta_pct {
-        Some(d) if d.abs() < 1.0 => "≈ MoM".to_string(),
-        Some(d) if d > 0.0 => format!("↑+{d:.0}% MoM"),
-        Some(d) => format!("↓{d:.0}% MoM"),
-        None => "MoM —".to_string(),
+        String::from("→ prev —")
     };
 
     let summary = vec![
@@ -1644,7 +1629,7 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
     )];
     if mtd_cost > 0.0 && !model_costs.is_empty() {
         for (i, (name, cost)) in model_costs.iter().take(3).enumerate() {
-            let pct = (cost / mtd_cost) * 100.0;
+            let pct_str = crate::text::format_pct_f64(*cost, mtd_cost);
             if i > 0 {
                 model_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
             }
@@ -1653,7 +1638,7 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
                 Style::default().fg(theme::LABEL_MUTED),
             ));
             model_line.push(Span::styled(
-                format!(" {} {pct:.0}%", super::format_cost(*cost, 0)),
+                format!(" {} {pct_str}", super::format_cost(*cost, 0)),
                 Style::default().fg(theme::PRIMARY),
             ));
         }
@@ -1696,14 +1681,14 @@ pub(crate) fn costs_header_lines(state: &AppState, today: chrono::NaiveDate) -> 
     )];
     if mtd_cost > 0.0 && !project_costs.is_empty() {
         for (i, (name, cost)) in project_costs.iter().take(3).enumerate() {
-            let pct = (cost / mtd_cost) * 100.0;
+            let pct_str = crate::text::format_pct_f64(*cost, mtd_cost);
             if i > 0 {
                 project_line.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
             }
             let label = state.project_label(name);
             project_line.push(Span::styled(label, Style::default().fg(theme::LABEL_MUTED)));
             project_line.push(Span::styled(
-                format!(" {} {pct:.0}%", super::format_cost(*cost, 0)),
+                format!(" {} {pct_str}", super::format_cost(*cost, 0)),
                 Style::default().fg(theme::PRIMARY),
             ));
         }
@@ -1813,16 +1798,17 @@ pub(crate) fn activity_header_lines(
         }
     }
 
-    let delta_pct = if prev_tokens > 0 {
-        Some(((this_tokens as f64 - prev_tokens as f64) / prev_tokens as f64) * 100.0)
+    // Surface the previous week's actual total verbatim so the reader can
+    // compare it against `this_tokens` directly. A pre-computed `↓N% WoW`
+    // reads like an actual week-over-week delta but compares a partial
+    // current week against a full prior week, which biases the number low.
+    let (delta_text, delta_color) = if prev_tokens > 0 {
+        (
+            format!("→ prev {} tok", crate::format_number(prev_tokens)),
+            theme::DIM,
+        )
     } else {
-        None
-    };
-    let (delta_text, delta_color) = match delta_pct {
-        Some(d) if d.abs() < 1.0 => ("≈ WoW".to_string(), theme::DIM),
-        Some(d) if d > 0.0 => (format!("↑+{d:.0}% WoW"), theme::SUCCESS),
-        Some(d) => (format!("↓{d:.0}% WoW"), theme::WARNING),
-        None => ("WoW —".to_string(), theme::DIM),
+        ("→ prev —".to_string(), theme::DIM)
     };
 
     let summary = vec![
@@ -1848,7 +1834,7 @@ pub(crate) fn activity_header_lines(
     let dow_max = dow_tokens.iter().copied().max().unwrap_or(1).max(1);
     let dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let mut dow_line: Vec<Span> = vec![Span::styled(
-        "  Day-of-week  ",
+        "  Day-of-week (all-time)  ",
         Style::default().fg(theme::DIM),
     )];
     for (i, name) in dow_names.iter().enumerate() {
@@ -2103,7 +2089,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             if state.activity_view_weekly {
                 weekly_activity(state).len()
             } else {
-                state.daily_groups.len()
+                // Match the row count after the zero-billable-token filter
+                // applied below so the scroll indicator (1-N/M) is correct.
+                state.active_days()
             }
         }
         6 => 24,
@@ -2235,20 +2223,14 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
         }
         1 => {
             let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-            // Alphabetical tiebreaker required by lint #30 — HashMap iteration
-            // is unordered, and the mouse double-click handler indexes into
-            // the same sort, so both sides need a stable key when tokens tie.
-            projects.sort_by(|a, b| {
-                b.1.work_tokens
-                    .cmp(&a.1.work_tokens)
-                    .then_with(|| a.0.cmp(b.0))
-            });
+            state.sort_projects(&mut projects);
             // `scroll` is the cursor (j/k moves it; Enter opens this row).
             // The actual viewport offset lives in `dashboard_viewport[1]`
             // and only adjusts when the cursor leaves the visible window.
             let cursor = scroll;
             let selected_path = projects.get(cursor).map_or("", |(name, _)| name.as_str());
-            let title = format!(" ◈ {selected_path} ");
+            let sort_label = state.dashboard_projects_sort.label();
+            let title = format!(" ◈ {selected_path}  · {sort_label} (s) ");
             let mut lines: Vec<Line> = Vec::new();
             let max_tokens = projects.first().map_or(1, |(_, s)| s.work_tokens);
             let bar_width = 12usize;
@@ -2261,7 +2243,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
             let mut project_daily_tokens: HashMap<String, Vec<(NaiveDate, u64)>> = HashMap::new();
             for group in state.daily_groups.iter().rev() {
-                for session in group.user_sessions() {
+                for session in &group.sessions {
                     let work = session.work_tokens();
                     let daily = project_daily_tokens
                         .entry(session.project_name.clone())
@@ -2295,7 +2277,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let mut project_first_date: HashMap<String, NaiveDate> = HashMap::new();
             let mut project_active_days: HashMap<String, usize> = HashMap::new();
             for group in &state.daily_groups {
-                for session in group.user_sessions() {
+                for session in &group.sessions {
                     for (model, tokens) in &session.day_tokens_by_model {
                         let cost = calculator
                             .calculate_cost(tokens, Some(model))
@@ -2446,7 +2428,8 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             (title, lines)
         }
         2 => {
-            let title = " Model Tokens ".to_string();
+            let sort_label = state.dashboard_models_sort.label();
+            let title = format!(" Model Tokens  · {sort_label} (s) ");
             let mut lines: Vec<Line> = Vec::new();
             let calculator = CostCalculator::global();
 
@@ -2499,7 +2482,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 .max()
                 .unwrap_or(1);
 
-            let mut models: Vec<_> = state
+            let mut models: Vec<(String, u64, (crate::aggregator::TokenStats, f64))> = state
                 .aggregated_model_tokens
                 .iter()
                 .map(|(name, ts)| {
@@ -2509,18 +2492,20 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         .iter()
                         .find(|(n, _)| n == name)
                         .map_or(0.0, |(_, c)| *c);
-                    (name.clone(), ts.clone(), work_tokens, cost)
+                    (name.clone(), work_tokens, (ts.clone(), cost))
                 })
                 .collect();
-            models.sort_by_key(|m| std::cmp::Reverse(m.2));
+            // Sort via shared helper so cursor index lines up with the
+            // panel and the popup never disagree on order.
+            state.sort_models(&mut models);
 
-            let total_tokens: u64 = models.iter().map(|(_, _, t, _)| *t).sum();
-            let max_tokens = models.first().map_or(1, |(_, _, t, _)| *t);
+            let total_tokens: u64 = models.iter().map(|(_, t, _)| *t).sum();
+            let max_tokens = models.first().map_or(1, |(_, t, _)| *t);
             let bar_width = 15usize;
             let name_width = content_width.saturating_sub(50);
             let items_visible = visible_height / 3;
 
-            for (i, (model, ts, work_tokens, cost)) in
+            for (i, (model, work_tokens, (ts, cost))) in
                 models.iter().enumerate().skip(scroll).take(items_visible)
             {
                 let ratio = if max_tokens > 0 {
@@ -2528,11 +2513,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 } else {
                     0.0
                 };
-                let pct = if total_tokens > 0 {
-                    (*work_tokens as f64 / total_tokens as f64 * 100.0) as u32
-                } else {
-                    0
-                };
+                let pct = crate::text::format_pct(*work_tokens, total_tokens);
                 let filled = (ratio * bar_width as f64).round() as usize;
                 let unknown = state.models_without_pricing.contains(model);
                 let bar = if unknown {
@@ -2629,7 +2610,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         format!(" {}", crate::format_number(*work_tokens)),
                         Style::default().fg(theme::PRIMARY),
                     ),
-                    Span::styled(format!(" {pct:>2}%"), Style::default().fg(bar_color)),
+                    Span::styled(format!(" {pct:>3}"), Style::default().fg(bar_color)),
                     Span::styled(date_range, Style::default().fg(theme::DIM)),
                 ]));
                 let info_color = if unknown {
@@ -2935,12 +2916,11 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                         entry.last_used = status.last_used;
                         entry.configured = status.configured;
                     } else if status.configured {
-                        // Configured server with no log entries (stale-never).
-                        // Earlier the Tools popup hid these — only servers that
-                        // appeared in `tool_usage` got a row — so users couldn't
-                        // see "configured but unused" servers in the same view as
-                        // the stale count. Surface them as 0-call rows so the
-                        // visible list matches the legend's "N stale".
+                        // Configured server with no log entries (stale-never)
+                        // is surfaced as a 0-call row so the visible list
+                        // matches the legend's "N stale" — counting only
+                        // servers present in `tool_usage` would hide
+                        // "configured but unused" servers from the same view.
                         servers.insert(
                             status.name.clone(),
                             GroupAgg {
@@ -2956,9 +2936,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 let mut rows: Vec<(String, GroupAgg)> = servers.into_iter().collect();
 
                 // Synthetic "Built-in" row when there are any built-in tools.
-                // It participates in the same cursor / sort / expansion logic as
-                // an MCP server. `builtin` was moved into `sections[0]`, so we
-                // read items off the section instead.
+                // It participates in the same cursor / sort / expansion logic
+                // as an MCP server, reading its items off `sections[0]` (the
+                // canonical home for built-in tools).
                 let builtin_items = &sections[0].items;
                 if !builtin_items.is_empty() {
                     let mut bi = GroupAgg {
@@ -2983,12 +2963,12 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
 
                 let now_for_legend = chrono::Utc::now();
                 // Stale count uses the same source-of-truth as the Dashboard
-                // Ecosystem preview: `mcp_status` + `is_underutilized` (>=30d
-                // OR never-used, configured only). Earlier this was counted
-                // off `rows` with a `>30` threshold — that excluded configured
-                // servers absent from logs and produced an off-by-one against
-                // the preview, leaving users with two contradictory numbers.
-                // Built-in is excluded by construction (not a member of `mcp_status`).
+                // Ecosystem preview: `mcp_status` + `is_underutilized`
+                // (>=30d OR never-used, configured only). Counting off
+                // `rows` with a `>30` threshold would exclude configured
+                // servers absent from logs and produce an off-by-one
+                // against the preview. Built-in is excluded by construction
+                // (not a member of `mcp_status`).
                 let stale_count = state
                     .mcp_status
                     .iter()
@@ -3060,27 +3040,39 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 let selected_idx = state.mcp_selected_server.min(rows.len().saturating_sub(1));
 
                 for (i, (group, agg)) in rows.iter().enumerate() {
+                    // Separator between Built-in and the MCP block: the two
+                    // categories use different `%` denominators (Built-in vs
+                    // grand total, MCP rows vs `mcp_total`) so a divider with
+                    // a `(% within MCP)` hint keeps the column readable.
+                    if i > 0
+                        && rows[i - 1].1.is_builtin
+                        && !agg.is_builtin
+                        && let Some(line_width) = popup_area.width.checked_sub(4)
+                    {
+                        let label = " MCP servers (% within MCP) ";
+                        let label_len = label.chars().count();
+                        let dash_total = (line_width as usize).saturating_sub(label_len);
+                        let left = dash_total / 2;
+                        let right = dash_total - left;
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("─".repeat(left), Style::default().fg(theme::SEPARATOR)),
+                            Span::styled(label, Style::default().fg(theme::CAT_MCP)),
+                            Span::styled("─".repeat(right), Style::default().fg(theme::SEPARATOR)),
+                        ]));
+                    }
                     let bar_max = if agg.is_builtin { builtin_max } else { mcp_max };
                     let ratio = agg.calls as f64 / bar_max as f64;
-                    // Percentage uses a per-category denominator: Built-in is
-                    // compared against `builtin_total`, MCP servers against
-                    // `mcp_total`. A shared denominator would make Built-in
-                    // dominate and squash every MCP server into a flat trough,
-                    // erasing per-server ranking detail.
+                    // MCP servers compare against `mcp_total` (per-category) so
+                    // ranking detail isn't squashed by Built-in dominance. The
+                    // Built-in row shows its share of the grand total instead,
+                    // matching the `Built-in N (X%)` summary line above.
                     let pct_denom = if agg.is_builtin {
-                        builtin_total
+                        builtin_total + mcp_total
                     } else {
                         mcp_total
                     };
-                    // Built-in is its own per-category denominator — the
-                    // resulting fraction is always full and carries no
-                    // information; the share vs grand total appears in the
-                    // summary line above, so suppress this column here.
-                    let pct_str: Option<String> = if agg.is_builtin {
-                        None
-                    } else {
-                        Some(crate::text::format_pct(agg.calls as u64, pct_denom as u64))
-                    };
+                    let pct_str = crate::text::format_pct(agg.calls as u64, pct_denom as u64);
                     let filled = (ratio * bar_width as f64).round() as usize;
                     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
                     // Built-in row gets the Built-in palette so it stays visually
@@ -3159,13 +3151,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             format!(" {:>5}", crate::format_number(agg.calls as u64)),
                             Style::default().fg(theme::LABEL_MUTED),
                         ),
-                        Span::styled(
-                            match &pct_str {
-                                Some(s) => format!(" {s:>3}"),
-                                None => "    ".to_string(),
-                            },
-                            Style::default().fg(theme::DIM),
-                        ),
+                        Span::styled(format!(" {pct_str:>3}"), Style::default().fg(theme::DIM)),
                         Span::styled(
                             format!(
                                 " · {tool_count} tool{}",
@@ -3209,11 +3195,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                                 .rsplit_once(':')
                                 .map_or_else(|| display.clone(), |(_, t)| t.to_string());
                             let t_ratio = *tcalls as f64 / tool_max as f64;
-                            let t_pct = if agg.calls > 0 {
-                                (*tcalls as f64 / agg.calls as f64 * 100.0) as u32
-                            } else {
-                                0
-                            };
+                            let t_pct = crate::text::format_pct(*tcalls as u64, agg.calls as u64);
                             let filled_t = (t_ratio * tool_bar_width as f64).round() as usize;
                             let t_bar = format!(
                                 "{}{}",
@@ -3251,7 +3233,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                                     Style::default().fg(theme::LABEL_MUTED),
                                 ),
                                 Span::styled(
-                                    format!(" {t_pct:>2}%"),
+                                    format!(" {t_pct:>3}"),
                                     Style::default().fg(theme::DIM),
                                 ),
                                 Span::styled(
@@ -3307,11 +3289,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 let mut row_idx = 0usize;
                 for (name, count) in sec.items.iter() {
                     let ratio = **count as f64 / max_usage as f64;
-                    let pct = if sec.total > 0 {
-                        (**count as f64 / sec.total as f64 * 100.0) as u32
-                    } else {
-                        0
-                    };
+                    let pct = crate::text::format_pct(**count as u64, sec.total as u64);
                     let filled = (ratio * bar_width as f64).round() as usize;
                     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
                     let (r, g, b) = rgb_from_table(&sec.bar_rgb_table, ratio);
@@ -3344,7 +3322,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                             format!(" {count:>4}"),
                             Style::default().fg(theme::LABEL_MUTED),
                         ),
-                        Span::styled(format!(" {pct:>2}%"), Style::default().fg(theme::DIM)),
+                        Span::styled(format!(" {pct:>3}"), Style::default().fg(theme::DIM)),
                         Span::styled(format!(" · {ses:>3} ses"), Style::default().fg(theme::DIM)),
                         Span::styled(
                             format!(" · {last_used_str}"),
@@ -3624,20 +3602,37 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             let title = " Daily Activity ".to_string();
             let mut lines: Vec<Line> = activity_header_lines(state, today);
             let body_height = visible_height.saturating_sub(ACTIVITY_HEADER_ROWS);
-            let daily: Vec<_> = state
+            // Skip zero-billable-token days so the row count matches the
+            // Overview headline (`active_days`) and the Costs panel ratio.
+            // The same `daily_costs` set defines "active" everywhere.
+            let active_dates: std::collections::HashSet<chrono::NaiveDate> =
+                state.daily_costs.iter().map(|(d, _)| *d).collect();
+            // Per-day breakdown: work total + the four billable buckets so
+            // users can spot what dominated a day at a glance (output-heavy
+            // refactor vs cache-read-heavy resume, etc.).
+            let daily: Vec<(chrono::NaiveDate, u64, u64, u64, u64, u64)> = state
                 .daily_groups
                 .iter()
+                .filter(|group| active_dates.contains(&group.date))
                 .map(|group| {
-                    let tokens: u64 = group
-                        .sessions
-                        .iter()
-                        .filter(|s| !s.is_subagent)
-                        .map(crate::aggregator::SessionInfo::work_tokens)
-                        .sum();
-                    (group.date, tokens)
+                    let mut work = 0u64;
+                    let mut input = 0u64;
+                    let mut output = 0u64;
+                    let mut cw = 0u64;
+                    let mut cr = 0u64;
+                    for s in group.sessions.iter().filter(|s| !s.is_subagent) {
+                        work += s.work_tokens();
+                        input += s.day_input_tokens;
+                        output += s.day_output_tokens;
+                        for ts in s.day_tokens_by_model.values() {
+                            cw += ts.cache_creation_tokens;
+                            cr += ts.cache_read_tokens;
+                        }
+                    }
+                    (group.date, work, input, output, cw, cr)
                 })
                 .collect();
-            let max_tokens = daily.iter().map(|(_, t)| *t).max().unwrap_or(1);
+            let max_tokens = daily.iter().map(|(_, w, ..)| *w).max().unwrap_or(1);
             let bar_width = 15usize;
 
             // Per-month totals (active days, work tokens, cost) so each
@@ -3646,11 +3641,11 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
             // in sync with the Costs panel by construction.
             let mut monthly_tok: std::collections::HashMap<(i32, u32), (u64, usize)> =
                 std::collections::HashMap::new();
-            for (date, tokens) in &daily {
+            for (date, work, ..) in &daily {
                 let entry = monthly_tok
                     .entry((date.year(), date.month()))
                     .or_insert((0, 0));
-                entry.0 += *tokens;
+                entry.0 += *work;
                 entry.1 += 1;
             }
             let mut monthly_cost: std::collections::HashMap<(i32, u32), f64> =
@@ -3661,7 +3656,9 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     .or_insert(0.0) += cost;
             }
             let mut prev_month: Option<(i32, u32)> = None;
-            for (i, (date, tokens)) in daily.iter().enumerate().skip(scroll).take(body_height) {
+            for (i, (date, work, input, output, cw, cr)) in
+                daily.iter().enumerate().skip(scroll).take(body_height)
+            {
                 let key = (date.year(), date.month());
                 if let Some(pm) = prev_month
                     && pm != key
@@ -3672,7 +3669,7 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                 }
                 prev_month = Some(key);
 
-                let ratio = *tokens as f64 / max_tokens as f64;
+                let ratio = *work as f64 / max_tokens as f64;
                 let filled = (ratio * bar_width as f64).round() as usize;
                 let intensity = (ratio * 0.7 + 0.3).min(1.0);
                 let bar_color = Color::Rgb(
@@ -3691,8 +3688,18 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
                     Span::raw(" "),
                     Span::styled(bar, Style::default().fg(bar_color)),
                     Span::styled(
-                        format!(" {:>9}", crate::format_number(*tokens)),
+                        format!(" {:>7}", crate::format_number(*work)),
                         Style::default().fg(theme::PRIMARY),
+                    ),
+                    Span::styled(
+                        format!(
+                            "  in {:>5} out {:>5} cw {:>5} cr {:>5}",
+                            crate::format_number(*input),
+                            crate::format_number(*output),
+                            crate::format_number(*cw),
+                            crate::format_number(*cr),
+                        ),
+                        Style::default().fg(theme::DIM),
                     ),
                 ]));
             }

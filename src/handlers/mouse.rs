@@ -204,9 +204,9 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
                 state.tools_detail_section = idx;
                 state.dashboard_scroll[state.dashboard_panel] = 0;
                 // Tools tab is index 0 (Built-in + MCP merged); reset MCP
-                // cursor when switching INTO it. Earlier this checked == 1
-                // (which was Skills) — a stale leftover from before the
-                // Tools/Skills/Commands/Subagents reordering.
+                // cursor when switching INTO it. The index pins to the
+                // first tab in the Tools/Skills/Commands/Subagents order;
+                // changing that order requires updating this check.
                 if state.tools_detail_section == 0 {
                     state.mcp_selected_server = 0;
                     state.mcp_selected_tool = None;
@@ -521,9 +521,8 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         //   line 0: "Active now (N)" header + status-count subtitle
         //   line 1..: active rows × 3 (metadata + title + last user message)
         //   then: blank separator + "Recently paused" header + paused rows × 3
-        // The active block starts at line 1 — before this it was line 2 with
-        // a leading blank, but that blank was removed for compactness and
-        // this hit-test math has to follow.
+        // The active block starts at line 1 — no leading blank line is
+        // rendered, so this hit-test math must match the draw function.
         const ROW_H: usize = 3;
         let active_block_start = 1usize;
         let active_block_end = active_block_start + active_count * ROW_H;
@@ -633,9 +632,13 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     if state.show_project_popup {
         if state.project_popup_selected == 0 {
             state.project_filter = None;
-        } else if let Some((name, _, _)) = state.project_list.get(state.project_popup_selected - 1)
-        {
-            state.project_filter = Some(name.clone());
+        } else {
+            // Selection indexes into the display-sorted view so the chosen
+            // row matches whatever the user is looking at on screen.
+            let sorted = state.project_list_sorted();
+            if let Some((name, _, _)) = sorted.get(state.project_popup_selected - 1).copied() {
+                state.project_filter = Some(name.clone());
+            }
         }
         state.apply_filter();
         state.show_project_popup = false;
@@ -663,11 +666,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
         for (idx, area) in state.project_detail_row_areas.clone() {
             if in_area(column, row, &area) {
                 let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-                projects.sort_by(|a, b| {
-                    b.1.work_tokens
-                        .cmp(&a.1.work_tokens)
-                        .then_with(|| a.0.cmp(b.0))
-                });
+                state.sort_projects(&mut projects);
                 if let Some((name, _)) = projects.get(idx) {
                     state.project_detail_path = (*name).clone();
                     state.project_detail_scroll = 0;

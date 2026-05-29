@@ -68,9 +68,10 @@ pub struct LiveSession {
     /// the PID is still alive). False when the session was reconstructed
     /// from a recent JSONL mtime alone (paused path).
     pub is_live: bool,
-    /// Paused-only signal: this session_id appeared in the persisted
-    /// snapshot of "previously observed alive". Powers the post-restart
-    /// "I had this open before reboot" hint via a `⟳` glyph.
+    /// Paused-only signal: this session_id appears in the persisted
+    /// snapshot of sessions observed alive prior to this ccsight run.
+    /// Powers the post-restart "I had this open before reboot" hint via
+    /// a `⟳` glyph.
     pub was_recently_live: bool,
 }
 
@@ -277,18 +278,18 @@ pub fn discover_recently_paused(
     out
 }
 
-/// Mark paused entries whose `session_id` appears in the persisted snapshot
-/// and re-sort so "previously open before restart" rows float to the top of
-/// the paused list. Run on the caller side because the snapshot lives
-/// outside this module.
+/// Mark paused entries whose `session_id` appears in the persisted
+/// snapshot and re-sort so rows that were open in the prior ccsight run
+/// float to the top of the paused list. Run on the caller side because
+/// the snapshot lives outside this module.
 pub fn mark_was_recently_live(
     paused: &mut [LiveSession],
     snapshot: &super::live_snapshot::LiveSnapshot,
     prior_run_anchor: Option<DateTime<Utc>>,
 ) {
     // Anchor = prior ccsight run's last `refresh()` moment. Sessions alive
-    // at that poll share that exact timestamp; mid-prior-run deaths keep
-    // their earlier stamp and fall outside the 1s tolerance window.
+    // at that poll share that exact timestamp; sessions that died mid-run
+    // keep a stamp from before the anchor and fall outside the 1s tolerance.
     let Some(anchor) = prior_run_anchor else {
         return;
     };

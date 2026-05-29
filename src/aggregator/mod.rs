@@ -11,7 +11,7 @@ pub(crate) use buckets::{
 
 pub use grouping::*;
 pub use pricing::*;
-pub use stats::{CacheStats, Stats, StatsAggregator, TokenStats};
+pub use stats::{CacheStats, ProjectStats, Stats, StatsAggregator, TokenStats};
 pub use tool_category::*;
 
 pub(crate) fn extract_project_name(entries: &[crate::domain::LogEntry]) -> Option<String> {

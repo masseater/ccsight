@@ -41,6 +41,10 @@ pub fn live_snapshot_path() -> Result<PathBuf> {
     Ok(state_root()?.join("live_snapshot.json"))
 }
 
+pub fn search_history_path() -> Result<PathBuf> {
+    Ok(state_root()?.join("search_history.json"))
+}
+
 /// One-shot migration from the pre-1.1 split paths. Idempotent: safe to call
 /// every startup. Renames `~/.cache/ccsight/{cache.json,index/}` and
 /// `~/.config/ccsight/pins.json` into `~/.ccsight/`. If the new path already

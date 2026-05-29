@@ -143,6 +143,27 @@ impl Pins {
         self.lookup.remove(path);
     }
 
+    /// Swap the entry at `idx` with the one above it. No-op when `idx`
+    /// is at the top or out of range. Used by the pins popup so users
+    /// can rearrange their order manually instead of being stuck with
+    /// pin-time ordering.
+    pub fn move_up(&mut self, idx: usize) -> bool {
+        if idx == 0 || idx >= self.entries.len() {
+            return false;
+        }
+        self.entries.swap(idx, idx - 1);
+        true
+    }
+
+    /// Swap the entry at `idx` with the one below it.
+    pub fn move_down(&mut self, idx: usize) -> bool {
+        if idx + 1 >= self.entries.len() {
+            return false;
+        }
+        self.entries.swap(idx, idx + 1);
+        true
+    }
+
     fn default_path() -> Result<PathBuf> {
         crate::infrastructure::pins_path()
     }

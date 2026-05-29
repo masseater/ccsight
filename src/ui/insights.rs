@@ -370,12 +370,12 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     let today = Local::now().date_naive();
     let current_hour = Local::now().hour() as u8;
 
+    // Subagents are included so the chart's full-day avg reconciles with
+    // the Overview total and Weekly avg sidebar. Filtering them here
+    // produced a different baseline than every other surface.
     let mut hourly_total: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
     for group in &state.daily_groups {
         for session in &group.sessions {
-            if session.is_subagent {
-                continue;
-            }
             for (hour, tokens) in &session.day_hourly_work_tokens {
                 *hourly_total.entry(*hour).or_insert(0) += tokens;
             }
@@ -388,7 +388,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
 
     let mut today_hourly: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
     if let Some(today_group) = state.daily_groups.iter().find(|g| g.date == today) {
-        for session in today_group.user_sessions() {
+        for session in &today_group.sessions {
             for (hour, tokens) in &session.day_hourly_work_tokens {
                 *today_hourly.entry(*hour).or_insert(0) += tokens;
             }
@@ -677,7 +677,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         cost_spans.push(Span::styled(
             format!(
                 "{:^width$}",
-                format!("${:.0}", cost.max(0.0)),
+                super::format_cost(**cost, 0),
                 width = col_width
             ),
             Style::default().fg(theme::WARM),
@@ -723,7 +723,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
                 let mut spans = vec![
                     Span::styled("this mo: ", Style::default().fg(theme::DIM)),
                     Span::styled(
-                        format!("${:.0}", current_cost.max(0.0)),
+                        super::format_cost(*current_cost, 0),
                         Style::default().fg(theme::PRIMARY),
                     ),
                 ];
@@ -735,7 +735,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
                         Style::default().fg(theme::DIM),
                     ));
                     spans.push(Span::styled(
-                        format!("${:.0}", forecast.max(0.0)),
+                        super::format_cost(forecast, 0),
                         Style::default().fg(theme::WARM),
                     ));
                 }
@@ -751,7 +751,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     let mut bottom_spans = vec![
         Span::styled(" avg: ", Style::default().fg(theme::DIM)),
         Span::styled(
-            format!("${:.0}/mo", avg_monthly.max(0.0)),
+            format!("{}/mo", super::format_cost(avg_monthly, 0)),
             Style::default().fg(theme::PRIMARY),
         ),
     ];
@@ -932,7 +932,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
         Some(first) => (today - first).num_days() as usize + 1,
         _ => 1,
     };
-    let active_days = state.daily_groups.len().max(1);
+    let active_days = state.active_days().max(1);
 
     let cache_read = state.stats.total_tokens.cache_read_tokens;
     let input_tokens = state.stats.total_tokens.input_tokens;
@@ -1220,7 +1220,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                                 .sum(),
                             den: 1.0,
                         },
-                        |v| format!("${v:.0}"),
+                        |v| super::format_cost(v, 0),
                     ),
                     build(
                         state,
@@ -1543,10 +1543,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 lines.push(sep.clone());
             }
 
-            // Per-category usage — absolute session-day counts only. Cross-category %
-            // was removed because the three categories have incommensurable invocation
-            // semantics (see note in the Metrics row). Each row shows how many sessions
-            // used at least one entry from that category, plus the top-used entry.
+            // Per-category usage — absolute session-day counts only. A
+            // cross-category % is intentionally omitted: the three
+            // categories have incommensurable invocation semantics (see
+            // note in the Metrics row). Each row shows how many sessions
+            // used at least one entry from that category, plus the
+            // top-used entry.
             {
                 let total = state.stats.total_session_days;
                 let skills = state.stats.sessions_using_skills;
@@ -1720,10 +1722,12 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             let today = Local::now().date_naive();
             let current_hour = Local::now().hour() as u8;
 
+            // Subagents are included to match the inline panel — the same
+            // chart on two surfaces must agree on its full-day avg baseline.
             let mut hourly_total: std::collections::HashMap<u8, u64> =
                 std::collections::HashMap::new();
             for group in &state.daily_groups {
-                for session in group.user_sessions() {
+                for session in &group.sessions {
                     for (hour, tokens) in &session.day_hourly_work_tokens {
                         *hourly_total.entry(*hour).or_insert(0) += tokens;
                     }
@@ -1737,7 +1741,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             let mut today_hourly: std::collections::HashMap<u8, u64> =
                 std::collections::HashMap::new();
             if let Some(today_group) = state.daily_groups.iter().find(|g| g.date == today) {
-                for session in today_group.user_sessions() {
+                for session in &today_group.sessions {
                     for (hour, tokens) in &session.day_hourly_work_tokens {
                         *today_hourly.entry(*hour).or_insert(0) += tokens;
                     }
@@ -2064,7 +2068,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                 cost_spans.push(Span::styled(
                     format!(
                         "{:^width$}",
-                        format!("${:.0}", cost.max(0.0)),
+                        super::format_cost(**cost, 0),
                         width = col_width
                     ),
                     Style::default().fg(theme::WARM),
@@ -2115,7 +2119,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             let mut summary_spans = vec![
                 Span::styled("  avg: ", Style::default().fg(theme::DIM)),
                 Span::styled(
-                    format!("${:.0}/mo", avg_monthly.max(0.0)),
+                    format!("{}/mo", super::format_cost(avg_monthly, 0)),
                     Style::default().fg(theme::PRIMARY),
                 ),
                 Span::styled(
@@ -2142,7 +2146,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                     summary_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
                     summary_spans.push(Span::styled("this mo: ", Style::default().fg(theme::DIM)));
                     summary_spans.push(Span::styled(
-                        format!("${:.0}", current_cost.max(0.0)),
+                        super::format_cost(*current_cost, 0),
                         Style::default().fg(theme::PRIMARY),
                     ));
                     if days_elapsed < days_in_month {
@@ -2151,7 +2155,7 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
                             Style::default().fg(theme::DIM),
                         ));
                         summary_spans.push(Span::styled(
-                            format!("${:.0}", forecast.max(0.0)),
+                            super::format_cost(forecast, 0),
                             Style::default().fg(theme::WARM),
                         ));
                     }
@@ -2159,8 +2163,11 @@ pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &
             }
             summary_spans.push(Span::styled(" | ", Style::default().fg(theme::DIM)));
             summary_spans.push(Span::styled("total: ", Style::default().fg(theme::DIM)));
+            // precision=0 matches the neighbouring avg / this mo / forecast
+            // figures on the same line and avoids clipping the last digit
+            // against the popup border.
             summary_spans.push(Span::styled(
-                super::format_cost(state.total_cost, 2),
+                super::format_cost(state.total_cost, 0),
                 Style::default().fg(theme::PRIMARY),
             ));
             lines.push(Line::from(summary_spans));

@@ -106,10 +106,10 @@ fn mcp_cursor_row(state: &AppState, servers: &[String]) -> usize {
 /// row is added or removed in the draw fn, this offset must be updated.
 fn mcp_pre_server_offset(state: &AppState) -> usize {
     // Delegate the "stale" definition to `McpServerStatus::is_underutilized`
-    // — the canonical source-of-truth — so this offset, the legend, the per-row
-    // ⚠ marker, and the Tier 3 alert all share one threshold. Earlier this
-    // re-implemented the check inline with `> 30` while the legend used `>= 30`,
-    // causing off-by-one drift between displays.
+    // — the canonical source-of-truth — so this offset, the legend, the
+    // per-row ⚠ marker, and the Tier 3 alert all share one threshold.
+    // Reimplementing the check inline (e.g. `> 30`) drifts off-by-one
+    // against the legend (`>= 30`) and produces mismatched displays.
     let now = chrono::Utc::now();
     let any_stale = state.mcp_status.iter().any(|s| s.is_underutilized(now, 30));
     1 + usize::from(any_stale)

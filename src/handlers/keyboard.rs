@@ -438,12 +438,9 @@ pub(crate) fn handle_conversation_key(
             state.session_list_hidden = !state.session_list_hidden;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            if state.show_detail {
-                state.show_detail = false;
-                state.session_detail_override = None;
-                state.session_detail_live_extra = None;
-                return;
-            }
+            // `show_detail` is now handled before this branch by the
+            // dispatcher in `main`, so the Session Detail popup is closed
+            // there via `handle_session_detail_key`.
             let has_search = state
                 .active_pane_index
                 .and_then(|i| state.panes.get(i))
@@ -568,21 +565,9 @@ pub(crate) fn handle_conversation_key(
             }
         }
         KeyCode::Char(' ') => {
-            if state.show_detail {
-                let fp = state
-                    .active_pane_index
-                    .and_then(|i| state.panes.get(i))
-                    .and_then(|p| p.file_path.clone())
-                    .or_else(|| get_conv_session_file(state, state.selected_session));
-                if let Some(fp) = fp {
-                    state.pins.toggle(&fp);
-                    if let Err(e) = state.pins.save() {
-                        state.toast_message = Some(format!("Pin save failed: {e}"));
-                        state.toast_time = Some(std::time::Instant::now());
-                    }
-                    state.needs_draw = true;
-                }
-            } else if state.active_pane_index.is_none()
+            // `show_detail` is intercepted by the dispatcher; here we only
+            // need the in-conv-view session-pin path.
+            if state.active_pane_index.is_none()
                 && let Some(fp) = get_conv_session_file(state, state.selected_session)
             {
                 state.pins.toggle(&fp);
@@ -719,11 +704,10 @@ pub(crate) fn handle_conversation_key(
             }
         }
         KeyCode::PageDown | KeyCode::Char('d') => {
-            // Auto-focus the first pane so d/u work even
-            // without pressing Tab/l first — the help text
-            // implies these scroll the conversation, but
-            // previously they silently no-op'd until a
-            // pane was explicitly focused.
+            // Auto-focus the first pane so d/u work even without pressing
+            // Tab/l first — the help text implies these scroll the
+            // conversation, so requiring explicit focus would feel like a
+            // silent no-op.
             if state.active_pane_index.is_none() && !state.panes.is_empty() {
                 state.active_pane_index = Some(0);
             }
@@ -830,6 +814,41 @@ pub(crate) fn handle_conversation_key(
                 }
             }
         }
+        // Pin reorder: J / K move the focused row down / up within the
+        // Pinned list. Guarded on conv_list_mode so the same keys keep
+        // their "scroll one message" meaning inside a focused pane.
+        KeyCode::Char('J')
+            if state.active_pane_index.is_none()
+                && state.conv_list_mode == ConvListMode::Pinned =>
+        {
+            let idx = state.selected_session;
+            if state.pins.move_down(idx) {
+                state.selected_session = idx + 1;
+                if let Err(e) = state.pins.save() {
+                    state.toast_message = Some(format!("Pin save failed: {e}"));
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                if state.panes.len() == 1 {
+                    preview_conversation_in_pane(state);
+                }
+            }
+        }
+        KeyCode::Char('K')
+            if state.active_pane_index.is_none()
+                && state.conv_list_mode == ConvListMode::Pinned =>
+        {
+            let idx = state.selected_session;
+            if state.pins.move_up(idx) {
+                state.selected_session = idx - 1;
+                if let Err(e) = state.pins.save() {
+                    state.toast_message = Some(format!("Pin save failed: {e}"));
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+                if state.panes.len() == 1 {
+                    preview_conversation_in_pane(state);
+                }
+            }
+        }
         KeyCode::Char('J') => {
             if let Some(idx) = state.active_pane_index
                 && let Some(pane) = state.panes.get_mut(idx)
@@ -871,10 +890,10 @@ pub(crate) fn handle_conversation_key(
             }
         }
         KeyCode::Char('i') => {
-            state.show_detail = !state.show_detail;
-            if state.show_detail {
-                state.session_detail_scroll = 0;
-            }
+            // Only the open path lives here; closing is owned by the
+            // Session Detail popup's own handler (`i`/Esc/q/Enter).
+            state.show_detail = true;
+            state.session_detail_scroll = 0;
         }
         KeyCode::Enter if state.active_pane_index.is_none() => {
             open_conversation_in_pane(state);
@@ -1072,6 +1091,29 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('/') => {
+            // Pre-seed the query with `filter:live ` when the user opens
+            // search from the Live tab on a clean input — most of the time
+            // they're trying to drill into the running sessions, so spare
+            // them the boilerplate. A non-empty input is left intact so
+            // pressing Esc-then-/ restores the prior query without losing
+            // edits.
+            if state.tab == Tab::Live && state.search_input.text.is_empty() {
+                state.search_input.set("filter:live ".to_string());
+            }
+            // Re-populate the result list whenever the popup opens with
+            // text — the Esc handler drops `search_results` to free memory,
+            // so without this restored queries would render empty until
+            // the user touched the input.
+            if !state.search_input.text.is_empty() {
+                let ctx_owned = crate::build_search_filter_ctx(state);
+                state.search_results = search::perform_search(
+                    &state.daily_groups,
+                    &state.search_input.text,
+                    &ctx_owned.as_ref(),
+                );
+                state.search_selected = 0;
+                crate::start_content_search(state);
+            }
             state.search_mode = true;
             state.search_input.move_end();
         }
@@ -1268,6 +1310,25 @@ pub(crate) fn handle_default_key(
                 && let Some(session) = crate::current_selected_session(state)
             {
                 handlers::tasks::start_session_summary(state, session, false);
+            } else if state.tab == Tab::Dashboard {
+                // Rankable panels (Projects = 1, Models = 2) toggle the
+                // sort key. `dashboard_scroll[N]` is the cursor into the
+                // sorted list, so reset it to 0 to avoid landing on a
+                // stale row when the order changes.
+                match state.dashboard_panel {
+                    1 => {
+                        state.dashboard_projects_sort =
+                            state.dashboard_projects_sort.toggle();
+                        state.dashboard_scroll[1] = 0;
+                        state.dashboard_viewport[1] = 0;
+                    }
+                    2 => {
+                        state.dashboard_models_sort = state.dashboard_models_sort.toggle();
+                        state.dashboard_scroll[2] = 0;
+                        state.dashboard_viewport[2] = 0;
+                    }
+                    _ => {}
+                }
             }
         }
         KeyCode::Char('r') => {
@@ -1396,20 +1457,27 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             }
             crate::adjust_mcp_scroll(state, &servers);
         }
+        KeyCode::Char('s') if state.dashboard_panel == 1 => {
+            // Mirror of the Projects-panel toggle in normal mode so the same
+            // key works whether the popup is open or not. Cursor resets to 0
+            // since the row order changes under it.
+            state.dashboard_projects_sort = state.dashboard_projects_sort.toggle();
+            state.dashboard_scroll[1] = 0;
+            state.dashboard_viewport[1] = 0;
+        }
+        KeyCode::Char('s') if state.dashboard_panel == 2 => {
+            // Models panel popup mirror of the normal-mode toggle.
+            state.dashboard_models_sort = state.dashboard_models_sort.toggle();
+            state.dashboard_scroll[2] = 0;
+            state.dashboard_viewport[2] = 0;
+        }
         KeyCode::Enter if state.dashboard_panel == 1 => {
             // Drill into the focused project. `dashboard_scroll[1]` is the
-            // cursor row in the sorted projects list (Projects panel has a
-            // viewport-decoupled cursor); resolve it back to the raw
-            // `project_name` so the drilldown popup can match it against
-            // `SessionInfo::project_name`.
+            // cursor row in the sorted projects list (viewport-decoupled
+            // cursor); resolve it via the shared sort so cursor index lines
+            // up with the visible row across panel, popup, and click paths.
             let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
-            // Tiebreaker matches dashboard.rs panel 1 (lint #30) so the same
-            // cursor index lands on the same project across renders.
-            projects.sort_by(|a, b| {
-                b.1.work_tokens
-                    .cmp(&a.1.work_tokens)
-                    .then_with(|| a.0.cmp(b.0))
-            });
+            state.sort_projects(&mut projects);
             if let Some((name, _)) = projects.get(state.dashboard_scroll[1]) {
                 state.project_detail_path = (*name).clone();
                 state.project_detail_scroll = 0;
@@ -1545,12 +1613,15 @@ pub(crate) fn handle_search_mode_key(
 ) {
     match key.code {
         KeyCode::Esc => {
+            // Keep `search_input.text` populated so the next `/` restores
+            // the previous query. Drop the result list to release memory;
+            // it gets rebuilt on the next open.
             state.search_mode = false;
-            state.search_input.clear();
             state.search_results.clear();
             state.search_selected = 0;
             state.search_task = None;
             state.searching = false;
+            state.search_history.reset_cursor();
             if let Some((tab, day, session, show_conv)) = state.search_saved_state.take() {
                 state.tab = tab;
                 state.selected_day = day;
@@ -1562,6 +1633,8 @@ pub(crate) fn handle_search_mode_key(
         KeyCode::Enter if !state.search_results.is_empty() => {
             let result = state.search_results[state.search_selected].clone();
             let query = state.search_input.text.clone();
+            // Persist the query so ↑ on the next `/` open recalls it.
+            state.search_history.push(&query);
             let is_content = matches!(result.match_type, search::SearchMatchType::Content);
             if state.search_saved_state.is_none() {
                 state.search_saved_state = Some((
@@ -1587,19 +1660,68 @@ pub(crate) fn handle_search_mode_key(
                 pane.search_mode = true;
             }
         }
-        KeyCode::Down if !state.search_results.is_empty() => {
-            state.search_selected = (state.search_selected + 1) % state.search_results.len();
+        // ↑ / ↓ walk the persisted query history only when the popup is
+        // in a "blank" state (empty input) or already recalling a prior
+        // entry. The moment the user has typed their own query, the
+        // arrows revert to plain list nav with wrap-around so they don't
+        // get yanked out of "their" results into history. j / k always
+        // navigate results regardless, for vim-style consistency.
+        KeyCode::Up => {
+            let in_history_mode =
+                state.search_input.text.is_empty() || state.search_history.is_browsing();
+            if state.search_selected > 0 {
+                state.search_selected -= 1;
+            } else if in_history_mode {
+                let draft = state.search_input.text.clone();
+                if let Some(prev) = state.search_history.step_back(&draft) {
+                    state.search_input.set(prev);
+                    let ctx_owned = crate::build_search_filter_ctx(state);
+                    state.search_results = search::perform_search(
+                        &state.daily_groups,
+                        &state.search_input.text,
+                        &ctx_owned.as_ref(),
+                    );
+                    state.search_selected = 0;
+                    start_content_search(state);
+                }
+            } else if !state.search_results.is_empty() {
+                state.search_selected = state.search_results.len() - 1;
+            }
         }
-        KeyCode::Up if !state.search_results.is_empty() => {
-            state.search_selected = state
-                .search_selected
-                .checked_sub(1)
-                .unwrap_or(state.search_results.len() - 1);
+        KeyCode::Down => {
+            if state.search_history.is_browsing() && state.search_selected == 0 {
+                if let Some(next) = state.search_history.step_forward() {
+                    state.search_input.set(next);
+                    let ctx_owned = crate::build_search_filter_ctx(state);
+                    state.search_results = search::perform_search(
+                        &state.daily_groups,
+                        &state.search_input.text,
+                        &ctx_owned.as_ref(),
+                    );
+                    state.search_selected = 0;
+                    start_content_search(state);
+                }
+                // step_forward past the newest entry restores the draft and
+                // clears the cursor; the next press lands in the result-nav
+                // branch below.
+            } else if !state.search_results.is_empty() {
+                state.search_selected = (state.search_selected + 1) % state.search_results.len();
+            }
         }
+        // j / k intentionally NOT mapped to result nav here — the popup is
+        // a text input first, and any single character must reach
+        // `search_input.insert_char` so queries that contain those letters
+        // are typeable at all. ↑/↓ alone navigate results once the user has
+        // typed something.
         KeyCode::Backspace => {
+            state.search_history.reset_cursor();
             state.search_input.delete_back();
-            state.search_results =
-                search::perform_search(&state.daily_groups, &state.search_input.text);
+            let ctx_owned = crate::build_search_filter_ctx(state);
+            state.search_results = search::perform_search(
+                &state.daily_groups,
+                &state.search_input.text,
+                &ctx_owned.as_ref(),
+            );
             state.search_selected = 0;
             start_content_search(state);
         }
@@ -1616,9 +1738,14 @@ pub(crate) fn handle_search_mode_key(
             state.search_input.move_end();
         }
         KeyCode::Char(c) => {
+            state.search_history.reset_cursor();
             state.search_input.insert_char(c);
-            state.search_results =
-                search::perform_search(&state.daily_groups, &state.search_input.text);
+            let ctx_owned = crate::build_search_filter_ctx(state);
+            state.search_results = search::perform_search(
+                &state.daily_groups,
+                &state.search_input.text,
+                &ctx_owned.as_ref(),
+            );
             state.search_selected = 0;
             start_content_search(state);
         }
@@ -1643,10 +1770,13 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
         KeyCode::Enter => {
             if state.project_popup_selected == 0 {
                 state.project_filter = None;
-            } else if let Some((name, _, _)) =
-                state.project_list.get(state.project_popup_selected - 1)
-            {
-                state.project_filter = Some(name.clone());
+            } else {
+                // Selection indexes into the display-sorted view so the
+                // chosen row matches whatever the user is looking at.
+                let sorted = state.project_list_sorted();
+                if let Some((name, _, _)) = sorted.get(state.project_popup_selected - 1).copied() {
+                    state.project_filter = Some(name.clone());
+                }
             }
             state.apply_filter();
             state.show_project_popup = false;

@@ -139,17 +139,25 @@ Always include a `Co-Authored-By` trailer for Claude-assisted commits; omit only
 
 Comments explain invariants, not history. Don't write incidents, prior bug
 numbers, captured numbers (percentages, $ amounts, K/M magnitudes,
-versions, dates), or "earlier this was X" — the file outlives the
-incident and the comment turns into a lie. Same for `e.g.`-style examples
-that quote real values: they read as illustrations but date as snapshots.
+versions, dates), or any phrasing that requires the reader to know what
+the code used to be. The file outlives the incident; "earlier this used
+X" / "previously the popup hid Y" / "this was renamed from Z" reads as a
+factual claim about a state the reader can't see and has no way to
+verify. Same for `e.g.`-style examples that quote real values: they read
+as illustrations but date as snapshots.
 
 - ❌ `// regression in vA.B.C where two surfaces disagreed on the count.`
 - ❌ `// e.g. "94%" once crushed the bars to "0–1%".`
+- ❌ `// Earlier this used `builtin.len() + mcp_servers.len()`.`
+- ❌ `// Tools panel was renamed "Ecosystem" because it covers Skills too.`
 - ✅ `// Truncating mid-number drops the K/M suffix and reads much smaller.`
+- ✅ `// `Ecosystem` covers Built-in + MCP + Skills + Subagents in one panel.`
 
 State the rule in terms a future reader can verify against the code in
-front of them. Past incidents and captured values go in the commit message
-or PR description. Test docstrings inside `mod tests` are exempt — they
+front of them. Past incidents, captured values, and rename history go in
+the commit message or PR description. Lint #38 detects the most common
+past-state phrasings (`earlier`, `previously`, `used to be`, `was
+renamed`, `pre-vN`). Test docstrings inside `mod tests` are exempt — they
 describe fixture arithmetic that is part of the assertion contract.
 
 ## Tests — three layers

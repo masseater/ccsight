@@ -68,7 +68,7 @@ pub fn find_cowork_audit_files() -> Vec<PathBuf> {
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     // Layout depth from cowork_root: account/ env/ local_<uuid>/ audit.jsonl ⇒ 4 levels.
-    // Cap at 6 to give a bit of slack for any future nesting Anthropic might add
+    // Cap at 6 to give a bit of leeway for any future nesting Anthropic might add
     // without letting a runaway tree (e.g. a symlink loop) explode.
     const MAX_DEPTH: usize = 6;
     if depth > MAX_DEPTH {

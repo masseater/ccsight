@@ -342,6 +342,32 @@ pub enum SummaryType {
     Day(crate::aggregator::DailyGroup),
 }
 
+/// Sort key for rankable Dashboard panels (Projects, Models, ...). Toggled
+/// with `s` while the panel is focused; defaults to `Recency` so the
+/// "what have I been using lately" question is answered at a glance.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum RankSort {
+    #[default]
+    Recency,
+    Tokens,
+}
+
+impl RankSort {
+    pub fn toggle(self) -> Self {
+        match self {
+            RankSort::Recency => RankSort::Tokens,
+            RankSort::Tokens => RankSort::Recency,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RankSort::Recency => "recent",
+            RankSort::Tokens => "tokens",
+        }
+    }
+}
+
 pub const MAX_PANES: usize = 4;
 pub const MIN_PANE_WIDTH: u16 = 40;
 pub const SESSION_LIST_WIDTH: u16 = 28;
@@ -528,6 +554,9 @@ pub struct AppState {
     pub searching: bool,
     pub search_preview_mode: bool,
     pub search_saved_state: Option<(Tab, usize, usize, bool)>,
+    /// Persisted query history. ↑/↓ in search mode walks past entries;
+    /// Enter (commit) appends the current input.
+    pub search_history: crate::search_history::SearchHistory,
     pub mcp_status: Vec<crate::infrastructure::McpServerStatus>,
     /// Configured (installed) Skills / Commands / Subagents discovered from
     /// `~/.claude/{skills,commands,agents}/` plus enabled plugin paths. Names
@@ -648,9 +677,122 @@ pub struct AppState {
     pub original_total_cost: f64,
     pub original_model_costs: Vec<(String, f64)>,
     pub original_aggregated_model_tokens: std::collections::HashMap<String, TokenStats>,
+    /// Sort mode for the Dashboard Projects panel + detail popup. Toggled
+    /// with `s` while the Projects panel is focused. Defaults to `Recency`
+    /// so currently-active projects sit at the top.
+    pub dashboard_projects_sort: RankSort,
+    /// Sort mode for the Dashboard Models panel + detail popup. Same toggle
+    /// semantics as `dashboard_projects_sort`, scoped to panel 2.
+    pub dashboard_models_sort: RankSort,
 }
 
 impl AppState {
+    /// Single source of truth for "active days" — calendar days with at
+    /// least one billable-token session. Matches the Costs panel ratio
+    /// and the Overview headline so all surfaces agree.
+    pub(crate) fn active_days(&self) -> usize {
+        self.daily_costs.len()
+    }
+
+    /// Project filter popup row order — follows the same sort mode as the
+    /// Projects panel so the two surfaces agree on rank. References point
+    /// into `project_list`; the caller indexes into the returned view.
+    pub(crate) fn project_list_sorted(&self) -> Vec<&(String, u64, chrono::NaiveDate)> {
+        let mut sorted: Vec<&(String, u64, chrono::NaiveDate)> =
+            self.project_list.iter().collect();
+        match self.dashboard_projects_sort {
+            RankSort::Tokens => {
+                sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            RankSort::Recency => {
+                sorted.sort_by(|a, b| {
+                    b.2.cmp(&a.2)
+                        .then_with(|| b.1.cmp(&a.1))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+            }
+        }
+        sorted
+    }
+
+    /// Sort a `(name, ProjectStats)` vec in place to match the Projects
+    /// panel order. The panel draw, the detail popup draw, the keyboard
+    /// Enter handler, and the mouse double-click handler all call this so
+    /// they index into the same list — independent copies of this
+    /// comparator drifted apart between surfaces in prior versions.
+    pub(crate) fn sort_projects(
+        &self,
+        projects: &mut Vec<(&String, &crate::aggregator::ProjectStats)>,
+    ) {
+        match self.dashboard_projects_sort {
+            RankSort::Tokens => {
+                projects.sort_by(|a, b| {
+                    b.1.work_tokens
+                        .cmp(&a.1.work_tokens)
+                        .then_with(|| a.0.cmp(b.0))
+                });
+            }
+            RankSort::Recency => {
+                // Last-activity date lookup goes via `project_list`, the
+                // single place that joins project name → last date.
+                let project_list = &self.project_list;
+                let last_date_for = |name: &str| -> Option<chrono::NaiveDate> {
+                    project_list
+                        .iter()
+                        .find(|(n, _, _)| n == name)
+                        .map(|(_, _, d)| *d)
+                };
+                projects.sort_by(|a, b| {
+                    last_date_for(b.0)
+                        .cmp(&last_date_for(a.0))
+                        .then_with(|| b.1.work_tokens.cmp(&a.1.work_tokens))
+                        .then_with(|| a.0.cmp(b.0))
+                });
+            }
+        }
+    }
+
+    /// Map of model display-name → last date it appeared in any user
+    /// session. Recomputed per call (cheap relative to dashboard render);
+    /// shared by the Models panel sort, the detail popup sort, and any
+    /// future "when did I last use X" surface.
+    pub(crate) fn model_last_used(&self) -> std::collections::HashMap<String, chrono::NaiveDate> {
+        let mut out = std::collections::HashMap::new();
+        for group in &self.daily_groups {
+            for session in group.user_sessions() {
+                for model_name in session.day_tokens_by_model.keys() {
+                    let normalized = crate::aggregator::normalize_model_name(model_name);
+                    let entry = out.entry(normalized).or_insert(group.date);
+                    if group.date > *entry {
+                        *entry = group.date;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Sort a `(name, work_tokens, ...)` vec in place to match the Models
+    /// panel order. Mirrors `sort_projects` so the panel draw and the
+    /// detail popup line up.
+    pub(crate) fn sort_models<T>(&self, models: &mut [(String, u64, T)]) {
+        match self.dashboard_models_sort {
+            RankSort::Tokens => {
+                models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            RankSort::Recency => {
+                let last_used = self.model_last_used();
+                let last_date_for = |name: &str| last_used.get(name).copied();
+                models.sort_by(|a, b| {
+                    last_date_for(&b.0)
+                        .cmp(&last_date_for(&a.0))
+                        .then_with(|| b.1.cmp(&a.1))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+            }
+        }
+    }
+
     /// Construct a fresh `AppState` with everything zero/empty/None except
     /// `loading = true`, `tab = Dashboard`, the persisted pin list, and the
     /// retention warning derived from the user config. `data_limit` is the
@@ -719,6 +861,7 @@ impl AppState {
             searching: false,
             search_preview_mode: false,
             search_saved_state: None,
+            search_history: crate::search_history::SearchHistory::load(),
             mcp_status: Vec::new(),
             configured_resources: crate::infrastructure::ConfiguredResources::default(),
             tool_last_used: std::collections::HashMap::new(),
@@ -790,6 +933,8 @@ impl AppState {
             original_total_cost: 0.0,
             original_model_costs: Vec::new(),
             original_aggregated_model_tokens: std::collections::HashMap::new(),
+            dashboard_projects_sort: RankSort::default(),
+            dashboard_models_sort: RankSort::default(),
         }
     }
 
@@ -1056,11 +1201,9 @@ impl AppState {
     }
 
     pub(crate) fn rebuild_project_list(&mut self) {
-        // Include subagent sessions — `state.stats.project_stats` (the dashboard
-        // Projects panel) already aggregates over all sessions, and `apply_filter`
-        // keeps subagents when the project filter matches. Excluding them here
-        // produced a misleading lower preview total in the project popup vs the
-        // panel.
+        // All sessions (including subagents) are counted — see the matching
+        // rule in `aggregator::stats` where `project_stats` is built. Both
+        // surfaces must agree on per-project totals.
         let mut map: std::collections::HashMap<String, (u64, NaiveDate)> =
             std::collections::HashMap::new();
         for group in &self.original_daily_groups {

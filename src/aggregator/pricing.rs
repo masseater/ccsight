@@ -7,8 +7,8 @@
 // (per code.claude.com/docs/en/agent-sdk/cost-tracking), so the 1h rate
 // dominates real-world cost — assuming everything is 5m undercounts by ~57%.
 // 200k tiered pricing (Sonnet 4 1M beta, Aug 2025) is no longer in effect —
-// current 1M models (Opus 4.6/4.7, Sonnet 4.6) bill at standard pricing per
-// the official "Long context pricing" section.
+// current 1M models (Opus 4.6/4.7/4.8, Sonnet 4.6) bill at standard pricing
+// per the official "Long context pricing" section.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -108,6 +108,18 @@ impl CostCalculator {
 
         // Per-model rates from platform.claude.com/docs/en/about-claude/pricing.
         // 5m cache write = base × 1.25; 1h cache write = base × 2.0; cache read = base × 0.10.
+
+        // Claude Opus 4.8: base $5 / $25 (verified against platform.claude.com/docs pricing page)
+        pricing.insert(
+            "claude-opus-4-8".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 5.0,
+                output_cost_per_mtok: 25.0,
+                cache_write_5m_cost_per_mtok: 6.25,
+                cache_write_1h_cost_per_mtok: 10.0,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
 
         // Claude Opus 4.7: base $5 input / $25 output (placeholder == 4.6 until official rates ship)
         pricing.insert(
@@ -427,6 +439,7 @@ mod tests {
         let calculator = CostCalculator::new();
         assert!(calculator.get_pricing(Some("claude-sonnet-4")).is_some());
         assert!(calculator.get_pricing(Some("claude-opus-4-5")).is_some());
+        assert!(calculator.get_pricing(Some("claude-opus-4-8")).is_some());
     }
 
     #[test]

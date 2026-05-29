@@ -115,6 +115,21 @@ pub fn format_pct(part: u64, total: u64) -> String {
     }
 }
 
+/// Floating-point variant of `format_pct` for cost / fraction shares where
+/// the inputs are naturally `f64` (e.g. dollars). Same sub-one-percent
+/// semantics as the integer variant — see [`format_pct`].
+pub fn format_pct_f64(part: f64, total: f64) -> String {
+    if part <= 0.0 || total <= 0.0 {
+        return "0%".to_string();
+    }
+    let pct = (part / total * 100.0) as u32;
+    if pct == 0 {
+        "<1%".to_string()
+    } else {
+        format!("{pct}%")
+    }
+}
+
 pub fn format_number(n: u64) -> String {
     let (divisor, suffix) = match n {
         n if n >= 1_000_000_000_000 => (1_000_000_000_000.0, "T"),

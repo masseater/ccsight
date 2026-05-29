@@ -86,7 +86,10 @@ for fname in '$UI_FILES'.split():
         stripped = line.strip()
         if stripped.startswith('.title(') and 'Span::styled' not in stripped and 'Line::from' not in stripped:
             content = stripped[7:].rstrip(')')  .rstrip(',')
-            if content and not content.startswith('\"') and not content.startswith('Span') and not content.startswith('Line'):
+            # Variables whose name ends in _line are by convention pre-built
+            # ratatui Lines (carrying their own per-span styling), so a bare
+            # title(x_line) call is the right call. Skip them.
+            if content and not content.startswith('\"') and not content.startswith('Span') and not content.startswith('Line') and not content.endswith('_line'):
                 print(f'  {fname}:L{i+1}: {stripped}')
 " 2>/dev/null || true)
 if [ -n "$PLAIN_VAR_TITLES" ]; then
@@ -966,6 +969,117 @@ print('\n'.join(hits))
 if [ -n "$COST_PRECISION" ]; then
     echo "ERROR: cost precision other than :.0 or :.2 (per Cost Precision rule):"
     echo "$COST_PRECISION"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 37. Percentage formatting: direct \`{pct:.0}%\` on a computed ratio bypasses
+# the \`<1%\` indicator that \`text::format_pct\` / \`format_pct_f64\` provide,
+# so genuinely small non-zero shares render as \`0%\` and become
+# indistinguishable from true zeroes (Projects, Models, Tools detail).
+# Use the helpers instead; the only exception is for signed deltas
+# (month-over-month \`↑+N%\` / \`↓-N%\`) and the Hourly Avg 1-decimal column.
+PCT_DIRECT=$(python3 -c "
+import os, re
+# Match \`{var:.0}%\` literal in format strings (any var name).
+pat = re.compile(r'\{[a-zA-Z_][a-zA-Z0-9_]*:\.\0%\}|format!\(.*\"[^\"]*\{[a-zA-Z_][a-zA-Z0-9_]*:\.0\}%')
+# Allowed surrounding text — signed delta or 1-decimal sites.
+allow_re = re.compile(r'↑\+\{|↓\{|:\.1\}%|>4\.1\}%')
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                stripped = line.lstrip()
+                if stripped.startswith('//'):
+                    continue
+                if '{pct:.0}%' in line and not allow_re.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$PCT_DIRECT" ]; then
+    echo "ERROR: direct \`{pct:.0}%\` format bypasses <1% indicator — use crate::text::format_pct or format_pct_f64:"
+    echo "$PCT_DIRECT"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 38. Past-state descriptions in comments: phrasings like "earlier this
+# used X" / "previously the popup hid Y" / "was renamed from Z" force the
+# reader to know a prior state the file no longer reflects. Rephrase the
+# rule positively, in terms a reader can verify against current code. Past
+# context belongs in the commit message / PR description.
+# Test docstrings inside `mod tests` and `#[cfg(test)]` blocks are exempt.
+PAST_STATE=$(python3 -c "
+import os, re
+# Phrases that almost always describe what the code USED to do.
+# Word-boundaries keep \`once per call\` / \`at most once\` valid.
+pat = re.compile(
+    r'\b(earlier(\s+(this|the|it|we|they|a|an|version))?|'
+    r'previously|'
+    r'used\s+to\s+(be|have|return|use|read|store|live|do|call|render|use|exist)|'
+    r'was\s+(renamed|deprecated|removed|replaced|moved)|'
+    r'pre-v\d|in\s+v\d)\b',
+    re.IGNORECASE,
+)
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                stripped = line.strip()
+                # Only \`//\` and \`///\` comments. Docstrings (\`///\`) describing
+                # fixture arithmetic inside test blocks are exempt from this
+                # rule; regular \`//\` comments are not — they describe runtime
+                # behavior that the file should keep documenting honestly.
+                if not stripped.startswith('//'):
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {stripped[:140]}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$PAST_STATE" ]; then
+    echo "ERROR: past-state phrasing in comment — rephrase as a present-tense invariant (see CLAUDE.md Comments):"
+    echo "$PAST_STATE"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 39. Direct `${...:.0}` format on a cost value bypasses `format_cost`'s
+# two-sig-fig rule (sub-$1 → 2 decimals, $1-$10 → 1 decimal). Display
+# callers must route cost values through `format_cost(_, 0)` so sig-figs
+# stay consistent across surfaces. The one site inside `format_cost`'s
+# body is the helper itself and is exempt. `src/cli.rs` keeps the precise
+# 2-decimal form for stdout, also exempt.
+COST_DIRECT=$(python3 -c "
+import os, re
+pat = re.compile(r'format!\(\"\\\$\\{[^\"]*\.0[\"}]')
+hits = []
+for root, _, files in os.walk('src'):
+    if root.startswith(os.path.join('src', 'cli')) or root == 'src/cli':
+        continue
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        if fname == 'cli.rs':
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                # The implementation of format_cost itself is the only
+                # legitimate site for the raw \`\${c:.0}\` form.
+                if 'fn format_cost' in line or '0 => format!' in line:
+                    continue
+                if pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()[:140]}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$COST_DIRECT" ]; then
+    echo "ERROR: direct \`format!(\"\${...:.0}\", ...)\` bypasses format_cost sig-figs — route through crate::ui::format_cost(_, 0):"
+    echo "$COST_DIRECT"
     ERRORS=$((ERRORS + 1))
 fi
 

@@ -41,7 +41,17 @@ pub mod helpers {
     }
 
     pub fn make_session(project: &str, summary: Option<&str>, branch: Option<&str>) -> SessionInfo {
+        // Synthesize a unique-per-session file_path so callers that build
+        // multiple sessions per group don't collide on the default `/tmp/test.jsonl`.
+        // perform_search dedupes by file_path, so without this fixture sessions
+        // sharing a path would disappear from the result set.
+        let path = format!(
+            "/tmp/test/{}/{}.jsonl",
+            project.replace('/', "_"),
+            branch.unwrap_or("none")
+        );
         SessionInfo {
+            file_path: PathBuf::from(path),
             project_name: project.to_string(),
             git_branch: branch.map(|s| s.to_string()),
             day_input_tokens: 1000,
@@ -146,6 +156,7 @@ pub mod helpers {
             searching: false,
             search_preview_mode: false,
             search_saved_state: None,
+            search_history: crate::search_history::SearchHistory::default(),
             mcp_status: Vec::new(),
             configured_resources: crate::infrastructure::ConfiguredResources::default(),
             tool_last_used: HashMap::new(),
@@ -217,6 +228,8 @@ pub mod helpers {
             original_total_cost: daily_costs.len() as f64,
             original_model_costs: Vec::new(),
             original_aggregated_model_tokens: HashMap::new(),
+            dashboard_projects_sort: crate::state::RankSort::default(),
+            dashboard_models_sort: crate::state::RankSort::default(),
         }
     }
 }

@@ -334,9 +334,9 @@ mod tests {
                 name: None,
             },
         );
-        // Older run, hours earlier. Even though its JSONL is still on disk
-        // and `last_seen < app_start_time`, it does NOT belong to "the
-        // last ccsight run".
+        // Snapshot entry from a run hours before the current `app_start_time`.
+        // Even though its JSONL is still on disk and `last_seen <
+        // app_start_time`, it does NOT belong to "the last ccsight run".
         snap.sessions.insert(
             "old_run".to_string(),
             SnapshotEntry {
@@ -407,8 +407,8 @@ mod tests {
 
     #[test]
     fn prior_run_anchor_prefers_last_refresh_at_over_max_heuristic() {
-        // Two prior sessions: a survivor stamped at prior exit, and a
-        // mid-run-death stamped 22m earlier. Anchor must follow
+        // Two prior sessions: a survivor stamped at the prior exit and a
+        // mid-run-death stamped 22m before that. Anchor must follow
         // `last_refresh_at`, not `max(last_seen)`, otherwise the mid-run
         // death gets mistaken for the exit cluster.
         let mut snap = LiveSnapshot::default();

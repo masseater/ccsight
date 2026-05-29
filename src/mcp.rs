@@ -496,7 +496,18 @@ impl CcsightServer {
         let query = &params.query;
 
         let fetch_limit = limit * 5;
-        let mut meta_results = crate::search::perform_search(&data.daily_groups, query);
+        // MCP server has no UI live-session state; the `filter:live` /
+        // `filter:busy` / `filter:paused` predicates resolve to "nothing
+        // matches" via empty path sets. Period and property filters still
+        // work since they don't need any live context.
+        let empty_paths = std::collections::HashSet::new();
+        let ctx = crate::search::SearchFiltersContext {
+            today: chrono::Local::now().date_naive(),
+            live_paths: &empty_paths,
+            busy_paths: &empty_paths,
+            paused_paths: &empty_paths,
+        };
+        let mut meta_results = crate::search::perform_search(&data.daily_groups, query, &ctx);
 
         if let Ok(index) = crate::infrastructure::SearchIndex::update_or_build(&data.daily_groups) {
             let content_results = index.search(query, fetch_limit, 200);
@@ -1963,6 +1974,8 @@ mod tests {
                 timestamp: Some("10:00:00".to_string()),
                 model: None,
                 tokens: None,
+                timestamp_utc: None,
+                usage: None,
             },
             ConversationMessage {
                 role: "assistant".to_string(),
@@ -1970,6 +1983,8 @@ mod tests {
                 timestamp: Some("10:00:05".to_string()),
                 model: Some("claude-sonnet-4".to_string()),
                 tokens: Some((1000, 500)),
+                timestamp_utc: None,
+                usage: None,
             },
             ConversationMessage {
                 role: "user".to_string(),
@@ -1977,6 +1992,8 @@ mod tests {
                 timestamp: Some("10:05:00".to_string()),
                 model: None,
                 tokens: None,
+                timestamp_utc: None,
+                usage: None,
             },
         ];
         let conv = extract_conversation(&messages);
@@ -1997,6 +2014,8 @@ mod tests {
             timestamp: None,
             model: None,
             tokens: None,
+            timestamp_utc: None,
+            usage: None,
         }];
         let conv = extract_conversation(&messages);
         assert_eq!(conv.len(), 1);
@@ -2014,6 +2033,8 @@ mod tests {
             timestamp: None,
             model: None,
             tokens: None,
+            timestamp_utc: None,
+            usage: None,
         }];
         let conv = extract_conversation(&messages);
         assert!(
@@ -2031,6 +2052,8 @@ mod tests {
             timestamp: None,
             model: None,
             tokens: None,
+            timestamp_utc: None,
+            usage: None,
         }];
         let conv = extract_conversation(&messages);
         let text = conv[0]["text"].as_str().unwrap();
@@ -2049,6 +2072,8 @@ mod tests {
             timestamp: None,
             model: None,
             tokens: None,
+            timestamp_utc: None,
+            usage: None,
         }];
         let conv = extract_conversation(&messages);
         assert!(conv.is_empty());
@@ -2079,6 +2104,8 @@ mod tests {
             timestamp: None,
             model: None,
             tokens: None,
+            timestamp_utc: None,
+            usage: None,
         }];
         let files = extract_files_touched(&messages);
         assert_eq!(files, vec!["/src/lib.rs", "/src/main.rs"]);
@@ -2092,6 +2119,8 @@ mod tests {
             timestamp: None,
             model: None,
             tokens: None,
+            timestamp_utc: None,
+            usage: None,
         }];
         let files = extract_files_touched(&messages);
         assert!(files.is_empty());

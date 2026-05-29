@@ -16,4 +16,6 @@ pub use file_discovery::{FileDiscovery, RetentionWarning, check_cleanup_period};
 pub use mcp_config::{McpServerStatus, compute_mcp_status};
 pub use resource_config::{ConfiguredResources, discover_configured_resources};
 pub use search_index::SearchIndex;
-pub use state_dir::{cache_path, index_dir, migrate_legacy_state_dirs, pins_path};
+pub use state_dir::{
+    cache_path, index_dir, migrate_legacy_state_dirs, pins_path, search_history_path,
+};

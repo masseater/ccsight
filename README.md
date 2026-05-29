@@ -6,26 +6,15 @@ reconcile spend across projects and models, and search every past conversation
 
 ## Features
 
-- **Dashboard**: API-equivalent cost estimate (what your usage would cost at
-  list-price API rates, with 5m vs 1h cache-write TTL accounted separately),
-  daily/monthly breakdown, top projects with sparklines and drilldown popup,
-  per-model spend, tool / language / activity heatmap, hourly patterns
-- **Live**: Currently-running and recently-paused sessions with status glyphs,
-  copy-resume command (`cd … && claude -r …`), snapshot recovery so you can
-  find what you had open after a host reboot
-- **Daily View**: Day-by-day sessions with activity graph, project/model/tool
-  breakdown, conversation viewer
-- **Insights**: Metrics (cost, sessions, tokens, cache hit rate, 5m TTL share,
-  tool success, summary coverage, subagent overhead), today vs average,
-  weekly/monthly trends — each with a detail popup
-- **Conversation**: Multi-pane browsing with syntax highlighting, in-pane
-  search, copy-to-clipboard
-- **Search**: Full-text search across all sessions (tantivy ngram, multilingual)
-- **Pin**: Mark important sessions, browse across dates
-- **MCP Server**: Query ccsight from other Claude clients (`--mcp` — exposes
-  `stats`, `sessions`, `search`, `live_sessions` tools)
-- **Caching**: Fast startup via on-disk cache (`~/.ccsight/cache.json`) and
-  incremental full-text index update
+- **Dashboard** — cost (with 5m vs 1h cache-write TTL separated), daily / monthly trends, top projects, models, tools, languages, activity heatmap, hourly pattern
+- **Live** — currently-running and recently-paused sessions, copy-resume command, post-reboot recovery via local snapshot
+- **Daily View** — per-day sessions + activity graph + project / model / tool breakdown + conversation viewer
+- **Insights** — metrics (cost, tokens, cache, tool success, subagent overhead), today vs average, weekly / monthly trends — each with detail popups
+- **Conversation** — multi-pane, syntax highlighting, in-pane search, per-turn latency / cost / token breakdown
+- **Search** — full-text (tantivy) + inline filter tokens + persistent history (`↑/↓`)
+- **Pin** — mark sessions, reorder with `Shift+J/K`, browse across dates
+- **MCP Server** — `--mcp` exposes `stats`, `sessions`, `search`, `live_sessions` to other Claude clients
+- **Caching** — on-disk cache + incremental full-text index for fast startup
 
 ## Installation
 
@@ -56,6 +45,8 @@ cargo install --path .
 ```bash
 ccsight                    # Run TUI
 ccsight --daily            # Print daily cost table to stdout (date / tokens / cost)
+ccsight --weekly           # Same shape, aggregated by ISO week (Mon-Sun)
+ccsight --monthly          # Same shape, aggregated by calendar month
 ccsight --mcp              # Run as MCP server (stdio)
 ccsight --clear-cache      # Drop the JSON cache + tantivy index, rebuild on next run
 ccsight --limit 50         # Load only the 50 most recent sessions (faster startup)
@@ -63,42 +54,52 @@ ccsight --limit 50         # Load only the 50 most recent sessions (faster start
 
 Run `ccsight --help` for the full flag list. Press `?` in the TUI for key bindings.
 
+### Search filters
+
+Press `/` inside the TUI to open the search popup. Plain queries match
+projects, summaries, branches, dates, and conversation content. Add any
+of these tokens to narrow the result set further:
+
+| Token | Effect |
+|-------|--------|
+| `filter:live` / `filter:paused` / `filter:busy` | Limit to sessions in the current Live / paused / busy poll |
+| `filter:today` / `filter:week` / `filter:month` | Calendar window (local timezone) |
+| `filter:date:YYYY-MM-DD` | Exact date |
+| `project:NAME` / `branch:NAME` / `model:NAME` | Substring match (case-insensitive) |
+
+Tokens can be combined freely with each other and with free text:
+
+```text
+/filter:today project:ccsight             # today's ccsight sessions
+/filter:live branch:main                  # currently-running on main branch
+/filter:month model:opus mcp setup        # last 30 days, Opus, containing "mcp setup"
+/filter:date:YYYY-MM-DD release           # specific date narrowed by content
+```
+
+The Live tab pre-fills `filter:live ` for `/`, and the search popup chips up recognised tokens so you can confirm parsing.
+
 ## MCP Server
 
-`ccsight --mcp` runs as a stdio MCP server exposing three tools:
+`ccsight --mcp` runs as a stdio MCP server exposing four tools:
 
-- `stats` — aggregated cost / token / model metrics, plus a per-MCP-server adoption snapshot
+- `stats` — aggregated cost / token / model metrics + per-MCP-server adoption snapshot
 - `sessions` — list & detail (with `conversation_query` for in-session search)
 - `search` — full-text search across all sessions (tantivy)
+- `live_sessions` — currently-running and recently-disconnected sessions
 
-All tools accept `date_from` / `date_to` (`YYYY-MM-DD`, local timezone).
+The first three accept `date_from` / `date_to` (`YYYY-MM-DD`, local timezone); `live_sessions` always reports the current poll.
 
-### Register with Claude Code
-
-The simplest way — Claude Code's CLI registers the MCP server in your user-scoped
-config so it's available across every project:
+Register with Claude Code (simplest, user-scoped — works in every project):
 
 ```bash
 claude mcp add --scope user ccsight -- ccsight --mcp
 ```
 
-### Manual config (Claude Code / Claude Desktop)
-
-Alternatively, add an entry under `mcpServers` in `~/.claude.json` (Claude Code)
-or `~/Library/Application Support/Claude/claude_desktop_config.json` (Claude Desktop):
+For Claude Desktop or hand-rolled configs, add this block under `mcpServers` in `~/.claude.json` or `~/Library/Application Support/Claude/claude_desktop_config.json`, then restart the host:
 
 ```json
-{
-  "mcpServers": {
-    "ccsight": {
-      "command": "ccsight",
-      "args": ["--mcp"]
-    }
-  }
-}
+{ "mcpServers": { "ccsight": { "command": "ccsight", "args": ["--mcp"] } } }
 ```
-
-After saving, restart the host. The tools then appear under the `ccsight` MCP server.
 
 ## Data Source
 
@@ -114,10 +115,8 @@ Reads inputs from these locations:
   Skills / Commands / Subagents. Surfaced as zero-call rows in the Tools popup
   for entries you've installed but never invoked.
 - **`~/Library/Application Support/Claude/local-agent-mode-sessions/`** *(macOS only)*
-  — Claude Desktop "Cowork" tab session logs (`audit.jsonl`) plus per-session
-  metadata. Ingested alongside regular Claude Code logs. The format is
-  undocumented and may change between releases; if a future update breaks it,
-  individual sessions just stop appearing rather than crashing the TUI.
+  — Claude Desktop "Cowork" sessions. Read via a side-channel format; if a
+  release breaks it, individual sessions silent-skip rather than crashing.
 
 State written by ccsight (cache + index are removed by `--clear-cache`; pins
 and the live snapshot are kept):
@@ -127,9 +126,6 @@ and the live snapshot are kept):
 - `~/.ccsight/pins.json` — pinned-session list
 - `~/.ccsight/live_snapshot.json` — record of sessions seen alive, used by the
   Live tab to flag "I had this open before the reboot" entries with a `⟳` glyph
-
-Pre-1.1 versions wrote to `~/.cache/ccsight/` and `~/.config/ccsight/`; ccsight
-migrates those automatically on first launch.
 
 ## License
 
