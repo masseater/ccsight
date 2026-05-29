@@ -2377,10 +2377,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     ),
                     Span::styled(sub_suffix, Style::default().fg(theme::DIM)),
                     Span::styled(" ", Style::default().fg(theme::DIM)),
-                    Span::styled(
-                        format_cost(total_day_cost, 0),
-                        cost_style(total_day_cost),
-                    ),
+                    Span::styled(format_cost(total_day_cost, 0), cost_style(total_day_cost)),
                 ])
                 .alignment(ratatui::layout::Alignment::Center),
             );
@@ -2391,10 +2388,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                         format!("{active_hours}h "),
                         Style::default().fg(theme::SUCCESS),
                     ),
-                    Span::styled(
-                        format_cost(total_day_cost, 0),
-                        cost_style(total_day_cost),
-                    ),
+                    Span::styled(format_cost(total_day_cost, 0), cost_style(total_day_cost)),
                 ])
                 .alignment(ratatui::layout::Alignment::Center),
             );
@@ -5741,12 +5735,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         )),
         Line::from("  Tab / 1-4     Switch tabs (Dashboard/Live/Daily/Insights)"),
         Line::from("  /             Search sessions (inline filters supported)"),
-        Line::from(
-            "                ↑/↓ walks the persisted query history",
-        ),
-        Line::from(
-            "                filter:live|paused|busy|today|week|month  filter:date:Y-M-D",
-        ),
+        Line::from("                ↑/↓ walks the persisted query history"),
+        Line::from("                filter:live|paused|busy|today|week|month  filter:date:Y-M-D"),
         Line::from("                project:NAME · branch:NAME · model:NAME"),
         Line::from("  f             Open period filter"),
         Line::from("  p             Open project filter"),

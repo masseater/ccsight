@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ccsight pre-push hook.
+#
+# Re-runs the CI-blocking gate (cargo fmt --check, cargo test, cargo clippy,
+# project lint) once before a push. pre-commit runs the same checks per
+# `git commit`, but `git cherry-pick` does not fire it (nor does a commit
+# made before the hooks were armed), so this is the last line that catches
+# those before code leaves the machine. The advisory tools (shellcheck,
+# cargo-audit) stay in pre-commit + CI.
+#
+# To install: `bash scripts/install-hooks.sh` (configures `core.hooksPath`).
+
+set -e
+
+# Locate repo root regardless of where git invokes the hook from.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-push] cargo fmt -- --check ..."
+if ! cargo fmt -- --check 2>&1; then
+    echo "[pre-push] FAILED: formatter drift. Run 'cargo fmt' and amend/recommit before pushing."
+    exit 1
+fi
+
+echo "[pre-push] cargo test ..."
+if ! cargo test --quiet 2>&1; then
+    echo "[pre-push] FAILED: cargo test reported failures."
+    exit 1
+fi
+
+echo "[pre-push] cargo clippy -- -D warnings ..."
+if ! cargo clippy --quiet -- -D warnings 2>&1; then
+    echo "[pre-push] FAILED: clippy reported warnings/errors."
+    exit 1
+fi
+
+echo "[pre-push] bash scripts/lint.sh ..."
+if ! bash scripts/lint.sh; then
+    echo "[pre-push] FAILED: project lint blocked the push."
+    exit 1
+fi
+
+echo "[pre-push] OK"

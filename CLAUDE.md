@@ -11,11 +11,13 @@ cargo fmt                    # Format (gate: `cargo fmt -- --check`)
 cargo test                   # Run tests
 cargo clippy -- -D warnings  # Lint (warnings are errors)
 bash scripts/lint.sh         # Project lint (UI patterns, safety)
-bash scripts/install-hooks.sh   # One-time pre-commit hook setup
 ```
 
-The pre-commit hook runs `cargo fmt -- --check`, `cargo test`, `cargo clippy`,
-and `bash scripts/lint.sh` on every commit. CI runs the same set.
+The `scripts/hooks/` pre-commit (per commit) and pre-push (before push) hooks
+run `cargo fmt --check` + test + clippy + lint; CI runs the same gate.
+`build.rs` arms them on first build via `core.hooksPath` (opt out:
+`CCSIGHT_NO_HOOK_INSTALL=1`; manual: `install-hooks.sh`). pre-push exists
+because `git cherry-pick` skips pre-commit.
 
 ## Smoke test (tmux)
 

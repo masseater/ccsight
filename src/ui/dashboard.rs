@@ -211,11 +211,8 @@ fn draw_stats_cards(frame: &mut Frame, area: Rect, state: &AppState) {
                 .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
-        Line::from(Span::styled(
-            "active days",
-            Style::default().fg(theme::DIM),
-        ))
-        .alignment(Alignment::Center),
+        Line::from(Span::styled("active days", Style::default().fg(theme::DIM)))
+            .alignment(Alignment::Center),
     ])
     .block(Block::default().borders(Borders::NONE));
 

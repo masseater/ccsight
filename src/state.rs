@@ -698,8 +698,7 @@ impl AppState {
     /// Projects panel so the two surfaces agree on rank. References point
     /// into `project_list`; the caller indexes into the returned view.
     pub(crate) fn project_list_sorted(&self) -> Vec<&(String, u64, chrono::NaiveDate)> {
-        let mut sorted: Vec<&(String, u64, chrono::NaiveDate)> =
-            self.project_list.iter().collect();
+        let mut sorted: Vec<&(String, u64, chrono::NaiveDate)> = self.project_list.iter().collect();
         match self.dashboard_projects_sort {
             RankSort::Tokens => {
                 sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

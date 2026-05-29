@@ -1317,8 +1317,7 @@ pub(crate) fn handle_default_key(
                 // stale row when the order changes.
                 match state.dashboard_panel {
                     1 => {
-                        state.dashboard_projects_sort =
-                            state.dashboard_projects_sort.toggle();
+                        state.dashboard_projects_sort = state.dashboard_projects_sort.toggle();
                         state.dashboard_scroll[1] = 0;
                         state.dashboard_viewport[1] = 0;
                     }

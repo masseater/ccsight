@@ -18,5 +18,5 @@ fi
 
 git config core.hooksPath scripts/hooks
 echo "Hooks installed: core.hooksPath = scripts/hooks"
-echo "Pre-commit checks: cargo clippy + bash scripts/lint.sh"
-echo "Bypass once with: git commit --no-verify"
+echo "pre-commit: cargo fmt --check + test + clippy + lint (per commit)"
+echo "pre-push:   same gate once before push (catches cherry-picked commits)"
