@@ -123,6 +123,17 @@ fn parse_session(session_path: &Path, day_idx: usize, session_idx: usize) -> Vec
         .collect()
 }
 
+/// Tightened `LogMergePolicy` for 30s-cadence incremental writes:
+/// `min_num_segments=3` and `del_docs_ratio_before_merge=0.3` (defaults
+/// 8 / 1.0 let segments and `.del` files accumulate forever). Paired
+/// with `wait_merging_threads` in `build` / `update_or_build`.
+fn install_merge_policy(writer: &IndexWriter) {
+    let mut policy = tantivy::indexer::LogMergePolicy::default();
+    policy.set_min_num_segments(3);
+    policy.set_del_docs_ratio_before_merge(0.3);
+    writer.set_merge_policy(Box::new(policy));
+}
+
 fn write_docs(writer: &IndexWriter, fields: &Fields, docs: &[ParsedDoc]) -> anyhow::Result<()> {
     for d in docs {
         writer.add_document(doc!(
@@ -198,6 +209,7 @@ impl SearchIndex {
         register_tokenizer(&index);
 
         let mut writer: IndexWriter = index.writer(500_000_000)?;
+        install_merge_policy(&writer);
 
         let tasks = collect_tasks(daily_groups);
         let parsed: Vec<ParsedDoc> = tasks
@@ -207,6 +219,10 @@ impl SearchIndex {
 
         write_docs(&writer, &fields, &parsed)?;
         writer.commit()?;
+        // Block until merge threads finish; without this, writer drops
+        // mid-merge and pending segments leak across reloads (339+ files
+        // over a day in our bench). One-time cost; faster steady-state.
+        writer.wait_merging_threads()?;
 
         let reader = index
             .reader_builder()
@@ -273,6 +289,7 @@ impl SearchIndex {
         register_tokenizer(&index);
 
         let mut writer: IndexWriter = index.writer(500_000_000)?;
+        install_merge_policy(&writer);
 
         for path in &to_delete {
             writer.delete_term(Term::from_field_text(fields.session_path, path));
@@ -311,6 +328,11 @@ impl SearchIndex {
 
         write_docs(&writer, &fields, &parsed)?;
         writer.commit()?;
+        // Same merge-threads barrier as `build` — see the comment there.
+        // This is the hot path (called every 30s on reload) so the win
+        // compounds: each reload finishes its merges before the next one
+        // starts, preventing the 339-segment accumulation we hit before.
+        writer.wait_merging_threads()?;
 
         let reader = index
             .reader_builder()

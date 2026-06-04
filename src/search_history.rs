@@ -81,6 +81,9 @@ impl SearchHistory {
         let _ = self.save();
     }
 
+    // The only caller is `#[cfg(not(test))]` above, so test builds see `save`
+    // as dead. It is live in production — keep it, silence the test-only lint.
+    #[cfg_attr(test, allow(dead_code))]
     fn save(&self) -> Result<()> {
         let path = crate::infrastructure::search_history_path()?;
         if let Some(parent) = path.parent() {

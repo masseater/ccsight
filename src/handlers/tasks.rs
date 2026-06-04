@@ -14,20 +14,10 @@ use crate::aggregator::{DailyGroup, SessionInfo};
 use crate::state::SummaryType;
 use crate::{AppState, summary};
 
-/// Write `text` to the system clipboard on a detached background thread.
-///
-/// `arboard::Clipboard::new()` and `set_text()` are synchronous and may block
-/// for several seconds on macOS when the NSPasteboard is contended (other
-/// apps clipboard activity, AppKit pasteboard daemon stalls). Running them
-/// on the event loop thread freezes the entire UI for that duration, and
-/// because `EnableMouseCapture` is still in effect, the surrounding terminal
-/// (e.g. a zellij tab hosting ccsight) loses mouse input until ccsight is
-/// killed. Detaching the write keeps the loop responsive.
-///
-/// Returns a `Receiver<Result<(), String>>` so the caller can poll the
-/// outcome and overwrite the optimistic "Copied" toast with an error
-/// message if the clipboard handle couldn't be acquired or `set_text`
-/// failed (e.g. headless / no display server / clipboard daemon down).
+/// Detached clipboard write — `arboard::Clipboard::set_text` is
+/// synchronous and can stall multi-second on macOS NSPasteboard
+/// contention, freezing the event loop. Returns a receiver so the caller
+/// can replace the optimistic "Copied" toast on failure.
 pub(crate) fn spawn_clipboard_write(text: String) -> mpsc::Receiver<Result<(), String>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

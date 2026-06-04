@@ -92,9 +92,7 @@ mod tests {
         assert!(cache2.cached_files > 0, "Second load should use cache");
         assert!(
             duration2 < duration1 || duration2.as_millis() < 500,
-            "Cached load ({:?}) should be faster than uncached ({:?})",
-            duration2,
-            duration1
+            "Cached load ({duration2:?}) should be faster than uncached ({duration1:?})"
         );
     }
 
@@ -120,16 +118,10 @@ mod tests {
         }
     }
 
-    /// Regression: `StatsAggregator` (powers TUI Overview cost) and
-    /// `DailyGrouper` (powers Daily tab / `--daily` CLI) MUST produce
-    /// identical token totals when fed the same files. They are two
-    /// independent aggregation paths and silently diverged in the past —
-    /// once when one path skipped the global cross-file dedup, once when
-    /// `if skip_tokens { continue; }` in the daily loop also skipped the
-    /// adjacent tool-usage counting in the global loop. The summed
-    /// per-day-per-model totals from `daily_groups` are the authoritative
-    /// reflection of cache_creation_5m/1h split; `stats.total_tokens`
-    /// likewise. Drift in either is a bug — pin it here.
+    /// Regression: `StatsAggregator` (Overview cost) and `DailyGrouper`
+    /// (Daily tab / `--daily`) are independent aggregation paths over the
+    /// same files. Token totals MUST match — past divergences came from
+    /// dedup / `skip_tokens` quirks. Both honor the cache_5m/1h split.
     #[test]
     fn test_stats_and_grouper_agree_on_token_totals() {
         let result = load_data(0).unwrap();
@@ -156,14 +148,9 @@ mod tests {
             }
         }
 
-        // The two aggregators are called back-to-back on the same file list,
-        // but each opens the JSONLs independently. In a dev env where Claude
-        // Code is actively writing the user's live session, that interval
-        // can land a handful of new entries on the grouper side, making the
-        // totals drift by single-digit kilotoken even when the logic is
-        // sound. Real regressions (skip_tokens divergence, missing dedup)
-        // produced megatoken-scale gaps in prior incidents, so a 0.1%
-        // tolerance keeps the test sharp without going flaky.
+        // Two aggregators open JSONLs independently; in a dev env with a
+        // live ccsight session, kilotoken drift can leak between passes.
+        // Real regressions produced megatoken gaps, so 0.1% stays sharp.
         let s = &result.stats.total_tokens;
         let pairs: [(u64, u64, &str); 6] = [
             (g_input, s.input_tokens, "input"),
@@ -176,14 +163,8 @@ mod tests {
         for (g, s, name) in pairs {
             let max = g.max(s);
             let diff = g.abs_diff(s);
-            // 0.5% tolerance, with a 1024-token floor so a small absolute
-            // delta on a near-empty corpus isn't a false negative. Dev
-            // envs run this against live JSONLs that the user's active
-            // Claude Code session is actively writing to; the gap between
-            // the two aggregator passes can land a few hundred K tokens
-            // of cache writes. Real regressions (skip_tokens / dedup
-            // divergence) produced multi-megatoken gaps on each metric,
-            // so 0.5% still catches them.
+            // 0.5% + 1024-floor: tolerates inter-pass live-JSONL drift,
+            // still catches real regressions (multi-megatoken gaps).
             let allowed = (max / 200).max(1024);
             assert!(
                 diff <= allowed,
@@ -299,9 +280,9 @@ mod tests {
             segments
                 .iter()
                 .map(|s| match s {
-                    TextSegment::Plain(p) => format!("Plain({:?})", p),
+                    TextSegment::Plain(p) => format!("Plain({p:?})"),
                     TextSegment::Code { lang, content } =>
-                        format!("Code({:?}, {:?})", lang, content),
+                        format!("Code({lang:?}, {content:?})"),
                 })
                 .collect::<Vec<_>>()
         );
@@ -379,7 +360,7 @@ mod tests {
         println!("Rendered {} lines:", lines.len());
         for (i, line) in lines.iter().enumerate() {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            println!("Line {}: {}", i, text);
+            println!("Line {i}: {text}");
         }
 
         assert_eq!(lines.len(), flags.len());
@@ -452,7 +433,7 @@ mod tests {
         println!("Rendered {} lines:", lines.len());
         for (i, line) in lines.iter().enumerate() {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            println!("Line {}: {}", i, text);
+            println!("Line {i}: {text}");
         }
 
         assert!(lines.len() >= 5, "Should have at least 5 lines");
@@ -931,7 +912,7 @@ mod tests {
     fn test_join_conversation_lines_empty_lines_between() {
         let lines = vec![
             "  Paragraph one end that fills the width".to_string(),
-            "".to_string(),
+            String::new(),
             "  Paragraph two".to_string(),
         ];
         let flags = vec![false, false, false];

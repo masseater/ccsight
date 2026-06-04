@@ -1,8 +1,9 @@
 mod cache;
 pub mod cowork_source;
 mod file_discovery;
+pub mod live_diagnostic;
 pub mod live_sessions;
-pub mod live_snapshot;
+pub mod live_snapshots;
 pub mod mcp_config;
 pub mod resource_config;
 pub mod search_index;

@@ -53,10 +53,10 @@ pub mod helpers {
         SessionInfo {
             file_path: PathBuf::from(path),
             project_name: project.to_string(),
-            git_branch: branch.map(|s| s.to_string()),
+            git_branch: branch.map(std::string::ToString::to_string),
             day_input_tokens: 1000,
             day_output_tokens: 500,
-            summary: summary.map(|s| s.to_string()),
+            summary: summary.map(std::string::ToString::to_string),
             ..default_session()
         }
     }
@@ -118,9 +118,15 @@ pub mod helpers {
             live_paused: Vec::new(),
             live_selected: 0,
             live_scroll: 0,
+            live_paused_scroll: 0,
+            live_has_snapshot_history: false,
             live_sessions_task: None,
             live_last_update: None,
-            prior_run_last_refresh: None,
+            prior_run_alive: std::collections::HashMap::new(),
+            live_view_snapshot_offset: 0,
+            live_past_sessions: Vec::new(),
+            live_past_snapshot_meta: None,
+            live_past_snapshot_total: 0,
             show_project_detail: false,
             project_detail_path: String::new(),
             project_detail_scroll: 0,
@@ -199,6 +205,7 @@ pub mod helpers {
             insights_panel_areas: Vec::new(),
             session_list_area: None,
             live_list_area: None,
+            live_paused_list_area: None,
             breakdown_panel_area: None,
             summary_popup_area: None,
             active_popup_area: None,
@@ -230,6 +237,8 @@ pub mod helpers {
             original_aggregated_model_tokens: HashMap::new(),
             dashboard_projects_sort: crate::state::RankSort::default(),
             dashboard_models_sort: crate::state::RankSort::default(),
+            dashboard_ecosystem_sort: crate::state::RankSort::default(),
+            dashboard_languages_sort: crate::state::RankSort::default(),
         }
     }
 }

@@ -5,13 +5,9 @@
 //! prevents the second copy from drifting if someone updates the
 //! escaping policy.
 
-/// POSIX-quote a cwd for `cd ...`, expanding a leading `~/` (or bare `~`)
-/// to `$HOME` first. The Daily session detail popup feeds `project_name`
-/// here, which is already display-formatted as `~/dev/foo`; naively
-/// quoting that yields `cd '~/dev/foo'` and the shell treats `~` as a
-/// literal directory name. If `$HOME` is unset (rare; not on a normal
-/// login shell), fall back to plain quoting so the user at least sees
-/// something pasteable rather than a broken command.
+/// POSIX-quote a cwd for `cd ...`, expanding leading `~/` (or bare `~`)
+/// via `$HOME` first. Without expansion `cd '~/dev/foo'` is literal.
+/// `$HOME` absent → plain quote (pasteable, broken — still better than panic).
 pub fn shell_quote_cwd(path: &str) -> String {
     shell_quote_cwd_with_home(path, std::env::var("HOME").ok().as_deref())
 }
@@ -30,6 +26,31 @@ fn shell_quote_cwd_with_home(path: &str, home: Option<&str>) -> String {
         path.to_string()
     };
     posix_shell_quote(&expanded)
+}
+
+/// `cd ... && claude -r <UUID>` from a JSONL path under
+/// `~/.claude/projects/<slug>/<uuid>.jsonl`. The cwd comes from the
+/// JSONL's `cwd` field (authoritative); reversing the slug is lossy when
+/// the real path contains `-`, so it's only a fallback. `None` for Cowork
+/// audit logs (desktop app only).
+pub fn resume_command_from_jsonl(jsonl_path: &std::path::Path) -> Option<String> {
+    if crate::infrastructure::is_cowork_audit_path(jsonl_path) {
+        return None;
+    }
+    let session_id = jsonl_path.file_stem().and_then(|s| s.to_str())?;
+    let cwd =
+        crate::infrastructure::live_sessions::read_cwd_from_jsonl(jsonl_path).or_else(|| {
+            jsonl_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|slug| slug.replace('-', "/"))
+        })?;
+    Some(format!(
+        "cd {} && claude -r {}",
+        shell_quote_cwd(&cwd),
+        posix_shell_quote(session_id),
+    ))
 }
 
 /// POSIX single-quote shell escape. Wraps the input in `'...'` and turns
@@ -51,7 +72,57 @@ pub fn posix_shell_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{posix_shell_quote, shell_quote_cwd_with_home};
+    use super::{posix_shell_quote, resume_command_from_jsonl, shell_quote_cwd_with_home};
+    use std::path::PathBuf;
+
+    #[test]
+    fn resume_command_falls_back_to_slug_when_jsonl_absent() {
+        // No file on disk → read_cwd_from_jsonl returns None → slug reversal.
+        let jsonl =
+            PathBuf::from("/Users/me/.claude/projects/-Users-me-work-project/0aef-1234.jsonl");
+        let cmd = resume_command_from_jsonl(&jsonl).unwrap();
+        assert!(cmd.starts_with("cd '/Users/me/work/project'"));
+        assert!(cmd.ends_with("claude -r '0aef-1234'"));
+    }
+
+    #[test]
+    fn resume_command_prefers_jsonl_cwd_over_lossy_slug() {
+        // The slug `-tmp-...-multi-word-dir` would reverse to
+        // `/tmp/.../multi/word/dir`; the real cwd in the JSONL keeps
+        // the literal `-`. The command must `cd` to the authoritative path.
+        let dir = std::env::temp_dir()
+            .join(format!("ccsight_resume_{}", std::process::id()))
+            .join("-Users-me-dev-multi-word-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let jp = dir.join("abc-123.jsonl");
+        std::fs::write(
+            &jp,
+            "{\"type\":\"summary\"}\n\
+             {\"type\":\"user\",\"cwd\":\"/Users/me/dev/multi-word-dir\"}\n",
+        )
+        .unwrap();
+        let cmd = resume_command_from_jsonl(&jp).unwrap();
+        assert!(
+            cmd.starts_with("cd '/Users/me/dev/multi-word-dir'"),
+            "expected authoritative cwd, got: {cmd}"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn resume_command_returns_none_for_cowork_audit_path() {
+        // Path inside the Cowork tree must be opted out — Cowork sessions
+        // are re-opened from Claude Desktop, not the CLI.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let jsonl = PathBuf::from(format!(
+            "{home}/Library/Application Support/Claude/local-agent-mode-sessions/a/b/c/audit.jsonl"
+        ));
+        // Skip the assertion if the test machine has no Cowork root (CI on
+        // Linux); the predicate `is_cowork_audit_path` returns false then.
+        if crate::infrastructure::is_cowork_audit_path(&jsonl) {
+            assert!(resume_command_from_jsonl(&jsonl).is_none());
+        }
+    }
 
     #[test]
     fn shell_quote_cwd_expands_tilde_slash() {

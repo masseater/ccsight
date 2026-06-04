@@ -11,18 +11,10 @@ use crate::infrastructure::{
 };
 use crate::parser::JsonlParser;
 
-/// Pull the slash-command name out of a Claude Code "command invocation"
-/// user message. Real invocations have a tiny body that is wholly the XML
-/// metadata block (`<command-name>`, `<command-message>`, `<command-args>`),
-/// so we accept a message only when:
-///
-/// 1. The message contains **exactly one** `<command-name>` tag (summary
-///    regeneration prompts list dozens of historical commands as text and
-///    must not be counted), AND
-/// 2. The body is short (< 500 chars — real invocations are ~100-200; the
-///    cap rejects large prompts that happen to contain a single tag).
-///
-/// Returns at most one command name (without the leading `/`).
+/// Slash-command name from a "command invocation" user message. Accepts
+/// only messages with exactly one `<command-name>` tag AND body < 500
+/// chars — real invocations are tiny XML blocks; summary regen prompts
+/// can list dozens of historical commands and would otherwise count.
 pub(crate) fn extract_command_names(text: &str) -> Vec<String> {
     if text.len() >= 500 {
         return Vec::new();
@@ -604,13 +596,9 @@ impl StatsAggregator {
         file_stats.model = super::extract_session_model(entries);
 
         for entry in entries {
-            // Decide once per entry whether its tokens are already credited
-            // to another file (global dedup). The two sub-aggregations
-            // below (per-day daily_stats / global stats) both consult this
-            // single decision — without sharing, one branch could skip
-            // while the other adds, producing the divergence between TUI
-            // Overview (uses global stats) and CLI --daily (reads
-            // daily_stats via the grouper).
+            // Single dedup decision shared by both daily_stats and global
+            // stats below — independent decisions would split TUI Overview
+            // and `--daily` totals.
             let skip_tokens = if entry.entry_type == EntryType::Assistant
                 && entry
                     .message

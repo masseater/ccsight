@@ -68,12 +68,9 @@ pub struct CachedFileStats {
     pub cache_creation_5m_tokens: u64,
     #[serde(default)]
     pub cache_creation_1h_tokens: u64,
-    /// `(message.id, requestId)` pairs whose tokens were credited to this
-    /// file's totals. Used by the global-dedup pre-load to skip duplicate
-    /// API responses that appear in multiple session JSONLs (e.g. when
-    /// Claude Code resumes/branches a session and writes the prior
-    /// conversation into a new file). Empty for files parsed before this
-    /// field existed — `#[serde(default)]` keeps old caches loadable.
+    /// `(message.id, requestId)` pairs credited to this file. Pre-loaded
+    /// into the cross-file dedup set so resume/branch duplicates skip.
+    /// Empty for caches predating this field (`serde(default)`).
     #[serde(default)]
     pub unique_hashes: Vec<String>,
     pub tool_usage: HashMap<String, usize>,

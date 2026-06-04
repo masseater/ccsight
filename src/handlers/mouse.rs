@@ -5,124 +5,6 @@
 use crate::state::{ConvListMode, ConversationPane, SCROLL_LINES};
 use crate::{AppState, PeriodFilter, Tab};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
-    use ratatui::layout::Rect;
-
-    fn daily_state_for_click() -> AppState {
-        // The mouse-click math is independent of the date; pick a fixed
-        // reference so the fixture does not couple to the wall clock.
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
-        let group = make_daily_group(date, vec![make_session("proj", None, None)]);
-        let mut state = make_test_app_state(vec![group]);
-        state.tab = Tab::Daily;
-        state.show_conversation = false;
-        // session_list_area: full-width 140 col panel, height 10, starting at row 13.
-        // item_height = 2 (line1 + line2 per session).
-        state.session_list_area = Some((
-            Rect {
-                x: 0,
-                y: 13,
-                width: 140,
-                height: 10,
-            },
-            0,
-            2,
-        ));
-        state
-    }
-
-    #[test]
-    fn info_button_click_opens_detail() {
-        let mut state = daily_state_for_click();
-        // Row 14 = line1 of session 0 (area.y=13, relative_y=1, line_in_session=0).
-        // Column 137 falls within [136, 139) — the [i] hit zone.
-        handle_mouse_click(&mut state, 137, 14);
-        assert!(state.show_detail, "clicking [i] should open session detail");
-        assert_eq!(state.selected_session, 0);
-    }
-
-    #[test]
-    fn click_off_info_button_only_selects() {
-        let mut state = daily_state_for_click();
-        // Row 14 line1 of session 0, but column 10 is far from [i].
-        handle_mouse_click(&mut state, 10, 14);
-        assert!(!state.show_detail, "non-[i] click must not open detail");
-        assert_eq!(state.selected_session, 0);
-    }
-
-    #[test]
-    fn click_on_line2_of_info_column_does_not_open() {
-        let mut state = daily_state_for_click();
-        // Row 15 = line2 of session 0 (relative_y=2, line_in_session=1).
-        // Even at the info-button column, line2 must not trigger the popup.
-        handle_mouse_click(&mut state, 137, 15);
-        assert!(
-            !state.show_detail,
-            "line2 click in info column must not open detail"
-        );
-    }
-
-    fn conv_state_for_click() -> AppState {
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
-        let session = make_session("proj", None, None);
-        let group = make_daily_group(date, vec![session.clone()]);
-        let mut state = make_test_app_state(vec![group]);
-        state.tab = Tab::Daily;
-        state.show_conversation = true;
-        // One pane occupying right half: x=70, width=70. The info-area [i]
-        // button hits at row=area.y+1=6, cols [70+66, 70+69) = [136, 139).
-        let mut pane = crate::state::ConversationPane::default();
-        pane.file_path = Some(session.file_path.clone());
-        state.panes.push(pane);
-        state.pane_areas = vec![Rect {
-            x: 70,
-            y: 5,
-            width: 70,
-            height: 30,
-        }];
-        state
-    }
-
-    #[test]
-    fn conv_info_button_click_opens_detail() {
-        let mut state = conv_state_for_click();
-        // row=6 (area.y+1), col=137 → inside [136, 139)
-        handle_mouse_click(&mut state, 137, 6);
-        assert!(
-            state.show_detail,
-            "[i] in conv pane should open session detail"
-        );
-        assert_eq!(state.active_pane_index, Some(0));
-    }
-
-    #[test]
-    fn conv_pane_body_click_does_not_open_detail() {
-        let mut state = conv_state_for_click();
-        // Click inside pane body (not on the info button row/column).
-        handle_mouse_click(&mut state, 100, 10);
-        assert!(
-            !state.show_detail,
-            "body click in conv pane should not open session detail"
-        );
-        assert_eq!(state.active_pane_index, Some(0));
-    }
-
-    #[test]
-    fn conv_info_button_click_ignored_without_session() {
-        let mut state = conv_state_for_click();
-        // Drop the file_path so the pane has no session.
-        state.panes[0].file_path = None;
-        handle_mouse_click(&mut state, 137, 6);
-        assert!(
-            !state.show_detail,
-            "without a session, [i] click must not open detail"
-        );
-    }
-}
-
 /// `column`/`row` are inside the area iff both axes contain them. Used by
 /// every popup/list/pane click test.
 pub(crate) fn in_area(column: u16, row: u16, area: &ratatui::layout::Rect) -> bool {
@@ -177,7 +59,11 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         } else {
             0
         };
-        let relative_row = (row - area.y).saturating_sub(1) as usize;
+        // `search_results_area` is the inner sub-rect whose block has no top
+        // border (Borders::LEFT|RIGHT|BOTTOM), so the first result line draws
+        // at `area.y` itself — there is no header row to subtract. Each result
+        // spans `item_height` rows.
+        let relative_row = (row - area.y) as usize;
         let clicked_idx = scroll_start + relative_row / item_height;
         if clicked_idx < state.search_results.len() {
             state.search_selected = clicked_idx;
@@ -385,7 +271,18 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         for (idx, area) in state.pane_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 state.active_pane_index = Some(idx);
-                let content_y = area.y + 1;
+                // Conversation lines start below the top border AND the
+                // session info header (3 lines when the pane has a loaded
+                // session, 0 otherwise) — mirror `draw_conversation_pane`'s
+                // `inner.y = area.y + 1 + info_height`. Computed before the
+                // `get_mut` below to avoid a borrow conflict.
+                let info_height: u16 =
+                    if state.panes.get(idx).is_some_and(|p| p.file_path.is_some()) {
+                        3
+                    } else {
+                        0
+                    };
+                let content_y = area.y + 1 + info_height;
                 if row >= content_y
                     && let Some(pane) = state.panes.get_mut(idx)
                     && !pane.message_lines.is_empty()
@@ -487,7 +384,11 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         && row >= area.y
         && row < area.y + area.height
     {
-        let relative_y = (row - area.y) as usize;
+        // `session_list_area` records the OUTER bordered chunk (Borders::ALL),
+        // so the first list line draws at `area.y + 1` (inside the top border).
+        // Subtract that border row before dividing by `item_height`, otherwise
+        // a click on a session's line2 resolves to the next session.
+        let relative_y = (row - area.y).saturating_sub(1) as usize;
         let clicked_idx = scroll + relative_y / item_height;
         if let Some(group) = state.daily_groups.get(state.selected_day) {
             let session_count = group.user_sessions().count();
@@ -496,7 +397,9 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
                 // [i] button: line1 of session, last 3 cols of the inner area open the detail popup.
                 let info_btn_left = area.x + area.width.saturating_sub(4);
                 let info_btn_right = area.x + area.width.saturating_sub(1);
-                let on_line1 = relative_y >= 1 && (relative_y - 1).is_multiple_of(item_height);
+                // With the border row removed above, line1 of each session sits
+                // at relative_y 0, 2, 4, … (multiples of item_height).
+                let on_line1 = relative_y.is_multiple_of(item_height);
                 if on_line1 && column >= info_btn_left && column < info_btn_right {
                     state.show_detail = true;
                     state.session_detail_scroll = 0;
@@ -506,90 +409,84 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         return;
     }
 
-    // Live tab session click — analogous to the Daily handler above, but
-    // the row layout has two sections (Active / Paused) interleaved with
-    // header lines, so the line-to-session math is bespoke.
-    if state.tab == Tab::Live
-        && let Some((area, scroll, active_count)) = state.live_list_area
-        && column >= area.x
-        && column < area.x + area.width
-        && row >= area.y
-        && row < area.y + area.height
-    {
-        let line_idx = scroll + (row - area.y) as usize;
-        // Layout (must mirror `draw_live` exactly):
-        //   line 0: "Active now (N)" header + status-count subtitle
-        //   line 1..: active rows × 3 (metadata + title + last user message)
-        //   then: blank separator + "Recently paused" header + paused rows × 3
-        // The active block starts at line 1 — no leading blank line is
-        // rendered, so this hit-test math must match the draw function.
-        const ROW_H: usize = 3;
-        let active_block_start = 1usize;
-        let active_block_end = active_block_start + active_count * ROW_H;
-        let paused_block_start = active_block_end + 2;
-        let (session_idx, row_line0) =
-            if line_idx >= active_block_start && line_idx < active_block_end {
-                let rel = line_idx - active_block_start;
-                (
-                    Some(rel / ROW_H),
-                    active_block_start + (rel / ROW_H) * ROW_H,
-                )
-            } else if line_idx >= paused_block_start {
-                let rel = line_idx - paused_block_start;
-                let paused_count = state.live_paused.len();
-                if rel / ROW_H < paused_count {
-                    (
-                        Some(active_count + rel / ROW_H),
-                        paused_block_start + (rel / ROW_H) * ROW_H,
-                    )
-                } else {
-                    (None, 0)
-                }
-            } else {
-                (None, 0)
-            };
-        if let Some(idx) = session_idx {
-            state.live_selected = idx;
-            // [i] hit zone: last 3 cols of line 1 of the clicked row.
-            let info_btn_left = area.x + area.width.saturating_sub(4);
-            let info_btn_right = area.x + area.width.saturating_sub(1);
-            let on_line1 = line_idx == row_line0;
-            if on_line1 && column >= info_btn_left && column < info_btn_right {
-                // Reuse the `i` key path so the popup wiring stays in one
-                // place (see handlers::keyboard `KeyCode::Char('i')` arm).
-                let live_info = crate::live_selected_session(state).map(|live| {
-                    let started = live
-                        .started_at
-                        .map(|t| {
-                            t.with_timezone(&chrono::Local)
-                                .format("%Y-%m-%d %H:%M")
-                                .to_string()
-                        })
-                        .unwrap_or_default();
-                    (
-                        live.jsonl_path.clone(),
-                        live.pid,
-                        live.status.clone().unwrap_or_else(|| "—".to_string()),
-                        started,
-                    )
-                });
-                if let Some((Some(jsonl), pid, status, started)) = live_info {
-                    let found = state.original_daily_groups.iter().find_map(|g| {
-                        g.sessions
-                            .iter()
-                            .find(|s| s.file_path == jsonl && !s.is_subagent)
-                            .cloned()
-                    });
-                    if let Some(session) = found {
-                        state.session_detail_override = Some(session);
-                        state.session_detail_live_extra = Some((pid, status, started));
-                        state.show_detail = true;
-                        state.session_detail_scroll = 0;
+    // Live tab session click. Active now and Recently paused render as two
+    // separate framed panels (`draw_live`); each panel body is `line 0 =
+    // header, rows at 1 + r*3`. Resolve which panel was clicked, then the
+    // shared per-row math gives the global `live_selected` index. Past view
+    // sets only `live_list_area` (single frame, base 0).
+    if state.tab == Tab::Live {
+        let active_count = state.live_active.len();
+        let in_rect = |area: ratatui::layout::Rect| {
+            column >= area.x
+                && column < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+        };
+        // (frame_inner_rect, scroll, row_count, global_base)
+        let frame = if let Some((area, scroll, count)) =
+            state.live_list_area.filter(|&(a, _, _)| in_rect(a))
+        {
+            Some((area, scroll, count, 0usize))
+        } else if let Some((area, scroll)) =
+            state.live_paused_list_area.filter(|&(a, _)| in_rect(a))
+        {
+            Some((area, scroll, state.live_paused.len(), active_count))
+        } else {
+            None
+        };
+        if let Some((area, scroll, count, base)) = frame {
+            const ROW_H: usize = 3;
+            let line_idx = scroll + (row - area.y) as usize;
+            // Line 0 is the panel's info header; rows start at line 1. A click
+            // on the header (or on a filler line when the panel is empty)
+            // resolves to no session.
+            if line_idx >= 1 {
+                let r = (line_idx - 1) / ROW_H;
+                if r < count {
+                    let row_line0 = 1 + r * ROW_H;
+                    state.live_selected = base + r;
+                    // [i] hit zone: last 3 cols of line 1 of the clicked row.
+                    let info_btn_left = area.x + area.width.saturating_sub(4);
+                    let info_btn_right = area.x + area.width.saturating_sub(1);
+                    let on_line1 = line_idx == row_line0;
+                    if on_line1 && column >= info_btn_left && column < info_btn_right {
+                        // Reuse the `i` key path so the popup wiring stays in
+                        // one place (see handlers::keyboard `Char('i')` arm).
+                        let live_info = crate::live_selected_session(state).map(|live| {
+                            let started = live
+                                .started_at
+                                .map(|t| {
+                                    t.with_timezone(&chrono::Local)
+                                        .format("%Y-%m-%d %H:%M")
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            (
+                                live.jsonl_path.clone(),
+                                live.pid,
+                                live.status.clone().unwrap_or_else(|| "—".to_string()),
+                                started,
+                            )
+                        });
+                        if let Some((Some(jsonl), pid, status, started)) = live_info {
+                            let found = state.original_daily_groups.iter().find_map(|g| {
+                                g.sessions
+                                    .iter()
+                                    .find(|s| s.file_path == jsonl && !s.is_subagent)
+                                    .cloned()
+                            });
+                            if let Some(session) = found {
+                                state.session_detail_override = Some(session);
+                                state.session_detail_live_extra = Some((pid, status, started));
+                                state.show_detail = true;
+                                state.session_detail_scroll = 0;
+                            }
+                        }
                     }
                 }
             }
+            return;
         }
-        return;
     }
 
     // Click on empty area dismisses topmost overlay
@@ -656,12 +553,9 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
         return;
     }
 
-    // Double-click on a project row in Projects detail popup opens the
-    // per-project detail popup (mirrors keyboard Enter). Guarded by
-    // `!show_project_detail` so a double-click *inside* an already-open
-    // per-project popup doesn't reopen the underlying row. Sort key must
-    // mirror dashboard.rs panel 1 — including the alphabetical tiebreaker
-    // (lint #30) — so `idx` indexes into the same list shown on screen.
+    // Double-click on a project row → per-project popup (mirrors Enter).
+    // Sort here must match dashboard.rs panel 1 (incl. lint #30 tiebreaker)
+    // so `idx` lands on the same row the user sees.
     if state.show_dashboard_detail && state.dashboard_panel == 1 && !state.show_project_detail {
         for (idx, area) in state.project_detail_row_areas.clone() {
             if in_area(column, row, &area) {
@@ -859,12 +753,9 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
                     if up {
                         pane.scroll = pane.scroll.saturating_sub(SCROLL_LINES);
                     } else {
-                        // Bound against the rendered cache when present so a
-                        // burst of scroll-down events can't drive `scroll`
-                        // past the actual content (the draw clamp would
-                        // recover it, but `selected_message` below is
-                        // computed before the next draw and would land on
-                        // the last message spuriously).
+                        // Clamp eagerly: a scroll burst would otherwise drive
+                        // `selected_message` (computed before the next draw)
+                        // onto the last message, not the visible row.
                         let max_scroll = pane
                             .rendered
                             .as_ref()
@@ -948,5 +839,298 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
                 state.selected_session += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+    use ratatui::layout::Rect;
+
+    fn daily_state_for_click() -> AppState {
+        // The mouse-click math is independent of the date; pick a fixed
+        // reference so the fixture does not couple to the wall clock.
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let group = make_daily_group(date, vec![make_session("proj", None, None)]);
+        let mut state = make_test_app_state(vec![group]);
+        state.tab = Tab::Daily;
+        state.show_conversation = false;
+        // session_list_area: full-width 140 col panel, height 10, starting at row 13.
+        // item_height = 2 (line1 + line2 per session).
+        state.session_list_area = Some((
+            Rect {
+                x: 0,
+                y: 13,
+                width: 140,
+                height: 10,
+            },
+            0,
+            2,
+        ));
+        state
+    }
+
+    #[test]
+    fn info_button_click_opens_detail() {
+        let mut state = daily_state_for_click();
+        // Row 14 = line1 of session 0 (area.y=13, relative_y=1, line_in_session=0).
+        // Column 137 falls within [136, 139) — the [i] hit zone.
+        handle_mouse_click(&mut state, 137, 14);
+        assert!(state.show_detail, "clicking [i] should open session detail");
+        assert_eq!(state.selected_session, 0);
+    }
+
+    #[test]
+    fn click_off_info_button_only_selects() {
+        let mut state = daily_state_for_click();
+        // Row 14 line1 of session 0, but column 10 is far from [i].
+        handle_mouse_click(&mut state, 10, 14);
+        assert!(!state.show_detail, "non-[i] click must not open detail");
+        assert_eq!(state.selected_session, 0);
+    }
+
+    #[test]
+    fn click_on_line2_of_info_column_does_not_open() {
+        let mut state = daily_state_for_click();
+        // Row 15 = line2 of session 0 (relative_y=2, line_in_session=1).
+        // Even at the info-button column, line2 must not trigger the popup.
+        handle_mouse_click(&mut state, 137, 15);
+        assert!(
+            !state.show_detail,
+            "line2 click in info column must not open detail"
+        );
+    }
+
+    fn conv_state_for_click() -> AppState {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let session = make_session("proj", None, None);
+        let group = make_daily_group(date, vec![session.clone()]);
+        let mut state = make_test_app_state(vec![group]);
+        state.tab = Tab::Daily;
+        state.show_conversation = true;
+        // One pane occupying right half: x=70, width=70. The info-area [i]
+        // button hits at row=area.y+1=6, cols [70+66, 70+69) = [136, 139).
+        let mut pane = crate::state::ConversationPane::default();
+        pane.file_path = Some(session.file_path.clone());
+        state.panes.push(pane);
+        state.pane_areas = vec![Rect {
+            x: 70,
+            y: 5,
+            width: 70,
+            height: 30,
+        }];
+        state
+    }
+
+    #[test]
+    fn conv_info_button_click_opens_detail() {
+        let mut state = conv_state_for_click();
+        // row=6 (area.y+1), col=137 → inside [136, 139)
+        handle_mouse_click(&mut state, 137, 6);
+        assert!(
+            state.show_detail,
+            "[i] in conv pane should open session detail"
+        );
+        assert_eq!(state.active_pane_index, Some(0));
+    }
+
+    #[test]
+    fn conv_pane_body_click_does_not_open_detail() {
+        let mut state = conv_state_for_click();
+        // Click inside pane body (not on the info button row/column).
+        handle_mouse_click(&mut state, 100, 10);
+        assert!(
+            !state.show_detail,
+            "body click in conv pane should not open session detail"
+        );
+        assert_eq!(state.active_pane_index, Some(0));
+    }
+
+    #[test]
+    fn conv_info_button_click_ignored_without_session() {
+        let mut state = conv_state_for_click();
+        // Drop the file_path so the pane has no session.
+        state.panes[0].file_path = None;
+        handle_mouse_click(&mut state, 137, 6);
+        assert!(
+            !state.show_detail,
+            "without a session, [i] click must not open detail"
+        );
+    }
+
+    // The list block has a top border, so list line N draws at area.y+1+N.
+    // A click on a session's line2 must select THAT session, not the next.
+    #[test]
+    fn daily_click_on_line2_selects_same_session() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let group = make_daily_group(
+            date,
+            vec![
+                make_session("p0", None, None),
+                make_session("p1", None, None),
+            ],
+        );
+        let mut state = make_test_app_state(vec![group]);
+        state.tab = Tab::Daily;
+        state.show_conversation = false;
+        state.session_list_area = Some((
+            Rect {
+                x: 0,
+                y: 13,
+                width: 140,
+                height: 10,
+            },
+            0,
+            2,
+        ));
+        // border y=13; session0 line1=14 line2=15; session1 line1=16 line2=17.
+        handle_mouse_click(&mut state, 10, 15);
+        assert_eq!(
+            state.selected_session, 0,
+            "line2 of session 0 must select session 0"
+        );
+        handle_mouse_click(&mut state, 10, 16);
+        assert_eq!(
+            state.selected_session, 1,
+            "line1 of session 1 must select session 1"
+        );
+    }
+
+    fn mk_search_result() -> crate::search::SearchResult {
+        crate::search::SearchResult {
+            day_idx: 0,
+            session_idx: 0,
+            snippet: None,
+            match_type: crate::search::SearchMatchType::Content,
+            session_path: None,
+        }
+    }
+
+    // The results block has NO top border, so result N's first line draws at
+    // area.y + N*item_height. A click must select the clicked result, not the
+    // previous one.
+    #[test]
+    fn search_result_click_selects_clicked_row() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let group = make_daily_group(date, vec![make_session("p", None, None)]);
+        let mut state = make_test_app_state(vec![group]);
+        state.search_mode = true;
+        state.search_results = vec![mk_search_result(), mk_search_result(), mk_search_result()];
+        state.search_results_area = Some(Rect {
+            x: 0,
+            y: 6,
+            width: 100,
+            height: 20,
+        });
+        // No top border: result0 line1=6; result1 line1=8; result2 line1=10.
+        handle_mouse_click(&mut state, 10, 8);
+        assert_eq!(state.search_selected, 1, "click on result 1 must select 1");
+        handle_mouse_click(&mut state, 10, 6);
+        assert_eq!(state.search_selected, 0, "click on result 0 must select 0");
+        handle_mouse_click(&mut state, 10, 11);
+        assert_eq!(
+            state.search_selected, 2,
+            "click on result 2 line2 must select 2"
+        );
+    }
+
+    fn paused_live(id: &str) -> crate::infrastructure::live_sessions::LiveSession {
+        use std::path::PathBuf;
+        crate::infrastructure::live_sessions::LiveSession {
+            session_id: id.to_string(),
+            jsonl_path: Some(PathBuf::from(format!("/tmp/{id}.jsonl"))),
+            cwd: PathBuf::from("/tmp"),
+            name: None,
+            status: None,
+            pid: 0,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime: None,
+            is_live: false,
+            was_recently_live: false,
+        }
+    }
+
+    // Active now and Recently paused are two separate frames. The paused
+    // frame's inner body is `line 0 = info header, rows at 1 + r*3`, and a
+    // paused row's global index is `active_count + r`. The info header must
+    // not be clickable.
+    #[test]
+    fn live_paused_frame_click_selects_correct_global_index() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let group = make_daily_group(date, vec![make_session("p", None, None)]);
+        let mut state = make_test_app_state(vec![group]);
+        state.tab = Tab::Live;
+        state.live_active = vec![paused_live("act")]; // active_count == 1
+        state.live_paused = vec![paused_live("a"), paused_live("b")];
+        // Active frame (inner): line 0 = status, row 0 at body lines 1-3.
+        state.live_list_area = Some((
+            Rect {
+                x: 1,
+                y: 1,
+                width: 138,
+                height: 5,
+            },
+            0,
+            1,
+        ));
+        // Paused frame (inner) below: body line 0 = info, rows at 1 + r*3.
+        state.live_paused_list_area = Some((
+            Rect {
+                x: 1,
+                y: 7,
+                width: 138,
+                height: 20,
+            },
+            0,
+        ));
+        // Active row 0 body line 1 → screen row 2 → global index 0.
+        handle_mouse_click(&mut state, 10, 2);
+        assert_eq!(state.live_selected, 0, "active row 0 → global index 0");
+        // Paused row 0 occupies body lines 1-3 → screen rows 8-10.
+        handle_mouse_click(&mut state, 10, 8);
+        assert_eq!(
+            state.live_selected, 1,
+            "paused row 0 → global index active_count + 0 = 1"
+        );
+        // Paused row 1 occupies body lines 4-6 → screen rows 11-13.
+        handle_mouse_click(&mut state, 10, 11);
+        assert_eq!(state.live_selected, 2, "paused row 1 → global index 2");
+        // Paused info header (body line 0 → screen row 7) selects nothing.
+        state.live_selected = 99;
+        handle_mouse_click(&mut state, 10, 7);
+        assert_eq!(
+            state.live_selected, 99,
+            "paused info header click must not select a session"
+        );
+    }
+
+    // Conversation lines render below the 3-line session info header, so a
+    // body click must map to the message at (scroll + row - (area.y+1+3)),
+    // and clicks on the header rows must not move the selection.
+    #[test]
+    fn conv_body_click_maps_past_info_header() {
+        let mut state = conv_state_for_click();
+        // Distinct message per line so an off-by-3 would pick the wrong one.
+        state.panes[0].message_lines = vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)];
+        // pane y=5, border+info header = 4 rows, so content starts at y=9.
+        handle_mouse_click(&mut state, 100, 9);
+        assert_eq!(
+            state.panes[0].selected_message, 0,
+            "first content row selects message 0"
+        );
+        handle_mouse_click(&mut state, 100, 11);
+        assert_eq!(
+            state.panes[0].selected_message, 2,
+            "third content row selects message 2"
+        );
+        // A click on the info-header row (y=7) must not move the selection.
+        state.panes[0].selected_message = 2;
+        handle_mouse_click(&mut state, 100, 7);
+        assert_eq!(
+            state.panes[0].selected_message, 2,
+            "info-header click must not change message selection"
+        );
     }
 }

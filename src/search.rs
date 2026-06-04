@@ -221,12 +221,8 @@ pub fn perform_search(
     let query_lower = free_text.to_lowercase();
     let no_text = free_text.is_empty();
     let mut results = Vec::new();
-    // Dedupe: one row per session (keyed on file_path) even when the same
-    // session shows up under multiple days. `daily_groups` is iterated
-    // newest-first, so the first hit per path is the most-recent day —
-    // exactly what a user clicking into "the live ccsight session" wants
-    // to land on. Without this, filter:live returns N×days rows when the
-    // user expects N rows.
+    // Dedupe by file_path; daily_groups is newest-first so first hit =
+    // most-recent day, matching user intent ("the live session").
     let mut seen: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
 
     for (day_idx, group) in daily_groups.iter().enumerate() {

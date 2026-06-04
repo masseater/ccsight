@@ -278,7 +278,7 @@ pub(crate) fn from_path(path: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn extension_from_path(path: &str) -> Option<String> {
-    let filename = path.rsplit('/').next().unwrap_or(path);
+    let filename = path.rsplit('/').next().unwrap_or(path).trim();
     let filename_lower = filename.to_lowercase();
 
     match filename_lower.as_str() {
@@ -287,42 +287,172 @@ pub(crate) fn extension_from_path(path: &str) -> Option<String> {
         _ => {}
     }
 
-    let ext = filename.rsplit('.').next()?.to_lowercase();
+    // A leading-dot name with no further dot is a dotfile (`.gitignore`,
+    // `.bash_profile`, `.node-version`), not a file with an extension —
+    // treating its whole name as the "extension" pollutes the Languages panel.
+    if let Some(rest) = filename_lower.strip_prefix('.')
+        && !rest.contains('.')
+    {
+        return None;
+    }
+
+    let ext = filename_lower.rsplit('.').next()?;
     if ext == filename_lower {
+        return None;
+    }
+    // A real extension is a short ASCII-alphanumeric token. Reject anything
+    // carrying path / glob / punctuation so a malformed input can never leak
+    // a row like `.github)` or `.json"` into `extension_usage`.
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_string())
+}
+
+/// Lowercased extension of a single filename fragment, or `None`. Rejects
+/// anything that isn't a clean ASCII-alphanumeric token after the last dot
+/// so brace/glob punctuation (`{js,json}`, `ts}`, `}`, `config.*`) can never
+/// leak into `extension_usage`.
+fn clean_ext(name: &str) -> Option<String> {
+    let dot = name.rfind('.')?;
+    let ext = name[dot + 1..].trim().to_lowercase().replace('*', "");
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
     Some(ext)
 }
 
 pub(crate) fn parse_extensions_from_glob(pattern: &str) -> Vec<String> {
-    let filename = pattern.rsplit('/').next().unwrap_or(pattern);
-    let Some(dot_pos) = filename.rfind('.') else {
-        return vec![];
-    };
-    let after_dot = &filename[dot_pos + 1..];
-    if after_dot.is_empty() {
-        return vec![];
+    // `.trim()` drops trailing newlines/whitespace that some patterns carry;
+    // left in place they made `ends_with('}')` fail and leaked the whole
+    // `{...}` blob as one "extension".
+    let filename = pattern.rsplit('/').next().unwrap_or(pattern).trim();
+
+    // Brace alternation `{a,b,c}`. Find the FIRST `{`/`}` (a single `rfind('.')`
+    // lands inside alternatives that contain a dot, e.g. `{tsconfig.json,*.ts}`,
+    // yielding garbage like `ts}` / `}`).
+    if let Some(open) = filename.find('{')
+        && let Some(close_rel) = filename[open..].find('}')
+    {
+        let close = open + close_rel;
+        let after_brace = &filename[close + 1..];
+        // A dot after the closing brace means the real extension lives there
+        // and the braces are just an infix alternation (`*.{test,spec}.tsx`).
+        if after_brace.contains('.') {
+            return clean_ext(after_brace).into_iter().collect();
+        }
+        // Otherwise each alternative is its own filename fragment carrying the
+        // extension; resolve `prefix + alternative` so `*.{js,json}` and
+        // `{tsconfig.json,*.ts}` both work. Dedup so one glob counts an
+        // extension once even when two alternatives share it.
+        let prefix = &filename[..open];
+        let inner = &filename[open + 1..close];
+        let mut out: Vec<String> = Vec::new();
+        for alt in inner.split(',') {
+            if let Some(ext) = clean_ext(&format!("{prefix}{}", alt.trim()))
+                && !out.contains(&ext)
+            {
+                out.push(ext);
+            }
+        }
+        return out;
     }
 
-    if after_dot.starts_with('{') && after_dot.ends_with('}') {
-        let inner = &after_dot[1..after_dot.len() - 1];
-        return inner
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim().to_lowercase();
-                let s = s.replace('*', "");
-                if s.is_empty() || s.contains('{') || s.contains('}') {
-                    None
-                } else {
-                    Some(s)
-                }
-            })
-            .collect();
+    clean_ext(filename).into_iter().collect()
+}
+
+#[cfg(test)]
+mod glob_ext_tests {
+    use super::parse_extensions_from_glob as p;
+
+    #[test]
+    fn plain_brace_alternation_splits_into_extensions() {
+        assert_eq!(p("**/*.{ts,tsx}"), vec!["ts", "tsx"]);
+        assert_eq!(
+            p("src/**/*.{js,jsx,ts,tsx}"),
+            vec!["js", "jsx", "ts", "tsx"]
+        );
+        assert_eq!(p("{*.yml,*.yaml}"), vec!["yml", "yaml"]);
     }
 
-    let ext = after_dot.to_lowercase().replace('*', "");
-    if ext.is_empty() || ext == filename.to_lowercase() {
-        return vec![];
+    #[test]
+    fn non_brace_pattern_takes_trailing_extension() {
+        assert_eq!(p("**/*.rs"), vec!["rs"]);
+        assert_eq!(p("Cargo.toml"), vec!["toml"]);
     }
-    vec![ext]
+
+    #[test]
+    fn brace_followed_by_real_extension_uses_that_extension() {
+        // `*.{test,spec}.tsx` matches `foo.test.tsx`; the extension is `tsx`,
+        // not the infix alternation `test`/`spec`.
+        assert_eq!(p("**/*.{test,spec}.tsx"), vec!["tsx"]);
+    }
+
+    #[test]
+    fn dotted_brace_alternatives_do_not_leak_braces() {
+        // Regression: `rfind('.')` used to land inside the alternatives and
+        // emit `ts}` / `json}`. Each alternative is resolved on its own.
+        assert_eq!(p("config/{tsconfig.json,*.ts}"), vec!["json", "ts"]);
+    }
+
+    #[test]
+    fn star_alternative_yields_no_garbage_extension() {
+        // `config.*` has no concrete extension → dropped, not emitted as `}`.
+        assert_eq!(p("*.{js,json,config.*}"), vec!["js", "json"]);
+    }
+
+    #[test]
+    fn trailing_whitespace_does_not_leak_the_brace_blob() {
+        // A trailing newline once defeated `ends_with('}')` and leaked
+        // `{js,json}` verbatim as one extension.
+        assert_eq!(p("*.{js,json}\n"), vec!["js", "json"]);
+        assert_eq!(p("*.{js,json} "), vec!["js", "json"]);
+    }
+
+    #[test]
+    fn duplicate_extension_across_alternatives_is_counted_once() {
+        assert_eq!(p("**/*.{spec.ts,test.ts}"), vec!["ts"]);
+    }
+
+    #[test]
+    fn special_filenames_have_no_extension() {
+        assert!(p("**/{Makefile,Dockerfile}").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod path_ext_tests {
+    use super::extension_from_path as e;
+
+    #[test]
+    fn normal_files_yield_their_extension() {
+        assert_eq!(e("src/main.rs").as_deref(), Some("rs"));
+        assert_eq!(e("a/b/App.tsx").as_deref(), Some("tsx"));
+        assert_eq!(e("data.tar.gz").as_deref(), Some("gz"));
+    }
+
+    #[test]
+    fn dotfiles_have_no_extension() {
+        // Regression: `.bash_profile` / `.node-version` once surfaced their
+        // whole name as a bogus extension row.
+        assert_eq!(e(".bash_profile"), None);
+        assert_eq!(e("~/.node-version"), None);
+        assert_eq!(e("repo/.gitignore"), None);
+        // A dotfile WITH a real extension still resolves it.
+        assert_eq!(e(".eslintrc.js").as_deref(), Some("js"));
+    }
+
+    #[test]
+    fn punctuation_is_rejected() {
+        // Malformed inputs must not leak `.github)` / `.json"` rows.
+        assert_eq!(e("foo.github)"), None);
+        assert_eq!(e("x.json\""), None);
+        assert_eq!(e("y.config-backup"), None);
+    }
+
+    #[test]
+    fn extensionless_files_are_none() {
+        assert_eq!(e("README"), None);
+        assert_eq!(e("LICENSE"), None);
+    }
 }

@@ -195,11 +195,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
 
         let model = session.model.as_deref().unwrap_or("unknown");
         let branch = session.git_branch.as_deref().unwrap_or("-");
-        let cost: f64 = session
-            .day_tokens_by_model
-            .iter()
-            .map(|(m, t)| calculator.calculate_cost(t, Some(m)).unwrap_or(0.0))
-            .sum();
+        let cost: f64 = session.cost(calculator);
 
         let project_short = crate::ui::shorten_project(&session.project_name);
 
@@ -467,176 +463,6 @@ pub fn extract_session_details_for_date(
     }
 
     (user_requests, files_modified, tool_counts)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-    use std::path::PathBuf;
-
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct TempFile(PathBuf);
-    impl TempFile {
-        fn new(prefix: &str) -> Self {
-            let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!("{prefix}_{id}.jsonl")))
-        }
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-        fn write_jsonl(&self, entries: &[serde_json::Value]) {
-            let mut f = std::fs::File::create(&self.0).unwrap();
-            for e in entries {
-                writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
-            }
-        }
-    }
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            std::fs::remove_file(&self.0).ok();
-        }
-    }
-
-    #[test]
-    fn test_extract_session_details_user_requests() {
-        let tmp = TempFile::new("ccsight_summary_test_requests.jsonl");
-        tmp.write_jsonl(&[
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:00:00Z",
-                "message": {"role": "user", "content": "Please fix the authentication flow in the login page"}
-            }),
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2026-03-20T10:01:00Z",
-                "message": {"role": "assistant", "content": "I'll fix that now."}
-            }),
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:05:00Z",
-                "message": {"role": "user", "content": "Now add unit tests for the auth module"}
-            }),
-        ]);
-
-        let (requests, _files, _tools) = extract_session_details(tmp.path());
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].contains("authentication flow"));
-        assert!(requests[1].contains("unit tests"));
-    }
-
-    #[test]
-    fn test_extract_session_details_short_messages_skipped() {
-        let tmp = TempFile::new("ccsight_summary_test_short.jsonl");
-        tmp.write_jsonl(&[
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:00:00Z",
-                "message": {"role": "user", "content": "ok"}
-            }),
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:01:00Z",
-                "message": {"role": "user", "content": "yes please"}
-            }),
-        ]);
-
-        let (requests, _files, _tools) = extract_session_details(tmp.path());
-        assert!(
-            requests.is_empty(),
-            "short messages (<=10 chars) should be skipped"
-        );
-    }
-
-    #[test]
-    fn test_extract_session_details_tool_usage() {
-        let tmp = TempFile::new("ccsight_summary_test_tools.jsonl");
-        tmp.write_jsonl(&[
-            serde_json::json!({
-                "type": "assistant",
-                "timestamp": "2026-03-20T10:00:00Z",
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "tool_use", "id": "1", "name": "Read", "input": {"file_path": "/src/main.rs"}},
-                        {"type": "tool_use", "id": "2", "name": "Edit", "input": {"file_path": "/src/lib.rs"}},
-                        {"type": "tool_use", "id": "3", "name": "Read", "input": {"file_path": "/src/test.rs"}}
-                    ]
-                }
-            }),
-        ]);
-
-        let (_requests, files, tools) = extract_session_details(tmp.path());
-        assert_eq!(*tools.get("Read").unwrap_or(&0), 2);
-        assert_eq!(*tools.get("Edit").unwrap_or(&0), 1);
-        assert!(files.contains(&"main.rs".to_string()));
-        assert!(files.contains(&"lib.rs".to_string()));
-        assert!(files.contains(&"test.rs".to_string()));
-    }
-
-    #[test]
-    fn test_extract_session_details_empty_file() {
-        let tmp = TempFile::new("ccsight_summary_test_empty.jsonl");
-        tmp.write_jsonl(&[]);
-
-        let (requests, files, tools) = extract_session_details(tmp.path());
-        assert!(requests.is_empty());
-        assert!(files.is_empty());
-        assert!(tools.is_empty());
-    }
-
-    #[test]
-    fn test_extract_session_details_for_date_filters_by_date() {
-        let tmp = TempFile::new("ccsight_summary_test_date.jsonl");
-        tmp.write_jsonl(&[
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:00:00Z",
-                "message": {"role": "user", "content": "Work on the first day of the sprint planning"}
-            }),
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-21T10:00:00Z",
-                "message": {"role": "user", "content": "Continue with the second day implementation tasks"}
-            }),
-        ]);
-
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(); // lint-ok: date-literal
-        let (requests, _files, _tools) = extract_session_details_for_date(tmp.path(), Some(date));
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].contains("first day"));
-    }
-
-    #[test]
-    fn test_extract_session_details_for_date_none_returns_all() {
-        let tmp = TempFile::new("ccsight_summary_test_date_none.jsonl");
-        tmp.write_jsonl(&[
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-20T10:00:00Z",
-                "message": {"role": "user", "content": "Work on the first day of the sprint planning"}
-            }),
-            serde_json::json!({
-                "type": "user",
-                "timestamp": "2026-03-21T10:00:00Z",
-                "message": {"role": "user", "content": "Continue with the second day implementation tasks"}
-            }),
-        ]);
-
-        let (requests, _files, _tools) = extract_session_details_for_date(tmp.path(), None);
-        assert_eq!(requests.len(), 2);
-    }
-
-    #[test]
-    fn test_extract_session_details_nonexistent_file() {
-        let (requests, files, tools) =
-            extract_session_details(std::path::Path::new("/tmp/nonexistent_ccsight_test.jsonl"));
-        assert!(requests.is_empty());
-        assert!(files.is_empty());
-        assert!(tools.is_empty());
-    }
 }
 
 pub fn generate_session_summary(
@@ -921,4 +747,174 @@ pub(crate) fn update_jsonl_summary(
     writeln!(file, "{json_str}").map_err(|e| format!("Write error: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempFile(PathBuf);
+    impl TempFile {
+        fn new(prefix: &str) -> Self {
+            let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!("{prefix}_{id}.jsonl")))
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn write_jsonl(&self, entries: &[serde_json::Value]) {
+            let mut f = std::fs::File::create(&self.0).unwrap();
+            for e in entries {
+                writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+            }
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn test_extract_session_details_user_requests() {
+        let tmp = TempFile::new("ccsight_summary_test_requests.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {"role": "user", "content": "Please fix the authentication flow in the login page"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-03-20T10:01:00Z",
+                "message": {"role": "assistant", "content": "I'll fix that now."}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:05:00Z",
+                "message": {"role": "user", "content": "Now add unit tests for the auth module"}
+            }),
+        ]);
+
+        let (requests, _files, _tools) = extract_session_details(tmp.path());
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("authentication flow"));
+        assert!(requests[1].contains("unit tests"));
+    }
+
+    #[test]
+    fn test_extract_session_details_short_messages_skipped() {
+        let tmp = TempFile::new("ccsight_summary_test_short.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {"role": "user", "content": "ok"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:01:00Z",
+                "message": {"role": "user", "content": "yes please"}
+            }),
+        ]);
+
+        let (requests, _files, _tools) = extract_session_details(tmp.path());
+        assert!(
+            requests.is_empty(),
+            "short messages (<=10 chars) should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_extract_session_details_tool_usage() {
+        let tmp = TempFile::new("ccsight_summary_test_tools.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "1", "name": "Read", "input": {"file_path": "/src/main.rs"}},
+                        {"type": "tool_use", "id": "2", "name": "Edit", "input": {"file_path": "/src/lib.rs"}},
+                        {"type": "tool_use", "id": "3", "name": "Read", "input": {"file_path": "/src/test.rs"}}
+                    ]
+                }
+            }),
+        ]);
+
+        let (_requests, files, tools) = extract_session_details(tmp.path());
+        assert_eq!(*tools.get("Read").unwrap_or(&0), 2);
+        assert_eq!(*tools.get("Edit").unwrap_or(&0), 1);
+        assert!(files.contains(&"main.rs".to_string()));
+        assert!(files.contains(&"lib.rs".to_string()));
+        assert!(files.contains(&"test.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_details_empty_file() {
+        let tmp = TempFile::new("ccsight_summary_test_empty.jsonl");
+        tmp.write_jsonl(&[]);
+
+        let (requests, files, tools) = extract_session_details(tmp.path());
+        assert!(requests.is_empty());
+        assert!(files.is_empty());
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_extract_session_details_for_date_filters_by_date() {
+        let tmp = TempFile::new("ccsight_summary_test_date.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {"role": "user", "content": "Work on the first day of the sprint planning"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-21T10:00:00Z",
+                "message": {"role": "user", "content": "Continue with the second day implementation tasks"}
+            }),
+        ]);
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 20).unwrap(); // lint-ok: date-literal
+        let (requests, _files, _tools) = extract_session_details_for_date(tmp.path(), Some(date));
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("first day"));
+    }
+
+    #[test]
+    fn test_extract_session_details_for_date_none_returns_all() {
+        let tmp = TempFile::new("ccsight_summary_test_date_none.jsonl");
+        tmp.write_jsonl(&[
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-20T10:00:00Z",
+                "message": {"role": "user", "content": "Work on the first day of the sprint planning"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-03-21T10:00:00Z",
+                "message": {"role": "user", "content": "Continue with the second day implementation tasks"}
+            }),
+        ]);
+
+        let (requests, _files, _tools) = extract_session_details_for_date(tmp.path(), None);
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_session_details_nonexistent_file() {
+        let (requests, files, tools) =
+            extract_session_details(std::path::Path::new("/tmp/nonexistent_ccsight_test.jsonl"));
+        assert!(requests.is_empty());
+        assert!(files.is_empty());
+        assert!(tools.is_empty());
+    }
 }

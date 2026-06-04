@@ -118,16 +118,10 @@ pub fn cli_help_lines() -> Vec<(String, String)> {
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    // `--clear-cache` composes with `--daily` / `--mcp` so users can clear and
-    // run the requested mode in one invocation (matches the "Clear the cache
-    // before loading" help text). When run alone — no companion mode flag and
-    // not interactively from a TTY — we exit after clearing so cron-style
-    // scripts piping ccsight don't get an unhelpful TUI-init error. An
-    // interactive `ccsight --clear-cache` falls through to the TUI for a
-    // fresh start.
-    // Migrate any pre-1.1 state (`~/.cache/ccsight/`, `~/.config/ccsight/`)
-    // into the unified `~/.ccsight/` tree before any other path lookup runs.
-    // Idempotent and silent on failure — startup must never block on it.
+    // `--clear-cache` composes with mode flags (`--daily`, `--mcp`) and
+    // falls through to the TUI if interactive; non-interactive `--clear-cache`
+    // alone exits to keep cron-style pipelines TTY-error-free.
+    // Path migration before any state path is looked up.
     infrastructure::migrate_legacy_state_dirs();
 
     if args.clear_cache {
@@ -205,16 +199,106 @@ fn main() -> io::Result<()> {
     result
 }
 
+fn poll_live_sessions_task(state: &mut AppState) {
+    if let Some(ref rx) = state.live_sessions_task {
+        match rx.try_recv() {
+            Ok((active, paused)) => {
+                state.live_active = active;
+                state.live_paused = paused;
+                state.live_last_update = Some(std::time::Instant::now());
+                // Refresh the time-travel-hint flag once per poll (the poll
+                // thread just ran `save_if_changed`) instead of re-scanning
+                // the snapshot dir every render frame.
+                state.live_has_snapshot_history =
+                    !infrastructure::live_snapshots::LiveSnapshot::load_recent().is_empty();
+                state.live_sessions_task = None;
+                state.live_selected = state
+                    .live_selected
+                    .min((state.live_active.len() + state.live_paused.len()).saturating_sub(1));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.live_sessions_task = None;
+                state.live_last_update = Some(std::time::Instant::now());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+fn poll_summary_task(state: &mut AppState) {
+    if let Some(ref rx) = state.summary_task {
+        match rx.try_recv() {
+            Ok(content) => {
+                state.summary_content = content;
+                state.generating_summary = false;
+                state.summary_scroll = 0;
+                state.summary_task = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Summary thread panicked; reset so the user can retry.
+                state.summary_task = None;
+                state.generating_summary = false;
+                state.summary_content = "❌ Summary generation failed".to_string();
+                state.summary_scroll = 0;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+fn poll_clipboard_task(state: &mut AppState) {
+    if let Some(ref clip_rx) = state.clipboard_task {
+        match clip_rx.try_recv() {
+            Ok(Ok(())) => {
+                state.clipboard_task = None;
+            }
+            Ok(Err(e)) => {
+                state.clipboard_task = None;
+                state.toast_message = Some(format!("Clipboard error: {e}"));
+                state.toast_time = Some(std::time::Instant::now());
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.clipboard_task = None;
+                state.toast_message = Some("Clipboard write failed (thread panicked)".to_string());
+                state.toast_time = Some(std::time::Instant::now());
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+fn poll_index_build_task(state: &mut AppState) {
+    if let Some(ref index_rx) = state.index_build_task {
+        match index_rx.try_recv() {
+            Ok(index) => {
+                state.search_index = Some(index);
+                state.index_build_task = None;
+                state.last_index_build = Some(std::time::Instant::now());
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Builder failed without sending; clear the flag so the
+                // top-bar indicator doesn't lie, and surface a toast so
+                // the user knows search will be unavailable until the
+                // next throttled rebuild (~60s).
+                state.index_build_task = None;
+                state.last_index_build = Some(std::time::Instant::now());
+                if state.search_index.is_none() {
+                    state.toast_message = Some("Search index build failed; will retry".to_string());
+                    state.toast_time = Some(std::time::Instant::now());
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
 fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
     thread::spawn(ui::warmup_syntax_highlighting);
     // Warm the user-language cache off the UI thread so the first summary doesn't
     // block on `defaults read NSGlobalDomain AppleLanguages` (macOS).
     summary::prefetch_user_language();
 
-    // Freeze the prior run's anchor before any poll can rewrite the snapshot.
-    let prior_run_last_refresh =
-        infrastructure::live_snapshot::LiveSnapshot::load().prior_run_anchor();
-    let mut state = AppState::new_initial(limit, prior_run_last_refresh);
+    let mut state = AppState::new_initial(limit);
 
     execute!(io::stdout(), BeginSynchronizedUpdate)?;
     let completed = terminal.draw(|f| ui::draw(f, &mut state))?;
@@ -347,35 +431,17 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
         // dozen ~1KB JSON reads + `kill -0` checks per poll, negligible.
         // `Disconnected` means the discovery thread panicked — clear the
         // slot so the next 5s tick re-spawns instead of freezing the panel.
-        if let Some(ref rx) = state.live_sessions_task {
-            match rx.try_recv() {
-                Ok((active, paused)) => {
-                    state.live_active = active;
-                    state.live_paused = paused;
-                    state.live_last_update = Some(std::time::Instant::now());
-                    state.live_sessions_task = None;
-                    state.live_selected = state
-                        .live_selected
-                        .min((state.live_active.len() + state.live_paused.len()).saturating_sub(1));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    state.live_sessions_task = None;
-                    state.live_last_update = Some(std::time::Instant::now());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_live_sessions_task(&mut state);
         if state.live_sessions_task.is_none() {
             let should_poll = state
                 .live_last_update
                 .is_none_or(|last| last.elapsed() > std::time::Duration::from_secs(5));
             if should_poll {
                 let (tx, rx) = mpsc::channel();
-                // The anchor is captured at boot only; do NOT recompute it
-                // from the loaded snapshot inside the thread. `refresh()`
-                // below rewrites `last_refresh_at`, which would drift the
-                // anchor to the current run and expire ⟳ on poll #2.
-                let prior_run_anchor = state.prior_run_last_refresh;
+                // Boot-frozen prior-run alive set drives the `⟳` marker;
+                // clone it into the thread rather than recomputing, since
+                // `save_if_changed` below rewrites the latest snapshot.
+                let prior_alive = state.prior_run_alive.clone();
                 thread::spawn(move || {
                     let active = infrastructure::live_sessions::discover_live();
                     let active_ids: std::collections::HashSet<String> =
@@ -386,36 +452,31 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         std::time::SystemTime::now(),
                     );
 
-                    // Snapshot dance:
-                    // 1. Load prior snapshot (still on disk from prev poll /
-                    //    prev ccsight run).
-                    // 2. Mark `was_recently_live` on paused rows already
-                    //    found via JSONL mtime (24h window). The anchor
-                    //    is the prior run's frozen last-heartbeat — sessions
-                    //    stamped during this run can never sit on it.
-                    // 3. Recover snapshot rows whose JSONL mtime fell
-                    //    outside the 24h window (Friday→Monday case) and
-                    //    append them to paused.
-                    // 4. Sort + mark again so recovered rows land at top.
-                    // 5. Refresh snapshot with current alive set and save.
-                    let mut snapshot = infrastructure::live_snapshot::LiveSnapshot::load();
+                    // Snapshot pipeline (see live_snapshots.rs / live_diagnostic.rs):
+                    // save → mark → recover → mark again → diagnostic refresh → prune.
+                    // The second mark catches rows that recover_missing adds.
+                    let _ = infrastructure::live_snapshots::LiveSnapshot::save_if_changed(&active);
                     infrastructure::live_sessions::mark_was_recently_live(
                         &mut paused,
-                        &snapshot,
-                        prior_run_anchor,
+                        &prior_alive,
                     );
                     let paused_ids: std::collections::HashSet<String> =
                         paused.iter().map(|s| s.session_id.clone()).collect();
                     let recovered =
-                        snapshot.recover_missing(&active_ids, &paused_ids, prior_run_anchor);
+                        infrastructure::live_diagnostic::LiveDiagnostic::recover_missing(
+                            &active_ids,
+                            &paused_ids,
+                            &prior_alive,
+                        );
                     paused.extend(recovered);
                     infrastructure::live_sessions::mark_was_recently_live(
                         &mut paused,
-                        &snapshot,
-                        prior_run_anchor,
+                        &prior_alive,
                     );
+                    let mut snapshot = infrastructure::live_diagnostic::LiveDiagnostic::load();
                     snapshot.refresh(&active);
                     snapshot.save();
+                    infrastructure::live_snapshots::LiveSnapshot::prune();
 
                     let _ = tx.send((active, paused));
                 });
@@ -556,82 +617,23 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             }
         }
 
-        if let Some(ref rx) = state.summary_task {
-            match rx.try_recv() {
-                Ok(content) => {
-                    state.summary_content = content;
-                    state.generating_summary = false;
-                    state.summary_scroll = 0;
-                    state.summary_task = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Summary thread panicked; reset so the user can retry.
-                    state.summary_task = None;
-                    state.generating_summary = false;
-                    state.summary_content = "❌ Summary generation failed".to_string();
-                    state.summary_scroll = 0;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_summary_task(&mut state);
 
         // Clipboard write outcome — overwrite the optimistic "Copied"
         // toast with an error if `arboard` couldn't acquire the system
         // clipboard (no display server, no clipboard daemon, etc.).
-        if let Some(ref clip_rx) = state.clipboard_task {
-            match clip_rx.try_recv() {
-                Ok(Ok(())) => {
-                    state.clipboard_task = None;
-                }
-                Ok(Err(e)) => {
-                    state.clipboard_task = None;
-                    state.toast_message = Some(format!("Clipboard error: {e}"));
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    state.clipboard_task = None;
-                    state.toast_message =
-                        Some("Clipboard write failed (thread panicked)".to_string());
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_clipboard_task(&mut state);
 
-        if let Some(ref index_rx) = state.index_build_task {
-            match index_rx.try_recv() {
-                Ok(index) => {
-                    state.search_index = Some(index);
-                    state.index_build_task = None;
-                    state.last_index_build = Some(std::time::Instant::now());
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Builder failed without sending; clear the flag so the
-                    // top-bar indicator doesn't lie, and surface a toast so
-                    // the user knows search will be unavailable until the
-                    // next throttled rebuild (~60s).
-                    state.index_build_task = None;
-                    state.last_index_build = Some(std::time::Instant::now());
-                    if state.search_index.is_none() {
-                        state.toast_message =
-                            Some("Search index build failed; will retry".to_string());
-                        state.toast_time = Some(std::time::Instant::now());
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_index_build_task(&mut state);
 
         if let Some((ref rx, ref query)) = state.search_task {
             match rx.try_recv() {
                 Ok(content_results) => {
                     if *query == state.search_input.text {
-                        // Remap tantivy results (carry `session_path`)
-                        // through the current `daily_groups` so any filter
-                        // applied between dispatch and arrival doesn't leak
-                        // stale `(day_idx, session_idx)`. File-content
-                        // fallback already computes indices against the
-                        // current view and leaves `session_path` None.
+                        // Remap tantivy `session_path` to current daily_groups
+                        // so filter changes between dispatch and arrival don't
+                        // leak stale `(day_idx, session_idx)`. File-content
+                        // fallback already targets the current view.
                         let path_lookup: std::collections::HashMap<String, (usize, usize)> = state
                             .daily_groups
                             .iter()
@@ -926,14 +928,10 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                     } else if state.show_summary {
                         handlers::keyboard::handle_summary_popup_key(&mut state, key);
                     } else if state.show_detail {
-                        // Session Detail popup wins over the conversation
-                        // view dispatch so its footer keys (r/R/s/S, ↑↓
-                        // scrolls the popup, i toggles closed) are reachable
-                        // when the popup is opened from inside the conv
-                        // view. The conv handler's `show_detail` branches
-                        // (Esc close, Space pin) are duplicated in
-                        // `handle_session_detail_key`, so we don't lose any
-                        // behaviour by routing here first.
+                        // Detail popup wins over conv-view dispatch so its
+                        // footer keys (r/R/s/S, ↑↓, i) reach the popup
+                        // handler. Conv handler's Esc/Space duplicates live
+                        // in handle_session_detail_key, so nothing is lost.
                         handlers::keyboard::handle_session_detail_key(&mut state, key);
                     } else if state.show_conversation {
                         handlers::keyboard::handle_conversation_key(
@@ -972,18 +970,11 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Closes whichever popup overlay is currently showing. Adding a new popup
-/// flag (`state.show_<x>`) requires touching THREE other call sites with the
-/// same `if state.show_<x> { ... }` guard, otherwise mouse events fall through
-/// onto the underlying view:
-///
-/// - `handlers::mouse::handle_mouse_click` — block clicks behind the popup
-/// - `handlers::mouse::handle_double_click` — same, with area check
-/// - `handlers::mouse::handle_mouse_scroll` — block scroll if popup is scrollable
-///
-/// Compiler doesn't enforce this; reviewing the 4 fns side-by-side is the
-/// standing rule. A mechanical lint produces too many false positives —
-/// some popups legitimately ignore double-click or scroll.
+/// Closes whichever popup overlay is currently showing. Adding a new
+/// `show_<x>` flag requires the same guard in three mouse handlers
+/// (`handle_mouse_click` / `handle_double_click` / `handle_mouse_scroll`)
+/// — review side-by-side; mechanical lint is too noisy because some
+/// popups legitimately skip double-click or scroll.
 pub(crate) fn dismiss_overlay(state: &mut AppState) {
     if state.show_help {
         state.show_help = false;
@@ -1095,18 +1086,25 @@ pub(crate) fn has_blocking_popup(state: &AppState) -> bool {
         || state.show_insights_detail
 }
 
-/// Total visible row count in the Live tab (active + paused). Used by the
-/// j/k navigation to clamp the cursor.
+/// Total visible row count in the Live tab. Today view = active + paused;
+/// past-day view = the loaded daily snapshot's rows.
 pub(crate) fn live_visible_count(state: &AppState) -> usize {
-    state.live_active.len() + state.live_paused.len()
+    if state.live_view_snapshot_offset == 0 {
+        state.live_active.len() + state.live_paused.len()
+    } else {
+        state.live_past_sessions.len()
+    }
 }
 
-/// Resolve the currently-selected Live session (active list first, then
-/// paused). Returns `None` when the list is empty.
+/// Resolve the currently-selected Live session. Today view = active first,
+/// then paused; past-day view = single list from the loaded daily snapshot.
 pub(crate) fn live_selected_session(
     state: &AppState,
 ) -> Option<&infrastructure::live_sessions::LiveSession> {
     let idx = state.live_selected;
+    if state.live_view_snapshot_offset > 0 {
+        return state.live_past_sessions.get(idx);
+    }
     if idx < state.live_active.len() {
         state.live_active.get(idx)
     } else {
@@ -1116,7 +1114,9 @@ pub(crate) fn live_selected_session(
 
 pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
     match state.dashboard_panel {
-        0 => state.daily_costs.len(),
+        // Body = day rows + month dividers; the j/G key bounds must match the
+        // popup's line-based scroll model so the oldest day is reachable.
+        0 => crate::ui::dashboard::active_days_body_line_count(state),
         1 => state.stats.project_stats.len(),
         2 => state.model_costs.len(),
         3 => crate::ui::dashboard::tool_usage_line_count(state),
@@ -1139,7 +1139,9 @@ pub(crate) fn dashboard_max_items(state: &AppState) -> usize {
             if state.activity_view_weekly {
                 crate::ui::dashboard::weekly_activity(state).len()
             } else {
-                state.daily_groups.len()
+                // Daily view renders active-day rows + month dividers, not every
+                // calendar group — match the popup's line-based total.
+                crate::ui::dashboard::active_days_body_line_count(state)
             }
         }
         6 => 24,
@@ -1163,15 +1165,9 @@ fn load_data(limit: usize) -> anyhow::Result<LoadedData> {
     let models_without_pricing = calculator.models_without_pricing(&stats.model_tokens);
     let cost: f64 = model_costs.iter().map(|(_, c)| c).sum();
 
-    // Daily costs include subagent contributions so the per-day breakdown sums
-    // back to `total_cost` (Overview). Filtering `!is_subagent` here would
-    // make the two totals disagree even though they share the same label.
-    // Subagent dispatch is a real spend and belongs on the day it ran.
-    //
-    // Days where every session has zero tokens (API errors, canceled prompts,
-    // system-only timestamps) are dropped — they live in `daily_groups` for
-    // the Daily tab's session view, but a zero-cost row in the Costs panel
-    // reads as noise alongside real spend.
+    // Subagent-inclusive so per-day rows sum back to Overview `total_cost`.
+    // Zero-token days (errors, cancellations) dropped to keep Costs panel
+    // clean; they still appear in Daily tab via daily_groups.
     let daily_costs: Vec<(NaiveDate, f64)> = daily_groups
         .iter()
         .filter_map(|group| {
@@ -1278,13 +1274,8 @@ pub(crate) fn start_content_search(state: &mut AppState) {
     let task_key = state.search_input.text.clone();
 
     if let Some(ref index) = state.search_index {
-        // Run tantivy search off the UI thread — with a few thousand
-        // sessions a single search can take tens-to-hundreds of ms, and
-        // re-issuing it per keystroke caused the UI to freeze on rapid
-        // editing. The receiver path (`search_task` poll in run loop)
-        // remaps `(day_idx, session_idx)` against the live `daily_groups`
-        // using `session_path` so filter changes between dispatch and
-        // arrival don't yield stale indices.
+        // Off-UI-thread to keep typing responsive. Receiver path remaps
+        // session_path → current daily_groups (see L617 lookup).
         let index = std::sync::Arc::clone(index);
         let (tx, rx) = mpsc::channel();
         state.searching = true;

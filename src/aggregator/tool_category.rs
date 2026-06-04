@@ -73,12 +73,9 @@ pub fn format_tool_short(name: &str) -> String {
     format!("{server}:{tool}")
 }
 
-/// Normalize a raw tool name + input into the storage key used in `tool_usage` maps.
-///
-/// Meta-tools like `Skill`, `Agent`, and `Task` carry a sub-identifier in their input
-/// (`input.skill`, `input.subagent_type`). Collapsing every invocation under the bare
-/// `"Skill"` key hides which skill was actually used, so the key is rewritten to
-/// `skill:<name>` / `agent:<subtype>` at insertion time. Other tools are unchanged.
+/// Storage key for `tool_usage` maps. Meta-tools (`Skill`/`Agent`/`Task`)
+/// expand to `skill:<name>` / `agent:<subtype>` from their `input` so the
+/// sub-identifier isn't collapsed; other tools keep their bare name.
 pub fn tool_usage_key(name: &str, input: &serde_json::Value) -> String {
     match name {
         "Skill" => input
@@ -105,14 +102,10 @@ fn extract_server(server_raw: &str) -> String {
     }
 }
 
-/// Compose the canonical key for a plugin-provided MCP server. When the
-/// plugin name and server name are identical (a plugin that exposes a single
-/// server with the same name as itself), the runtime form
-/// `mcp__plugin_<X>_<X>__...` collapses to just `<X>` — the join with
-/// observed `tool_usage` only succeeds if both sides agree on this rule.
-/// Both `extract_server` (which parses observed tool keys) and
-/// `mcp_config::read_plugin_mcp_servers` (which builds the configured set
-/// from `.mcp.json`) call this helper so the rule lives in one place.
+/// Canonical key for a plugin-provided MCP server. `<X>__<X>` collapses
+/// to `<X>` (runtime form `mcp__plugin_X_X__...` does the same); both
+/// `extract_server` and `mcp_config::read_plugin_mcp_servers` route here
+/// so observed and configured keys line up.
 pub fn plugin_server_key(plugin: &str, server: &str) -> String {
     if plugin == server {
         server.to_string()

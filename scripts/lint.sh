@@ -1083,6 +1083,85 @@ if [ -n "$COST_DIRECT" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
+# 40. Test code calling `LiveSnapshot::save_if_changed(` (no `_in` suffix)
+# writes into the user's real `~/.ccsight/live_snapshots/` and corrupts
+# the Live tab's history. Tests MUST use `save_if_changed_in(&tmpdir,
+# ...)` so fixtures stay isolated. The bare API is reserved for the
+# polling thread.
+TEST_REAL_DIR=$(python3 -c "
+import os, re
+pat = re.compile(r'LiveSnapshot::save_if_changed\(')
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            in_test_block = False  # reset per file
+            for i, line in enumerate(f, 1):
+                # Only trigger on actual test module bodies. The bare
+                # #[cfg(test)] attribute is also used on top-of-file
+                # test-only imports/re-exports, so flagging on it would
+                # mis-tag the entire file as test code.
+                if re.search(r'^\s*mod\s+tests?\s*\{', line):
+                    in_test_block = True
+                if in_test_block and pat.search(line):
+                    hits.append(f'  {path}:L{i}: {line.rstrip()[:140]}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$TEST_REAL_DIR" ]; then
+    echo "ERROR: test code is calling \`LiveSnapshot::save_if_changed(\` — use save_if_changed_in(&tmpdir, ...) so test fixtures don't leak into ~/.ccsight/live_snapshots/:"
+    echo "$TEST_REAL_DIR"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 41. Comment block length cap (see CLAUDE.md Comments / Length):
+#   - `//` and `///` blocks: max 5 lines
+#   - `//!` module-doc blocks: max 20 lines
+# Overflow → trim to the invariant or push narrative into the commit
+# message. Escape hatch: `// lint-ok: long-comment` on the first line.
+LONG_COMMENTS=$(python3 -c "
+import os, re
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            lines = f.readlines()
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            if not stripped.startswith('//'):
+                i += 1
+                continue
+            start = i
+            # Block type from first line.
+            if stripped.startswith('//!'):
+                kind, cap = 'module-doc', 20
+            elif stripped.startswith('///'):
+                kind, cap = 'item-doc', 5
+            else:
+                kind, cap = 'inline', 5
+            while i < len(lines) and lines[i].lstrip().startswith('//'):
+                i += 1
+            length = i - start
+            if length <= cap:
+                continue
+            # Escape hatch on the first line.
+            if 'lint-ok: long-comment' in lines[start]:
+                continue
+            hits.append(f'  {path}:L{start+1}: {kind} block of {length} lines (cap {cap})')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$LONG_COMMENTS" ]; then
+    echo 'ERROR: comment block exceeds length cap — trim to the invariant or mark with `// lint-ok: long-comment` on the first line (see CLAUDE.md Comments / Length):'
+    echo "$LONG_COMMENTS"
+    ERRORS=$((ERRORS + 1))
+fi
+
 if [ $ERRORS -eq 0 ]; then
     echo "Lint: OK"
 else

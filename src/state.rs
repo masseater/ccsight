@@ -9,12 +9,9 @@ use crate::aggregator::{CacheStats, CostCalculator, DailyGroup, Stats, TokenStat
 use crate::infrastructure::{RetentionWarning, SearchIndex};
 use crate::{ConversationMessage, pins, search};
 
-/// Canonical input-field type. Every text entry surface (search box, filter,
-/// custom date) MUST use this rather than a raw `String + usize` cursor pair.
-/// `cursor` is a CHAR index, not a byte offset, and the methods below all
-/// translate to byte offsets via `char_indices` so multi-byte input (Japanese,
-/// emoji) doesn't panic on non-char-boundary slicing. Lint #15 catches the
-/// most common mistake (raw `.remove(cursor)` / `.insert(cursor, …)` ops).
+/// Canonical text-input field. `cursor` is a CHAR index translated via
+/// `char_indices`, so multi-byte input (CJK / emoji) won't panic on
+/// non-char-boundary slicing. Lint #15 enforces (no raw `.remove(cursor)`).
 #[derive(Default, Clone)]
 pub struct TextInput {
     pub text: String,
@@ -298,7 +295,7 @@ mod project_label_tests {
             .iter()
             .map(|n| make_session(n, None, Some("main")))
             .collect();
-        let mut state = AppState::new_initial(0, None);
+        let mut state = AppState::new_initial(0);
         state.original_daily_groups = vec![DailyGroup {
             date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(), // lint-ok: date-literal
             sessions,
@@ -345,7 +342,7 @@ pub enum SummaryType {
 /// Sort key for rankable Dashboard panels (Projects, Models, ...). Toggled
 /// with `s` while the panel is focused; defaults to `Recency` so the
 /// "what have I been using lately" question is answered at a glance.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RankSort {
     #[default]
     Recency,
@@ -364,6 +361,16 @@ impl RankSort {
         match self {
             RankSort::Recency => "recent",
             RankSort::Tokens => "tokens",
+        }
+    }
+
+    /// Title label for panels whose magnitude axis isn't tokens (e.g. the
+    /// Ecosystem popup ranks by call count). `Recency` is always "recent";
+    /// the magnitude variant takes the caller's word.
+    pub fn magnitude_label(self, word: &'static str) -> &'static str {
+        match self {
+            RankSort::Recency => "recent",
+            RankSort::Tokens => word,
         }
     }
 }
@@ -480,7 +487,16 @@ pub struct AppState {
     pub live_active: Vec<crate::infrastructure::live_sessions::LiveSession>,
     pub live_paused: Vec<crate::infrastructure::live_sessions::LiveSession>,
     pub live_selected: usize,
+    /// Active-frame viewport scroll. The Live tab renders Active now and
+    /// Recently paused in two separate frames, each scrolling independently;
+    /// `live_scroll` follows the cursor while it is in the active section,
+    /// `live_paused_scroll` while it is in the paused section.
     pub live_scroll: usize,
+    pub live_paused_scroll: usize,
+    /// Cached "any frozen snapshot exists" flag, gating the Live tab's
+    /// time-travel title hint. The live poll recomputes it instead of
+    /// re-scanning the snapshot dir on every render frame.
+    pub live_has_snapshot_history: bool,
     pub live_sessions_task: Option<
         mpsc::Receiver<(
             Vec<crate::infrastructure::live_sessions::LiveSession>,
@@ -488,10 +504,31 @@ pub struct AppState {
         )>,
     >,
     pub live_last_update: Option<std::time::Instant>,
-    /// Anchor for the `⟳ from last ccsight run` cluster check. Copied from
-    /// the on-disk snapshot once at boot and frozen; must not be touched by
-    /// in-run polling, otherwise the marker expires after the first refresh.
-    pub prior_run_last_refresh: Option<chrono::DateTime<chrono::Utc>>,
+    /// Alive-session set from the prior run's final snapshot, frozen once
+    /// at boot. Drives the Live tab's `⟳ restorable` marker: a paused
+    /// session is restorable iff it was alive when ccsight last had a view
+    /// (= the most recent snapshot that existed before this run's first
+    /// poll overwrote the latest file).
+    pub prior_run_alive:
+        std::collections::HashMap<String, crate::infrastructure::live_snapshots::LiveSnapshotEntry>,
+    /// Live tab "time travel": 0 = now (live poll), 1..=N = N-th most
+    /// recent frozen snapshot from `~/.ccsight/live_snapshots/`. The
+    /// `←/→` stepper crosses snapshot boundaries (multiple per day are
+    /// possible within the multi-snapshot window) instead of always
+    /// stepping a whole day.
+    pub live_view_snapshot_offset: usize,
+    /// Pseudo-`LiveSession` rows materialised from the frozen snapshot at
+    /// `live_view_snapshot_offset`. Populated by the snapshot stepper so
+    /// the existing renderer + `live_selected_session` can iterate
+    /// uniformly with today's `live_active`. Empty on today (offset = 0).
+    pub live_past_sessions: Vec<crate::infrastructure::live_sessions::LiveSession>,
+    /// Captured-at and date of the snapshot referenced by
+    /// `live_view_snapshot_offset > 0`. `None` on today.
+    pub live_past_snapshot_meta: Option<(chrono::DateTime<chrono::Utc>, chrono::NaiveDate)>,
+    /// Total snapshots available in the retention window. Drives the
+    /// "(M/N)" position indicator in the past-day header. Refreshed
+    /// alongside `live_past_sessions`.
+    pub live_past_snapshot_total: usize,
     /// Per-project drilldown popup. Opened from the Projects detail popup
     /// (panel 1) via Enter on the focused row. `project_detail_path` is the
     /// raw project_name (matching `SessionInfo::project_name` for lookup).
@@ -515,13 +552,9 @@ pub struct AppState {
     pub cache_stats: Option<CacheStats>,
     pub dashboard_panel: usize,
     pub dashboard_scroll: [usize; 7],
-    /// Edge-triggered scroll offset for dashboard detail popups that have a
-    /// cursor concept (currently panel 1 / Projects). For panels without a
-    /// cursor, the equivalent scroll lives in `dashboard_scroll` directly
-    /// (where j/k just moves the viewport). For panels WITH a cursor, j/k
-    /// moves `dashboard_scroll` (= cursor) and `dashboard_viewport` adjusts
-    /// only when the cursor leaves the visible window — same pattern as the
-    /// MCP server detail and Vim's `scrolloff`.
+    /// Viewport (edge-triggered) for cursor-bearing dashboard popups
+    /// (panel 1 / Projects). Cursor-less panels keep both in
+    /// `dashboard_scroll`. Vim `scrolloff` pattern; mirrors MCP server detail.
     pub dashboard_viewport: [usize; 7],
     pub show_dashboard_detail: bool,
     /// Daily Activity detail popup (panel 5) view toggle: `false` = per-day
@@ -558,15 +591,10 @@ pub struct AppState {
     /// Enter (commit) appends the current input.
     pub search_history: crate::search_history::SearchHistory,
     pub mcp_status: Vec<crate::infrastructure::McpServerStatus>,
-    /// Configured (installed) Skills / Commands / Subagents discovered from
-    /// `~/.claude/{skills,commands,agents}/` plus enabled plugin paths. Names
-    /// are bare (no `skill:`/`command:`/`agent:` prefix) and namespaced as
-    /// `<plugin>:<resource>` for plugin-provided entries — matching the
-    /// discriminator used in `tool_usage` keys (`skill:<name>` → strip prefix,
-    /// look up here). Populated at load time and on data reload.
-    /// The Tools detail popup uses these to render zero-call rows for entries
-    /// that are installed but never invoked, mirroring how MCP stale-never
-    /// servers are surfaced.
+    /// Installed Skills / Commands / Subagents from
+    /// `~/.claude/{skills,commands,agents}/` + enabled plugin paths.
+    /// Names bare; plugin entries namespaced `<plugin>:<resource>` to
+    /// match `tool_usage` key form. Drives zero-call rows in Tools popup.
     pub configured_resources: crate::infrastructure::ConfiguredResources,
     /// Last-used timestamp per `tool_usage` key (Built-in / Skill / Subagent / MCP tool).
     /// Computed by `compute_tool_last_used` from `daily_groups`. Mirrors the per-server
@@ -637,10 +665,13 @@ pub struct AppState {
     pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
     pub insights_panel_areas: Vec<ratatui::layout::Rect>,
     pub session_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
-    /// Live-tab row hit-test data. `(inner_rect, scroll, active_count)` so
-    /// `handle_mouse_click` can translate row coords into a session index
-    /// across the two-section (Active / Paused) layout.
+    /// Active-frame row hit-test data. `(inner_rect, scroll, active_count)` so
+    /// `handle_mouse_click` can translate row coords into a session index.
+    /// The past-snapshot view reuses this single frame.
     pub live_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
+    /// Paused-frame row hit-test data. `(inner_rect, scroll)`; the global
+    /// session index is `live_active.len() + row`. `None` in past view.
+    pub live_paused_list_area: Option<(ratatui::layout::Rect, usize)>,
     pub breakdown_panel_area: Option<ratatui::layout::Rect>,
     pub summary_popup_area: Option<ratatui::layout::Rect>,
     pub active_popup_area: Option<ratatui::layout::Rect>,
@@ -684,6 +715,14 @@ pub struct AppState {
     /// Sort mode for the Dashboard Models panel + detail popup. Same toggle
     /// semantics as `dashboard_projects_sort`, scoped to panel 2.
     pub dashboard_models_sort: RankSort,
+    /// Sort mode for the Dashboard Ecosystem detail popup (panel 3) — all
+    /// tabs' item lists and the MCP server rows. `Recency` ranks by
+    /// last-used (default); the magnitude variant ranks by call count.
+    pub dashboard_ecosystem_sort: RankSort,
+    /// Sort mode for the Dashboard Languages panel + detail popup (panel 4).
+    /// Same toggle semantics as the other rankable panels; `Recency` (default)
+    /// ranks by the last day a file of that language/extension was touched.
+    pub dashboard_languages_sort: RankSort,
 }
 
 impl AppState {
@@ -721,7 +760,7 @@ impl AppState {
     /// comparator drifted apart between surfaces in prior versions.
     pub(crate) fn sort_projects(
         &self,
-        projects: &mut Vec<(&String, &crate::aggregator::ProjectStats)>,
+        projects: &mut [(&String, &crate::aggregator::ProjectStats)],
     ) {
         match self.dashboard_projects_sort {
             RankSort::Tokens => {
@@ -732,15 +771,15 @@ impl AppState {
                 });
             }
             RankSort::Recency => {
-                // Last-activity date lookup goes via `project_list`, the
-                // single place that joins project name → last date.
-                let project_list = &self.project_list;
-                let last_date_for = |name: &str| -> Option<chrono::NaiveDate> {
-                    project_list
-                        .iter()
-                        .find(|(n, _, _)| n == name)
-                        .map(|(_, _, d)| *d)
-                };
+                // Build the name → last-date map once (mirrors sort_models)
+                // so the comparator is O(1) per probe instead of scanning
+                // `project_list` on every comparison.
+                let last_date: std::collections::HashMap<&str, chrono::NaiveDate> = self
+                    .project_list
+                    .iter()
+                    .map(|(n, _, d)| (n.as_str(), *d))
+                    .collect();
+                let last_date_for = |name: &str| last_date.get(name).copied();
                 projects.sort_by(|a, b| {
                     last_date_for(b.0)
                         .cmp(&last_date_for(a.0))
@@ -792,14 +831,65 @@ impl AppState {
         }
     }
 
+    /// Map of language name / raw extension → last date it was touched in any
+    /// user session. Languages and extensions live in distinct keyspaces
+    /// (`"Rust"` vs `"rs"`), so one map serves both the known-language rows
+    /// and the unknown-extension rows of the Languages panel. Mirrors
+    /// `model_last_used`.
+    pub(crate) fn language_last_used(
+        &self,
+    ) -> std::collections::HashMap<String, chrono::NaiveDate> {
+        let mut out = std::collections::HashMap::new();
+        for group in &self.daily_groups {
+            for session in group.user_sessions() {
+                for key in session
+                    .day_language_usage
+                    .keys()
+                    .chain(session.day_extension_usage.keys())
+                {
+                    let entry = out.entry(key.clone()).or_insert(group.date);
+                    if group.date > *entry {
+                        *entry = group.date;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Sort the Languages panel rows `(name, count, is_unknown)` in place to
+    /// match the active sort mode. Shared by the compact panel and the detail
+    /// popup so both surfaces agree on rank.
+    pub(crate) fn sort_languages(&self, entries: &mut [(String, usize, bool)]) {
+        match self.dashboard_languages_sort {
+            RankSort::Tokens => {
+                entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            RankSort::Recency => {
+                let last_used = self.language_last_used();
+                let last_date_for = |name: &str| last_used.get(name).copied();
+                entries.sort_by(|a, b| {
+                    last_date_for(&b.0)
+                        .cmp(&last_date_for(&a.0))
+                        .then_with(|| b.1.cmp(&a.1))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+            }
+        }
+    }
+
     /// Construct a fresh `AppState` with everything zero/empty/None except
     /// `loading = true`, `tab = Dashboard`, the persisted pin list, and the
     /// retention warning derived from the user config. `data_limit` is the
     /// CLI `--limit` value carried into the data-load thread.
-    pub(crate) fn new_initial(
-        data_limit: usize,
-        prior_run_last_refresh: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Self {
+    pub(crate) fn new_initial(data_limit: usize) -> Self {
+        // Freeze the prior run's final alive set BEFORE any poll runs — the
+        // first `save_if_changed` would otherwise overwrite the latest
+        // snapshot with the current (mostly empty post-reboot) alive set and
+        // break restorable recovery. A non-empty latest snapshot also means
+        // time-travel history exists (`load_recent` skips empties).
+        let prior_run_alive = crate::infrastructure::live_snapshots::latest_snapshot_alive();
+        let live_has_snapshot_history = !prior_run_alive.is_empty();
         Self {
             needs_draw: true,
             tab: Tab::Dashboard,
@@ -823,9 +913,15 @@ impl AppState {
             live_paused: Vec::new(),
             live_selected: 0,
             live_scroll: 0,
+            live_paused_scroll: 0,
+            live_has_snapshot_history,
             live_sessions_task: None,
             live_last_update: None,
-            prior_run_last_refresh,
+            prior_run_alive,
+            live_view_snapshot_offset: 0,
+            live_past_sessions: Vec::new(),
+            live_past_snapshot_meta: None,
+            live_past_snapshot_total: 0,
             show_project_detail: false,
             project_detail_path: String::new(),
             project_detail_scroll: 0,
@@ -903,6 +999,7 @@ impl AppState {
             insights_panel_areas: Vec::new(),
             session_list_area: None,
             live_list_area: None,
+            live_paused_list_area: None,
             breakdown_panel_area: None,
             summary_popup_area: None,
             active_popup_area: None,
@@ -934,6 +1031,8 @@ impl AppState {
             original_aggregated_model_tokens: std::collections::HashMap::new(),
             dashboard_projects_sort: RankSort::default(),
             dashboard_models_sort: RankSort::default(),
+            dashboard_ecosystem_sort: RankSort::default(),
+            dashboard_languages_sort: RankSort::default(),
         }
     }
 
@@ -1112,13 +1211,20 @@ impl AppState {
 
         for group in &self.daily_groups {
             for session in &group.sessions {
-                if session.is_subagent {
-                    continue;
-                }
-                stats.total_sessions_count += 1;
-                stats.total_session_days += 1;
-                if session.summary.is_some() {
-                    stats.sessions_with_summary += 1;
+                // Subagent rule (matches unfiltered StatsAggregator): only
+                // counts exclude subagents; tokens / model / activity /
+                // project / tool / language are subagent-inclusive so
+                // filtered totals reconcile with subagent-inclusive cost.
+                if !session.is_subagent {
+                    stats.total_sessions_count += 1;
+                    stats.total_session_days += 1;
+                    if session.summary.is_some() {
+                        stats.sessions_with_summary += 1;
+                    }
+                    crate::aggregator::StatsAggregator::add_session_adoption(
+                        &mut stats,
+                        session.day_tool_usage.keys(),
+                    );
                 }
 
                 let work_tokens = session.work_tokens();
@@ -1169,10 +1275,6 @@ impl AppState {
                 for (tool, count) in &session.day_tool_usage {
                     *stats.tool_usage.entry(tool.clone()).or_insert(0) += count;
                 }
-                crate::aggregator::StatsAggregator::add_session_adoption(
-                    &mut stats,
-                    session.day_tool_usage.keys(),
-                );
                 for (lang, count) in &session.day_language_usage {
                     *stats.language_usage.entry(lang.clone()).or_insert(0) += count;
                 }
@@ -1267,5 +1369,78 @@ impl AppState {
             .get(name)
             .cloned()
             .unwrap_or_else(|| crate::ui::shorten_project(name).to_string())
+    }
+}
+
+#[cfg(test)]
+mod filtered_stats_tests {
+    use super::*;
+    use crate::test_helpers::helpers::{
+        make_daily_group, make_session_with_tokens, make_test_app_state,
+    };
+
+    // Under a filter, the rebuilt stats must INCLUDE subagent tokens (so the
+    // token cards reconcile with the always-subagent-inclusive cost) while the
+    // user-facing session COUNT excludes them — matching the unfiltered path.
+    #[test]
+    fn filtered_rebuild_includes_subagent_tokens_excludes_from_count() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let mut sub = make_session_with_tokens("~/proj", 5000, 2000, "claude-sonnet-4-20250514");
+        sub.is_subagent = true;
+        let group = make_daily_group(
+            date,
+            vec![
+                make_session_with_tokens("~/proj", 1000, 500, "claude-sonnet-4-20250514"),
+                sub,
+            ],
+        );
+        let mut state = make_test_app_state(vec![group]);
+        // A Custom range covering the date takes the filtered-rebuild path.
+        state.period_filter = PeriodFilter::Custom(date, Some(date));
+        state.apply_filter();
+        assert_eq!(
+            state.stats.total_tokens.input_tokens, 6000,
+            "filtered tokens must include the subagent's input"
+        );
+        assert_eq!(state.stats.total_tokens.output_tokens, 2500);
+        assert_eq!(
+            state.stats.total_sessions_count, 1,
+            "session count must exclude the subagent"
+        );
+    }
+
+    #[test]
+    fn sort_languages_defaults_to_recency_then_toggles_to_tokens() {
+        // "Rust" was touched on the older day with many hits; "Python" on the
+        // newer day with few. Recency (the default) must float Python despite
+        // its lower count; toggling to Tokens flips to Rust.
+        let older = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(); // lint-ok: date-literal
+        let newer = NaiveDate::from_ymd_opt(2026, 1, 10).unwrap(); // lint-ok: date-literal
+        let mut s_old = make_session_with_tokens("~/p", 1, 1, "claude-sonnet-4-20250514");
+        s_old.day_language_usage.insert("Rust".to_string(), 100);
+        let mut s_new = make_session_with_tokens("~/p", 1, 1, "claude-sonnet-4-20250514");
+        s_new.day_language_usage.insert("Python".to_string(), 5);
+        let mut state = make_test_app_state(vec![
+            make_daily_group(older, vec![s_old]),
+            make_daily_group(newer, vec![s_new]),
+        ]);
+
+        assert_eq!(state.dashboard_languages_sort, RankSort::Recency);
+        let mut entries = vec![
+            ("Rust".to_string(), 100usize, false),
+            ("Python".to_string(), 5usize, false),
+        ];
+        state.sort_languages(&mut entries);
+        assert_eq!(
+            entries[0].0, "Python",
+            "recency ranks the more recently used language first"
+        );
+
+        state.dashboard_languages_sort = RankSort::Tokens;
+        state.sort_languages(&mut entries);
+        assert_eq!(
+            entries[0].0, "Rust",
+            "tokens ranks the higher-count language first"
+        );
     }
 }

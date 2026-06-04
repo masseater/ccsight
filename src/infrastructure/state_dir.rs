@@ -37,22 +37,24 @@ pub fn pins_path() -> Result<PathBuf> {
     Ok(state_root()?.join("pins.json"))
 }
 
-pub fn live_snapshot_path() -> Result<PathBuf> {
+pub fn live_diagnostic_path() -> Result<PathBuf> {
     Ok(state_root()?.join("live_snapshot.json"))
+}
+
+/// Directory holding per-poll alive-session history files
+/// (`<YYYY-MM-DD>-<HHMM>.json`). See [`super::live_snapshots`] for the
+/// write semantics (diff detection + 30-min debounce, tiered retention).
+pub fn live_snapshots_dir() -> Result<PathBuf> {
+    Ok(state_root()?.join("live_snapshots"))
 }
 
 pub fn search_history_path() -> Result<PathBuf> {
     Ok(state_root()?.join("search_history.json"))
 }
 
-/// One-shot migration from the pre-1.1 split paths. Idempotent: safe to call
-/// every startup. Renames `~/.cache/ccsight/{cache.json,index/}` and
-/// `~/.config/ccsight/pins.json` into `~/.ccsight/`. If the new path already
-/// exists (user already migrated, or both old and new co-exist for some
-/// reason), the legacy file is left untouched — we never overwrite.
-///
-/// All errors are silenced because state directories are best-effort: a
-/// migration failure should never block startup. The next run will retry.
+/// Idempotent legacy-path migration into `~/.ccsight/`. Never overwrites
+/// an existing target. Errors silenced — startup must not block; next
+/// run retries.
 pub fn migrate_legacy_state_dirs() {
     let Ok(home) = std::env::var("HOME") else {
         return;
@@ -72,6 +74,11 @@ pub fn migrate_legacy_state_dirs() {
             home.join(".config/ccsight/pins.json"),
             new_root.join("pins.json"),
         ),
+        // In-tree rename: the early multi-snapshot prototype called this
+        // directory `daily/` before semantics evolved to per-poll history.
+        // `live_snapshots/` matches the diagnostic singleton file at the
+        // root (`live_snapshot.json`) — singular = current, plural = history.
+        (new_root.join("daily"), new_root.join("live_snapshots")),
     ];
 
     let needs_migration = migrations

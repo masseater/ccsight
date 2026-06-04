@@ -56,6 +56,20 @@ impl SessionInfo {
     pub fn work_tokens(&self) -> u64 {
         self.day_input_tokens + self.day_output_tokens
     }
+
+    /// Per-day cost summed over `day_tokens_by_model`. Single source so
+    /// every cross-surface view (Overview / Costs / Daily / --daily /
+    /// MCP / summaries) agrees. Param-injected calculator keeps it pure.
+    pub fn cost(&self, calculator: &crate::aggregator::CostCalculator) -> f64 {
+        self.day_tokens_by_model
+            .iter()
+            .map(|(model, tokens)| {
+                calculator
+                    .calculate_cost(tokens, Some(model))
+                    .unwrap_or(0.0)
+            })
+            .sum()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,19 +96,10 @@ impl DailyGrouper {
     ) -> Vec<DailyGroup> {
         let mut date_map: HashMap<NaiveDate, Vec<SessionInfo>> = HashMap::new();
 
-        // Global dedup across files: same (msg_id, requestId) can appear
-        // in multiple session JSONLs because Claude Code rewrites prior
-        // turns when a session is resumed/branched. Each API request is
-        // billed once by Anthropic, so we must collapse the duplicates.
-        // Pre-load with hashes already credited to cached files so a
-        // fresh-parse file doesn't re-claim them.
-        //
-        // Restrict pre-load to files whose cache is STILL VALID for this
-        // run: a stale cache entry (mtime changed → file about to be
-        // re-parsed) would otherwise inject hashes into `global_seen`
-        // that the fresh parse should be free to re-credit. Result was
-        // those hashes' tokens dropped from totals entirely. Files no
-        // longer on disk are excluded by the same `is_valid` check.
+        // Cross-file dedup: resume/branch rewrites duplicate (msg_id,
+        // requestId) across sessions but Anthropic bills once. Pre-load
+        // with hashes from VALID-cache files only — stale entries would
+        // block fresh-parse files from re-crediting their own tokens.
         let mut global_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(c) = cache.as_ref() {
             for file in files {
@@ -699,12 +704,9 @@ fn extract_first_user_message(entries: &[crate::domain::LogEntry]) -> Option<Str
     })
 }
 
-/// Pull the most recent meaningful user-role text from the entry stream.
-/// Strips well-known system-injected wrappers; for anything still bearing
-/// an unrecognised kebab-case tag (`<local-command-caveat>`,
-/// `<task-notification>`, etc.) skips the whole message and falls through
-/// to the previous user entry — same approach as
-/// `extract_first_user_message`.
+/// Most-recent meaningful user-role text. Strips known system wrappers;
+/// any remaining unknown `<kebab-tag>` causes fall-through to the prior
+/// user entry (same approach as `extract_first_user_message`).
 fn extract_last_user_message(entries: &[crate::domain::LogEntry]) -> Option<String> {
     use crate::domain::Role;
     entries.iter().rev().find_map(|e| {
@@ -1411,9 +1413,11 @@ mod tests {
             .clone();
 
         // Path 2: Stats parses the same file from scratch.
-        let mut cache_b = crate::infrastructure::Cache::new_empty();
-        let (_stats, _) =
-            StatsAggregator::aggregate_with_shared_cache(&[path.clone()], cache_b.clone());
+        let cache_b = crate::infrastructure::Cache::new_empty();
+        let (_stats, _) = StatsAggregator::aggregate_with_shared_cache(
+            std::slice::from_ref(&path),
+            cache_b.clone(),
+        );
         let _ = cache_b;
         let cache_b_loaded = crate::infrastructure::Cache::load()
             .unwrap_or_else(|_| crate::infrastructure::Cache::new_empty());

@@ -14,8 +14,91 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::handlers;
+use crate::infrastructure::live_sessions::LiveSession;
+use crate::infrastructure::live_snapshots::LiveSnapshot;
 use crate::state::{ConvListMode, ConversationPane, MAX_PANES, SummaryType};
 use crate::{AppState, PeriodFilter, Tab, search, ui};
+
+/// Live tab snapshot stepper. `delta = +1` walks back one snapshot
+/// (older), `-1` walks forward (newer / toward today). The snapshot list
+/// is sorted captured_at-descending across the full retention window, so
+/// stepping crosses date boundaries automatically when multiple snapshots
+/// exist within the same day.
+pub(crate) fn step_live_view_snapshot(state: &mut AppState, delta: i32) {
+    let snapshots = LiveSnapshot::load_recent();
+    let total = snapshots.len();
+    let next = match delta.signum() {
+        1 => state
+            .live_view_snapshot_offset
+            .saturating_add(delta.unsigned_abs() as usize),
+        -1 => state
+            .live_view_snapshot_offset
+            .saturating_sub(delta.unsigned_abs() as usize),
+        _ => return,
+    };
+    let next = next.min(total);
+    if next == state.live_view_snapshot_offset {
+        state.toast_message = Some(if delta > 0 {
+            "Already at oldest snapshot".to_string()
+        } else {
+            "Already at today".to_string()
+        });
+        state.toast_time = Some(std::time::Instant::now());
+        return;
+    }
+    state.live_view_snapshot_offset = next;
+    state.live_past_snapshot_total = total;
+    if next == 0 {
+        state.live_past_sessions.clear();
+        state.live_past_snapshot_meta = None;
+    } else {
+        // offset 1 → snapshots[0] (most-recent past), offset N → snapshots[N-1].
+        if let Some(snap) = snapshots.into_iter().nth(next - 1) {
+            state.live_past_snapshot_meta = Some((snap.captured_at, snap.date));
+            let mut rows: Vec<LiveSession> = snap
+                .sessions
+                .into_values()
+                .map(|e| {
+                    let jsonl_mtime = e
+                        .jsonl_path
+                        .as_deref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .and_then(|d| {
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(
+                                d.as_secs() as i64,
+                                d.subsec_nanos(),
+                            )
+                        });
+                    LiveSession {
+                        session_id: e.session_id,
+                        jsonl_path: e.jsonl_path,
+                        cwd: e.cwd,
+                        name: e.name,
+                        status: None,
+                        pid: 0,
+                        started_at: None,
+                        updated_at: jsonl_mtime,
+                        jsonl_mtime,
+                        is_live: false,
+                        was_recently_live: false,
+                    }
+                })
+                .collect();
+            rows.sort_by_key(|s| {
+                std::cmp::Reverse(
+                    s.jsonl_mtime
+                        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH),
+                )
+            });
+            state.live_past_sessions = rows;
+        }
+    }
+    state.live_selected = 0;
+    state.live_scroll = 0;
+    state.needs_draw = true;
+}
 
 /// `state.show_help == true` branch — Esc/q/? close, j/k/↑↓ scroll the body.
 pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
@@ -152,12 +235,8 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
                 state.filter_input.move_end();
             }
             KeyCode::Char(c)
-                // Restrict input to characters that can legally appear
-                // in `YYYY-MM-DD[..YYYY-MM-DD]` / `YYYY-MM`. Without
-                // this filter, accidental presses of `f`/`j`/`k` (the
-                // popup-trigger and list-nav keys) silently appended
-                // garbage to the field, leaving the user no way to
-                // recover except Backspace-to-empty.
+                // Only date-shape chars (digits / - / .). Without this,
+                // `f`/`j`/`k` (popup / nav keys) silently appended garbage.
                 if (c.is_ascii_digit() || c == '-' || c == '.') => {
                     state.filter_input.insert_char(c);
                     state.filter_input_error = false;
@@ -242,6 +321,32 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
                 }
             }
         }
+        KeyCode::Char('y') => {
+            // Mirror the Live tab `y` binding: copy `cd ... && claude -r UUID`
+            // for the session whose detail popup is open. Use override (set
+            // by Live tab opens) so cwd reversal targets the right JSONL
+            // even when the Daily selection cursor has moved.
+            let file_path = state
+                .session_detail_override
+                .as_ref()
+                .map(|s| s.file_path.clone())
+                .or_else(|| crate::current_selected_session(state).map(|s| s.file_path));
+            if let Some(path) = file_path {
+                match crate::shell::resume_command_from_jsonl(&path) {
+                    Some(cmd) => {
+                        state.clipboard_task =
+                            Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
+                        state.toast_message = Some(format!("Copied: {cmd}"));
+                    }
+                    None => {
+                        state.toast_message =
+                            Some("Cowork — re-open from Claude Desktop".to_string());
+                    }
+                }
+                state.toast_time = Some(std::time::Instant::now());
+                state.needs_draw = true;
+            }
+        }
         KeyCode::Char('C') => {
             let no_loading_panes = state.panes.iter().all(|p| !p.loading);
             if no_loading_panes
@@ -293,12 +398,9 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.show_conversation == true` branch — handles both the in-pane content
-/// search mode AND the larger pane navigation / list nav state. The original
-/// branch in `main.rs` was ~530 lines and used `continue` to skip to the next
-/// iteration; we translate that to plain `return;` (the only post-dispatch
-/// work in the loop is `state.needs_draw = true`, which is harmless to also
-/// run).
+/// `show_conversation` branch — handles in-pane content search AND pane
+/// nav. Uses `return;` to short-circuit post-dispatch (only `needs_draw`
+/// runs after; harmless to skip).
 pub(crate) fn handle_conversation_key(
     state: &mut AppState,
     key: crossterm::event::KeyEvent,
@@ -949,19 +1051,25 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('y') if state.tab == Tab::Live => {
-            if let Some(s) = crate::live_selected_session(state) {
-                // `cd ... && claude -r ...` works from any terminal, not just
-                // one already in the right cwd. Single-line so paste-and-enter
-                // executes immediately. Both `cwd` (read from
-                // `~/.claude/sessions/<pid>.json`) and `session_id` are
-                // POSIX-quoted: even though they should be a normal path and
-                // a UUID, the JSON is on disk and could in principle be
-                // tampered with; quoting prevents the clipboard payload from
-                // becoming a shell-injection vector.
+            // Snapshot the fields before mutating `state` (toast) so the
+            // `live_selected_session` borrow is released.
+            let sel = crate::live_selected_session(state)
+                .map(|s| (s.jsonl_path.clone(), s.cwd.clone(), s.session_id.clone()));
+            if let Some((jsonl_path, fallback_cwd, session_id)) = sel {
+                // Authoritative cwd = the JSONL's `cwd` field; it preserves a
+                // literal `-` in the path that the slug reversal mangles into
+                // `/`. Fall back to the discovered cwd (pid.json for active
+                // sessions) only when no JSONL exists yet.
+                let cwd = jsonl_path
+                    .as_deref()
+                    .and_then(crate::infrastructure::live_sessions::read_cwd_from_jsonl)
+                    .unwrap_or_else(|| fallback_cwd.to_string_lossy().into_owned());
+                // Both cwd and session_id are POSIX-quoted — the underlying
+                // JSON is on disk and could be tampered with.
                 let cmd = format!(
                     "cd {} && claude -r {}",
-                    crate::shell::shell_quote_cwd(&s.cwd.to_string_lossy()),
-                    crate::shell::posix_shell_quote(&s.session_id),
+                    crate::shell::shell_quote_cwd(&cwd),
+                    crate::shell::posix_shell_quote(&session_id),
                 );
                 state.clipboard_task =
                     Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
@@ -970,12 +1078,10 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('i') if state.tab == Tab::Live => {
-            // Reuse the existing Session Detail popup. Live sessions might be
-            // outside the active period/project filter, so look up in
-            // `original_daily_groups` and stash the result in
-            // `session_detail_override` for `draw_detail_popup` to consume.
-            // Snapshot the live fields up-front so subsequent state mutation
-            // doesn't fight the borrow on `live_selected_session`.
+            // Live sessions can sit outside the current filter, so look
+            // up in `original_daily_groups` and stash via
+            // `session_detail_override`. Snapshot live fields up-front to
+            // dodge the `live_selected_session` borrow.
             let live_info = crate::live_selected_session(state).map(|live| {
                 let started = live
                     .started_at
@@ -1050,9 +1156,13 @@ pub(crate) fn handle_default_key(
         }
         KeyCode::Char('p') => {
             state.show_project_popup = true;
+            // Preselect against the SAME sorted view the popup renders and the
+            // Enter handler indexes (`project_list_sorted`, recency by
+            // default) — using the raw `project_list` order here would land
+            // the cursor on an unrelated project and silently switch filters.
             state.project_popup_selected = match &state.project_filter {
                 Some(name) => state
-                    .project_list
+                    .project_list_sorted()
                     .iter()
                     .position(|(n, _, _)| n == name)
                     .map_or(0, |i| i + 1),
@@ -1091,12 +1201,8 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('/') => {
-            // Pre-seed the query with `filter:live ` when the user opens
-            // search from the Live tab on a clean input — most of the time
-            // they're trying to drill into the running sessions, so spare
-            // them the boilerplate. A non-empty input is left intact so
-            // pressing Esc-then-/ restores the prior query without losing
-            // edits.
+            // Pre-seed `filter:live ` only on clean Live-tab input; existing
+            // input survives so Esc-then-/ restores the prior edit.
             if state.tab == Tab::Live && state.search_input.text.is_empty() {
                 state.search_input.set("filter:live ".to_string());
             }
@@ -1132,6 +1238,13 @@ pub(crate) fn handle_default_key(
             state.session_detail_live_extra = None;
             state.daily_breakdown_focus = false;
             state.daily_breakdown_scroll = 0;
+            // No tab bar is drawn during the initial load (the splash owns
+            // the whole screen), so tab switching is meaningless and would
+            // only decide which view the user lands on when loading ends.
+            // Ignore it entirely — load always resolves onto Dashboard.
+            if state.loading {
+                return false;
+            }
             // Order: Dashboard → Live → Daily → Insights.
             state.tab = match key.code {
                 KeyCode::Char('1') => Tab::Dashboard,
@@ -1154,6 +1267,8 @@ pub(crate) fn handle_default_key(
                 } else {
                     state.dashboard_panel - 1
                 };
+            } else if state.tab == Tab::Live {
+                step_live_view_snapshot(state, 1);
             } else if state.tab == Tab::Daily
                 && state.selected_day < state.daily_groups.len().saturating_sub(1)
             {
@@ -1176,6 +1291,8 @@ pub(crate) fn handle_default_key(
                 } else {
                     state.dashboard_panel + 1
                 };
+            } else if state.tab == Tab::Live {
+                step_live_view_snapshot(state, -1);
             } else if state.tab == Tab::Daily && state.selected_day > 0 {
                 state.selected_day -= 1;
                 state.selected_session = 0;
@@ -1311,10 +1428,10 @@ pub(crate) fn handle_default_key(
             {
                 handlers::tasks::start_session_summary(state, session, false);
             } else if state.tab == Tab::Dashboard {
-                // Rankable panels (Projects = 1, Models = 2) toggle the
-                // sort key. `dashboard_scroll[N]` is the cursor into the
-                // sorted list, so reset it to 0 to avoid landing on a
-                // stale row when the order changes.
+                // Rankable panels (Projects = 1, Models = 2, Languages = 4)
+                // toggle the sort key. `dashboard_scroll[N]` is the cursor
+                // into the sorted list, so reset it to 0 to avoid landing on
+                // a stale row when the order changes.
                 match state.dashboard_panel {
                     1 => {
                         state.dashboard_projects_sort = state.dashboard_projects_sort.toggle();
@@ -1325,6 +1442,11 @@ pub(crate) fn handle_default_key(
                         state.dashboard_models_sort = state.dashboard_models_sort.toggle();
                         state.dashboard_scroll[2] = 0;
                         state.dashboard_viewport[2] = 0;
+                    }
+                    4 => {
+                        state.dashboard_languages_sort = state.dashboard_languages_sort.toggle();
+                        state.dashboard_scroll[4] = 0;
+                        state.dashboard_viewport[4] = 0;
                     }
                     _ => {}
                 }
@@ -1362,6 +1484,14 @@ pub(crate) fn handle_default_key(
         KeyCode::Char('t') if state.tab == Tab::Daily && !state.daily_groups.is_empty() => {
             state.selected_day = 0;
             state.selected_session = 0;
+        }
+        KeyCode::Char('t') if state.tab == Tab::Live && state.live_view_snapshot_offset != 0 => {
+            // Mirror Daily's `t` — jump to today. No-op when already on today.
+            state.live_view_snapshot_offset = 0;
+            state.live_past_sessions.clear();
+            state.live_selected = 0;
+            state.live_scroll = 0;
+            state.needs_draw = true;
         }
         KeyCode::Char('i') => {
             if state.tab == Tab::Daily {
@@ -1469,6 +1599,22 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             state.dashboard_models_sort = state.dashboard_models_sort.toggle();
             state.dashboard_scroll[2] = 0;
             state.dashboard_viewport[2] = 0;
+        }
+        KeyCode::Char('s') if state.dashboard_panel == 3 => {
+            // Ecosystem popup: toggle recency vs call-count across every tab
+            // and the server rows. Rows reorder under the cursor, so reset
+            // the scroll/viewport and the MCP server/tool selection.
+            state.dashboard_ecosystem_sort = state.dashboard_ecosystem_sort.toggle();
+            state.dashboard_scroll[3] = 0;
+            state.dashboard_viewport[3] = 0;
+            state.mcp_selected_server = 0;
+            state.mcp_selected_tool = None;
+        }
+        KeyCode::Char('s') if state.dashboard_panel == 4 => {
+            // Languages popup mirror of the normal-mode toggle.
+            state.dashboard_languages_sort = state.dashboard_languages_sort.toggle();
+            state.dashboard_scroll[4] = 0;
+            state.dashboard_viewport[4] = 0;
         }
         KeyCode::Enter if state.dashboard_panel == 1 => {
             // Drill into the focused project. `dashboard_scroll[1]` is the
@@ -1595,15 +1741,10 @@ pub(crate) fn handle_summary_popup_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.search_mode == true` branch — global search popup. Esc cancels and
-/// restores the saved tab/day/session, Enter jumps to the selected hit (and
-/// optionally activates the in-pane content search). Char keys edit the input
-/// and re-run the search incrementally.
-///
-/// Takes two callbacks because the original branch invokes
-/// `start_content_search(state)` and `open_conversation_in_pane(state)` —
-/// both live in `main.rs` and can't be moved without churn. They are passed
-/// in as `fn(&mut AppState)` pointers.
+/// `search_mode` branch — Esc restores prior tab/day/session, Enter jumps
+/// to the hit, char keys edit the input and re-run incrementally. Two
+/// `fn` callbacks for `start_content_search` / `open_conversation_in_pane`
+/// which live in `main.rs`.
 pub(crate) fn handle_search_mode_key(
     state: &mut AppState,
     key: KeyEvent,
@@ -1659,12 +1800,9 @@ pub(crate) fn handle_search_mode_key(
                 pane.search_mode = true;
             }
         }
-        // ↑ / ↓ walk the persisted query history only when the popup is
-        // in a "blank" state (empty input) or already recalling a prior
-        // entry. The moment the user has typed their own query, the
-        // arrows revert to plain list nav with wrap-around so they don't
-        // get yanked out of "their" results into history. j / k always
-        // navigate results regardless, for vim-style consistency.
+        // ↑↓ walk history only on blank input or while already recalling;
+        // typing reverts ↑↓ to list nav so users aren't yanked into
+        // history. j/k always navigate results (vim consistency).
         KeyCode::Up => {
             let in_history_mode =
                 state.search_input.text.is_empty() || state.search_history.is_browsing();
@@ -1781,5 +1919,54 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
             state.show_project_popup = false;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_live_view_snapshot_at_today_warns_when_walking_forward() {
+        // Forward (-1) from offset 0 → "Already at today" toast, offset
+        // unchanged. Mirror case (oldest) depends on real disk contents
+        // and varies across runs, so not exercised here.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.live_view_snapshot_offset = 0;
+        step_live_view_snapshot(&mut state, -1);
+        assert_eq!(state.live_view_snapshot_offset, 0);
+        assert_eq!(state.toast_message.as_deref(), Some("Already at today"));
+    }
+
+    fn noop(_: &mut AppState) {}
+
+    #[test]
+    fn tab_switch_ignored_while_loading() {
+        // No tab bar is drawn during the initial load, so switching keys
+        // must be inert — the view stays on Dashboard until data arrives.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.loading = true;
+        state.tab = Tab::Dashboard;
+        for code in [
+            KeyCode::Char('2'),
+            KeyCode::Char('3'),
+            KeyCode::Char('4'),
+            KeyCode::Tab,
+        ] {
+            handle_default_key(&mut state, KeyEvent::from(code), noop, noop);
+            assert!(state.tab == Tab::Dashboard, "loading must block {code:?}");
+        }
+    }
+
+    #[test]
+    fn tab_switch_works_once_loaded() {
+        // After loading clears, the same keys switch tabs normally.
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.loading = false;
+        state.tab = Tab::Dashboard;
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('2')), noop, noop);
+        assert!(state.tab == Tab::Live);
+        handle_default_key(&mut state, KeyEvent::from(KeyCode::Char('3')), noop, noop);
+        assert!(state.tab == Tab::Daily);
     }
 }

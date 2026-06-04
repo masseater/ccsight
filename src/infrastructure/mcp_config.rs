@@ -30,22 +30,10 @@ impl McpServerStatus {
     }
 }
 
-/// Read the union of MCP server names that Claude Code currently considers
-/// "configured":
-///
-/// 1. **Global user MCP servers** — `~/.claude.json::mcpServers` keys.
-/// 2. **Plugin-provided MCP servers** — every enabled plugin in
-///    `~/.claude/settings.json::enabledPlugins` contributes the servers
-///    declared in its bundled `.mcp.json` / `.claude-plugin/plugin.json`,
-///    namespaced as `<plugin>/<server>` to match the runtime form ccsight
-///    extracts in `aggregator/tool_category::mcp_server_of`.
-///
-/// Without (2), plugin-installed servers (e.g. an internal company plugin
-/// providing 15 MCP servers) get incorrectly flagged as "inactive (not in
-/// global config)" when in fact they're loaded by the plugin layer.
-///
-/// Project-scope `.mcp.json` and per-project `.claude/settings.json` are
-/// intentionally NOT consulted — see Tools popup design notes for rationale.
+/// MCP servers Claude Code considers configured: global
+/// (`~/.claude.json`) + each enabled plugin's `.mcp.json`, namespaced
+/// `<plugin>/<server>` to match `aggregator/tool_category::mcp_server_of`.
+/// Project-scope configs intentionally excluded.
 pub fn read_configured_mcp_servers() -> HashSet<String> {
     let mut servers = read_global_mcp_servers();
     servers.extend(read_plugin_mcp_servers());

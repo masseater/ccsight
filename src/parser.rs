@@ -206,10 +206,10 @@ mod tests {
         let projects_dir = format!("{}/.claude/projects", home.to_string_lossy());
 
         if std::path::Path::new(&projects_dir).exists() {
-            let pattern = format!("{}/*/*.jsonl", projects_dir);
+            let pattern = format!("{projects_dir}/*/*.jsonl");
             let files: Vec<_> = glob::glob(&pattern)
                 .unwrap()
-                .filter_map(|r| r.ok())
+                .filter_map(std::result::Result::ok)
                 .take(5)
                 .collect();
 

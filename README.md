@@ -7,7 +7,7 @@ reconcile spend across projects and models, and search every past conversation
 ## Features
 
 - **Dashboard** — cost (with 5m vs 1h cache-write TTL separated), daily / monthly trends, top projects, models, tools, languages, activity heatmap, hourly pattern
-- **Live** — currently-running and recently-paused sessions, copy-resume command, post-reboot recovery via local snapshot
+- **Live** — currently-running and recently-paused sessions, copy-resume command, post-reboot recovery via local snapshots, time-travel through past snapshots with `←/→`
 - **Daily View** — per-day sessions + activity graph + project / model / tool breakdown + conversation viewer
 - **Insights** — metrics (cost, tokens, cache, tool success, subagent overhead), today vs average, weekly / monthly trends — each with detail popups
 - **Conversation** — multi-pane, syntax highlighting, in-pane search, per-turn latency / cost / token breakdown
@@ -119,13 +119,14 @@ Reads inputs from these locations:
   release breaks it, individual sessions silent-skip rather than crashing.
 
 State written by ccsight (cache + index are removed by `--clear-cache`; pins
-and the live snapshot are kept):
+and the live history are kept):
 
 - `~/.ccsight/cache.json` — parsed-session JSON cache (incremental)
 - `~/.ccsight/index/` — tantivy full-text index segments
 - `~/.ccsight/pins.json` — pinned-session list
-- `~/.ccsight/live_snapshot.json` — record of sessions seen alive, used by the
-  Live tab to flag "I had this open before the reboot" entries with a `⟳` glyph
+- `~/.ccsight/live_snapshot.json` — latest alive-session poll (diagnostic only)
+- `~/.ccsight/live_snapshots/<date>-<HHMM>.json` — alive-set history; powers
+  `⟳ restorable` and `←/→ h/l` time-travel. 7-day retention
 
 ## License
 

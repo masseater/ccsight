@@ -48,13 +48,10 @@ impl Pins {
                     (data.pins, lookup)
                 }
                 _ => {
-                    // Parse failure or version mismatch. Silently zeroing the
-                    // entries here is dangerous: the next pin toggle would
-                    // call save(), overwriting the on-disk file with just the
-                    // one new pin and losing every prior pin. Move the
-                    // unparseable file aside so the user can recover it later
-                    // (and so we never overwrite real data with an empty
-                    // list). Best-effort: failure to rename is silent.
+                    // Parse failure / version mismatch: move file aside instead
+                    // of zeroing, otherwise the next toggle+save would
+                    // overwrite real pins with a single-entry file. Rename
+                    // failures are silent (best-effort recovery).
                     let backup = data_path.with_extension(format!(
                         "json.corrupt-{}",
                         chrono::Utc::now().format("%Y%m%dT%H%M%S")

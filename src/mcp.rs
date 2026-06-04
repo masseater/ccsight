@@ -259,12 +259,9 @@ impl CcsightServer {
                 total_input += session.day_input_tokens;
                 total_output += session.day_output_tokens;
 
-                if session.is_subagent {
-                    continue;
-                }
-
-                session_count += 1;
-
+                // Subagent-inclusive (matches total_cost_usd / --daily / TUI
+                // project_stats). Subagent skip below gates only session_count
+                // and hourly / tool / language tallies.
                 if group_by == Some("day") {
                     let day = daily_agg.entry(group.date).or_default();
                     day.0 += session_cost;
@@ -276,6 +273,12 @@ impl CcsightServer {
                 proj.0 += 1;
                 proj.1 += session.work_tokens();
                 proj.2 += session_cost;
+
+                if session.is_subagent {
+                    continue;
+                }
+
+                session_count += 1;
 
                 for (hour, tokens) in &session.day_hourly_work_tokens {
                     *hourly_agg.entry(*hour).or_default() += tokens;
@@ -509,14 +512,39 @@ impl CcsightServer {
         };
         let mut meta_results = crate::search::perform_search(&data.daily_groups, query, &ctx);
 
-        if let Ok(index) = crate::infrastructure::SearchIndex::update_or_build(&data.daily_groups) {
-            let content_results = index.search(query, fetch_limit, 200);
-            for result in content_results {
-                if !meta_results
-                    .iter()
-                    .any(|r| r.day_idx == result.day_idx && r.session_idx == result.session_idx)
-                {
-                    meta_results.push(result);
+        // The tantivy index only knows message content — `filter:` / `project:`
+        // etc. tokens would be matched literally and return nothing, so search
+        // the free text only (perform_search above already applied the filters
+        // to the metadata pass).
+        let (_, free_text) = crate::search::parse_search_query(query);
+        if !free_text.is_empty()
+            && let Ok(index) =
+                crate::infrastructure::SearchIndex::update_or_build(&data.daily_groups)
+        {
+            // Resolve a result to its session file_path (newest-first walk
+            // order matches the TUI). Used to dedupe a multi-day session,
+            // which lives in one DailyGroup per active day with the same
+            // path but a distinct day_idx — otherwise it returns once per day
+            // and starves other matches up to `limit`.
+            let path_of = |r: &crate::search::SearchResult| -> Option<std::path::PathBuf> {
+                data.daily_groups.get(r.day_idx).and_then(|g| {
+                    g.sessions
+                        .iter()
+                        .filter(|s| !s.is_subagent)
+                        .nth(r.session_idx)
+                        .map(|s| s.file_path.clone())
+                })
+            };
+            let mut seen: std::collections::HashSet<std::path::PathBuf> =
+                meta_results.iter().filter_map(path_of).collect();
+            for result in index.search(&free_text, fetch_limit, 200) {
+                match path_of(&result) {
+                    Some(p) => {
+                        if seen.insert(p) {
+                            meta_results.push(result);
+                        }
+                    }
+                    None => meta_results.push(result),
                 }
             }
         }
@@ -567,11 +595,7 @@ impl CcsightServer {
                 continue;
             };
 
-            let cost: f64 = session
-                .day_tokens_by_model
-                .iter()
-                .filter_map(|(model, tokens)| calculator.calculate_cost(tokens, Some(model)))
-                .sum();
+            let cost: f64 = session.cost(calculator);
 
             let session_id: String = session
                 .file_path
@@ -622,10 +646,10 @@ impl CcsightServer {
         &self,
         Parameters(params): Parameters<LiveSessionsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        use crate::infrastructure::live_diagnostic::LiveDiagnostic;
         use crate::infrastructure::live_sessions::{
             LiveSession, discover_live, discover_recently_paused, mark_was_recently_live,
         };
-        use crate::infrastructure::live_snapshot::LiveSnapshot;
 
         let active = discover_live();
         let active_ids: std::collections::HashSet<String> =
@@ -635,16 +659,15 @@ impl CcsightServer {
             std::time::Duration::from_secs(24 * 3600),
             std::time::SystemTime::now(),
         );
-        let snapshot = LiveSnapshot::load();
-        // MCP has no run of its own; reuse the most recent TUI ccsight's
-        // anchor via the helper.
-        let anchor = snapshot.prior_run_anchor();
-        mark_was_recently_live(&mut paused, &snapshot, anchor);
+        // MCP is read-only with no boot-freeze of its own; it reads the
+        // TUI's latest persisted snapshot live as the restorable source.
+        let prior_alive = crate::infrastructure::live_snapshots::latest_snapshot_alive();
+        mark_was_recently_live(&mut paused, &prior_alive);
         let paused_ids: std::collections::HashSet<String> =
             paused.iter().map(|s| s.session_id.clone()).collect();
-        let recovered = snapshot.recover_missing(&active_ids, &paused_ids, anchor);
+        let recovered = LiveDiagnostic::recover_missing(&active_ids, &paused_ids, &prior_alive);
         paused.extend(recovered);
-        mark_was_recently_live(&mut paused, &snapshot, anchor);
+        mark_was_recently_live(&mut paused, &prior_alive);
 
         // Lookup table from `daily_groups` so we can enrich each live row
         // with ai_title / last_user_message / tokens / cost / model. Build
@@ -705,12 +728,7 @@ impl CcsightServer {
                     .map(crate::aggregator::TokenStats::work_tokens)
                     .sum()
             });
-            let cost: f64 = info.map_or(0.0, |i| {
-                i.day_tokens_by_model
-                    .iter()
-                    .map(|(m, t)| calculator.calculate_cost(t, Some(m)).unwrap_or(0.0))
-                    .sum()
-            });
+            let cost: f64 = info.map_or(0.0, |i| i.cost(calculator));
             let model_normalized = info
                 .and_then(|i| i.model.as_ref())
                 .map(|m| crate::aggregator::normalize_model_name(m));
@@ -2563,6 +2581,58 @@ mod tests {
         assert_eq!(daily[1]["date"].as_str().unwrap(), today.to_string());
         assert_eq!(daily[1]["sessions"], 2);
         assert!(daily[1]["cost_usd"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_stats_daily_and_projects_cost_include_subagents_and_reconcile() {
+        // daily[].cost_usd and projects[].cost_usd must include subagent spend
+        // so they sum to total_cost_usd (which always does) — matching --daily
+        // and the TUI project_stats. Regression: the subagent skip used to sit
+        // above these accumulators, undercounting both.
+        let today = Local::now().date_naive();
+        let mut sub =
+            make_session_with_tokens("~/projects/a", 5000, 2000, "claude-sonnet-4-20250514");
+        sub.is_subagent = true;
+        let groups = vec![make_daily_group(
+            today,
+            vec![
+                make_session_with_tokens("~/projects/a", 1000, 500, "claude-sonnet-4-20250514"),
+                sub,
+            ],
+        )];
+        let server = CcsightServer::from_groups(groups);
+        let json = extract_json(
+            &server
+                .stats(Parameters(StatsParams {
+                    period: None,
+                    date_from: None,
+                    date_to: None,
+                    group_by: Some("day".to_string()),
+                }))
+                .unwrap(),
+        );
+        let total = json["total_cost_usd"].as_f64().unwrap();
+        let sum_daily: f64 = json["daily"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["cost_usd"].as_f64().unwrap())
+            .sum();
+        let sum_proj: f64 = json["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["cost_usd"].as_f64().unwrap())
+            .sum();
+        assert!(total > 0.0);
+        assert!(
+            (total - sum_daily).abs() < 0.01,
+            "daily cost must reconcile with total (subagent-inclusive): total={total} sum_daily={sum_daily}"
+        );
+        assert!(
+            (total - sum_proj).abs() < 0.01,
+            "projects cost must reconcile with total (subagent-inclusive): total={total} sum_proj={sum_proj}"
+        );
     }
 
     #[test]

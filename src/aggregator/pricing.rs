@@ -1,14 +1,7 @@
 // Pricing: https://platform.claude.com/docs/en/about-claude/pricing
-//
-// Cache writes are billed differently by TTL: 5m = 1.25x base input, 1h = 2x.
-// Claude Code's JSONL emits `message.usage.cache_creation` as a structured
-// `{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}` object, so callers
-// can apply each rate. Subscription users default to 1h TTL automatically
-// (per code.claude.com/docs/en/agent-sdk/cost-tracking), so the 1h rate
-// dominates real-world cost — assuming everything is 5m undercounts by ~57%.
-// 200k tiered pricing (Sonnet 4 1M beta, Aug 2025) is no longer in effect —
-// current 1M models (Opus 4.6/4.7/4.8, Sonnet 4.6) bill at standard pricing
-// per the official "Long context pricing" section.
+// Cache writes bill by TTL — 5m = 1.25x base input, 1h = 2x; subscription
+// users default to 1h, so flat-5m would materially undercount. 1M-context
+// models bill at standard per-token across the whole window (no >200k tier).
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -591,8 +584,7 @@ mod tests {
         // 500K @ $3/M = $1.50
         assert!(
             (cost - 1.50).abs() < 0.01,
-            "Expected ~$1.50, got ${:.4}",
-            cost
+            "Expected ~$1.50, got ${cost:.4}"
         );
     }
 
@@ -617,8 +609,7 @@ mod tests {
         // Total: ~$0.495
         assert!(
             (cost - 0.495).abs() < 0.01,
-            "Expected ~$0.495, got ${:.4}",
-            cost
+            "Expected ~$0.495, got ${cost:.4}"
         );
     }
 
@@ -641,8 +632,7 @@ mod tests {
             .unwrap();
         assert!(
             (cost - 6.0).abs() < 0.01,
-            "1h cache for Sonnet 4.6 should be $6/MTok, got ${:.4}",
-            cost
+            "1h cache for Sonnet 4.6 should be $6/MTok, got ${cost:.4}"
         );
     }
 
@@ -668,8 +658,7 @@ mod tests {
         // Total: $6.375
         assert!(
             (cost - 6.375).abs() < 0.01,
-            "mixed 5m+1h cache cost should be $6.375 for Sonnet 4.6, got ${:.4}",
-            cost
+            "mixed 5m+1h cache cost should be $6.375 for Sonnet 4.6, got ${cost:.4}"
         );
     }
 
@@ -734,8 +723,7 @@ mod tests {
         // 500K @ $5/M = $2.50, 100K @ $25/M = $2.50 → total $5.00
         assert!(
             (cost - 5.00).abs() < 0.01,
-            "Expected ~$5.00, got ${:.4}",
-            cost
+            "Expected ~$5.00, got ${cost:.4}"
         );
     }
 
@@ -806,8 +794,7 @@ mod tests {
         for model in expected_models {
             assert!(
                 calculator.pricing.contains_key(model),
-                "Missing pricing for: {}",
-                model
+                "Missing pricing for: {model}"
             );
         }
     }

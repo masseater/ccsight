@@ -1,28 +1,12 @@
-//! Discover and adapt Claude Desktop "Cowork" session logs.
+//! Adapter for Claude Desktop "Cowork" session logs under
+//! `~/Library/Application Support/Claude/local-agent-mode-sessions/`
+//! (macOS only; empty list on other platforms).
 //!
-//! Cowork sessions live under
-//! `~/Library/Application Support/Claude/local-agent-mode-sessions/<accountId>/<envId>/`,
-//! with this layout:
-//!
-//! ```text
-//! local_<uuid>.json          ← session metadata: title, processName, cwd, model, ...
-//! local_<uuid>/
-//!   audit.jsonl              ← full conversation log (one entry per line)
-//!   outputs/, uploads/, ...
-//! ```
-//!
-//! ccsight reads `audit.jsonl` as the conversation source and joins the
-//! sibling metadata json for the human-curated title and the `processName`
-//! used as project name (sandbox `cwd` like `/sessions/<vmname>` is not
-//! useful for users).
-//!
-//! This is an **unofficial private format**. Anthropic does not document the
-//! schema and may change it in any Claude Desktop release. The reader is
-//! tolerant: malformed files / missing fields skip silently with a single
-//! aggregated stderr warning at end of discovery.
-//!
-//! macOS-only; on Linux/WSL2 the directory is absent and discovery returns
-//! an empty list.
+//! ccsight reads `audit.jsonl` for conversation data and joins the
+//! sibling `local_<uuid>.json` for title / processName (sandbox `cwd` =
+//! `/sessions/<vmname>` is not user-friendly). The schema is unofficial
+//! and may change without notice; the reader skips malformed files
+//! silently to stay tolerant of upstream churn.
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -97,12 +81,9 @@ pub fn is_cowork_audit_path(path: &Path) -> bool {
     path.starts_with(&root)
 }
 
-/// Given an `audit.jsonl` path, locate the sibling `local_<uuid>.json` and
-/// return parsed metadata. The metadata file is one directory up from
-/// `audit.jsonl` and named after the parent directory + `.json`.
-///
-/// Returns `None` if the file is missing or unparseable. Caller is expected
-/// to fall back to defaults (project name = directory stem, title absent).
+/// Read sibling `local_<uuid>.json` (one dir up, named after the
+/// session dir) for an `audit.jsonl`. `None` on read/parse failure —
+/// callers fall back to dir-stem defaults.
 pub fn read_metadata_for_audit(audit_path: &Path) -> Option<CoworkMetadata> {
     let session_dir = audit_path.parent()?;
     let session_name = session_dir.file_name()?.to_str()?;
@@ -123,17 +104,10 @@ pub fn fallback_project_name_from_audit(audit_path: &Path) -> String {
         .to_string()
 }
 
-/// Resolve the user-facing project name for a session file, taking Cowork
-/// metadata into account.
-///
-/// For a regular Claude Code JSONL the in-stream `cwd` (encoded in
-/// `extracted`) is canonical, so we just return it. For a Cowork audit.jsonl
-/// the in-stream `cwd` points at sandbox or session-internal `outputs/` dirs
-/// — meaningless to a user — so the sibling metadata's `processName` (e.g.
-/// `intelligent-eager-cerf`) wins outright. This function is the **single
-/// source of truth** for project naming so both the cache writer
-/// (`stats::aggregate_files_into_stats`) and the live grouper
-/// (`grouping::parse_and_build_sessions`) agree.
+/// User-facing project name. Regular JSONL → in-stream `cwd`; Cowork
+/// audit.jsonl → sibling metadata's `processName` (in-stream `cwd` is
+/// a meaningless sandbox path). Single source of truth — both cache
+/// writer and live grouper route through this.
 pub fn resolve_project_name(file: &Path, extracted: Option<String>) -> Option<String> {
     if !is_cowork_audit_path(file) {
         return extracted;

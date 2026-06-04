@@ -196,6 +196,33 @@ pub fn discover_live() -> Vec<LiveSession> {
     out
 }
 
+/// Read the launch `cwd` from a session JSONL — recorded on message entries,
+/// not the leading summary line, so it surfaces within the first few lines.
+/// Returns the FIRST match (the session's project dir = the right `cd` target
+/// for resume) — deliberately not the reverse-walk last value. `MAX_LINES`
+/// bounds the probe; a session with no message yet yields `None`.
+pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    const MAX_LINES: usize = 100;
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file)
+        .lines()
+        .take(MAX_LINES)
+        .map_while(Result::ok)
+    {
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+            && let Some(cwd) = v.get("cwd").and_then(|c| c.as_str())
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
 /// Scan `~/.claude/projects/**/*.jsonl` for sessions whose mtime is within
 /// `window` of `now` and whose UUID is *not* in `active_ids`. The returned
 /// sessions carry minimal metadata: cwd / name / status are unknown from a
@@ -249,16 +276,20 @@ pub fn discover_recently_paused(
                 continue;
             }
             let jsonl_mtime = mtime_utc(&jsonl_path);
-            // Reconstruct the cwd from the slugified directory name by
-            // reversing the `/`→`-` substitution. This is best-effort —
-            // multiple original paths can map to the same slug, but it
-            // matches Claude Code's own convention.
-            let dir_name = project_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            let cwd = PathBuf::from(dir_name.replace('-', "/"));
+            // Prefer the JSONL's authoritative `cwd` over the slug: a real
+            // `-` in the path is indistinguishable from the `/`→`-`
+            // separator, so reversing the slug collapses `foo-bar-baz` to
+            // `foo/bar/baz` and the label loses everything but the tail.
+            let cwd = read_cwd_from_jsonl(&jsonl_path).map_or_else(
+                || {
+                    let dir_name = project_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    PathBuf::from(dir_name.replace('-', "/"))
+                },
+                PathBuf::from,
+            );
             out.push(LiveSession {
                 session_id: stem,
                 jsonl_path: Some(jsonl_path),
@@ -278,39 +309,34 @@ pub fn discover_recently_paused(
     out
 }
 
-/// Mark paused entries whose `session_id` appears in the persisted
-/// snapshot and re-sort so rows that were open in the prior ccsight run
-/// float to the top of the paused list. Run on the caller side because
-/// the snapshot lives outside this module.
+/// Mark paused entries that were alive in the prior run's final snapshot
+/// (`prior_alive`, frozen at boot), then re-sort so restorable rows float
+/// to the top. `prior_alive` is passed in because the snapshot reader and
+/// the boot-freeze both live outside this module.
 pub fn mark_was_recently_live(
     paused: &mut [LiveSession],
-    snapshot: &super::live_snapshot::LiveSnapshot,
-    prior_run_anchor: Option<DateTime<Utc>>,
+    prior_alive: &std::collections::HashMap<String, super::live_snapshots::LiveSnapshotEntry>,
 ) {
-    // Anchor = prior ccsight run's last `refresh()` moment. Sessions alive
-    // at that poll share that exact timestamp; sessions that died mid-run
-    // keep a stamp from before the anchor and fall outside the 1s tolerance.
-    let Some(anchor) = prior_run_anchor else {
-        return;
-    };
-    let cluster_floor = anchor - chrono::Duration::seconds(1);
-
     for entry in paused.iter_mut() {
-        if let Some(snap_entry) = snapshot.sessions.get(&entry.session_id) {
-            if snap_entry.last_seen >= cluster_floor && snap_entry.last_seen <= anchor {
-                entry.was_recently_live = true;
-                // Stamp `updated_at` with the snapshot's `last_seen` so the
-                // row age reflects "when ccsight last saw this alive".
-                entry.updated_at = Some(snap_entry.last_seen);
-            }
+        if prior_alive.contains_key(&entry.session_id) {
+            entry.was_recently_live = true;
         }
     }
     let zero_ts = DateTime::<Utc>::UNIX_EPOCH;
-    paused.sort_by_key(|s| {
-        // Tier 1: was_recently_live first so post-restart recovery hints
-        // stay at the top regardless of JSONL mtime. Tier 2: mtime desc.
-        let tier = u8::from(!s.was_recently_live);
-        (tier, std::cmp::Reverse(s.jsonl_mtime.unwrap_or(zero_ts)))
+    // Tier 1: was_recently_live first so restorable hints stay at the top
+    // regardless of JSONL mtime. Tier 2: mtime desc. Tier 3: session_id —
+    // recovered rows arrive in nondeterministic HashMap order and share a
+    // tier (often with tied/None mtime), so without this tiebreaker they
+    // shuffle between frames (render-stable sort, lint #30).
+    paused.sort_by(|a, b| {
+        u8::from(!a.was_recently_live)
+            .cmp(&u8::from(!b.was_recently_live))
+            .then_with(|| {
+                b.jsonl_mtime
+                    .unwrap_or(zero_ts)
+                    .cmp(&a.jsonl_mtime.unwrap_or(zero_ts))
+            })
+            .then_with(|| a.session_id.cmp(&b.session_id))
     });
 }
 
@@ -318,6 +344,39 @@ pub fn mark_was_recently_live(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn read_cwd_from_jsonl_returns_authoritative_path_with_literal_dash() {
+        // The real cwd has a literal `-` (multi-word-dir). Reading it
+        // from the JSONL `cwd` field must return it verbatim — the lossy
+        // slug reversal would have collapsed it to `multi/word/dir`.
+        let tmpdir = std::env::temp_dir().join(format!("ccsight_cwd_{}", std::process::id()));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let jp = tmpdir.join("session.jsonl");
+        // Line 1: summary with no cwd (mirrors Claude Code's first line).
+        // Line 2: a message entry carrying the authoritative cwd.
+        std::fs::write(
+            &jp,
+            "{\"type\":\"summary\",\"summary\":\"x\"}\n\
+             {\"type\":\"user\",\"cwd\":\"/Users/me/dev/multi-word-dir\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_cwd_from_jsonl(&jp).as_deref(),
+            Some("/Users/me/dev/multi-word-dir")
+        );
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn read_cwd_from_jsonl_none_when_absent() {
+        let tmpdir = std::env::temp_dir().join(format!("ccsight_cwd_none_{}", std::process::id()));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let jp = tmpdir.join("nocwd.jsonl");
+        std::fs::write(&jp, "{\"type\":\"summary\"}\n{\"type\":\"user\"}\n").unwrap();
+        assert!(read_cwd_from_jsonl(&jp).is_none());
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
 
     fn paused(id: &str, mtime_offset_secs: i64, snapshot_match: bool) -> LiveSession {
         LiveSession {
@@ -336,220 +395,49 @@ mod tests {
     }
 
     #[test]
-    fn mark_was_recently_live_promotes_snapshot_matches() {
-        // Three paused sessions; only "in_snapshot" is in the snapshot.
-        // Expectation: after marking + sort, snapshot match comes first
-        // even though it has the OLDEST mtime.
+    fn mark_sorts_restorable_rows_above_non_restorable_regardless_of_mtime() {
+        // Two paused rows with `was_recently_live` pre-set to simulate the
+        // outcome of the daily-snapshot lookup. The sort tier must put
+        // restorable first even when the non-restorable row has fresher
+        // mtime.
         let mut paused_list = vec![
-            paused("recent_only", 10, false),
-            paused("middle", 100, false),
-            paused("in_snapshot", 1000, false),
+            paused("fresh_non_restorable", 10, false),
+            paused("old_restorable", 1000, true),
         ];
-        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
-        let prev_run_stamp = Utc::now() - chrono::Duration::seconds(120);
-        snap.sessions.insert(
-            "in_snapshot".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "in_snapshot".to_string(),
-                last_seen: prev_run_stamp,
-                cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/in_snapshot.jsonl")),
-                name: None,
-            },
-        );
-        let anchor = snap.prior_run_anchor();
-
-        mark_was_recently_live(&mut paused_list, &snap, anchor);
-
-        assert_eq!(paused_list[0].session_id, "in_snapshot");
+        // Empty prior_alive — the rows already carry `was_recently_live`,
+        // so we only verify the sort tier honors the pre-set flag.
+        let prior_alive = std::collections::HashMap::new();
+        mark_was_recently_live(&mut paused_list, &prior_alive);
+        assert_eq!(paused_list[0].session_id, "old_restorable");
         assert!(paused_list[0].was_recently_live);
-        assert_eq!(paused_list[1].session_id, "recent_only");
-        assert!(!paused_list[1].was_recently_live);
+        assert_eq!(paused_list[1].session_id, "fresh_non_restorable");
     }
 
     #[test]
-    fn mark_skips_entries_stamped_after_prior_anchor() {
-        // Manual-kill case: snapshot has an entry whose stamp is *newer*
-        // than the prior run's heartbeat (= would have been stamped during
-        // the current run if marking were re-derived). Anchor is fixed at
-        // the prior heartbeat — the entry sits outside the cluster.
-        let mut paused_list = vec![paused("manually_closed", 30, false)];
-        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
-        snap.last_refresh_at = Some(Utc::now() - chrono::Duration::seconds(120));
-        snap.sessions.insert(
-            "manually_closed".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "manually_closed".to_string(),
-                last_seen: Utc::now() - chrono::Duration::seconds(60),
-                cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/manually_closed.jsonl")),
-                name: None,
-            },
-        );
-        let anchor = snap.prior_run_anchor();
-        mark_was_recently_live(&mut paused_list, &snap, anchor);
-        assert!(
-            !paused_list[0].was_recently_live,
-            "session stamped after the prior heartbeat must not be flagged ⟳"
-        );
-    }
-
-    #[test]
-    fn mark_only_flags_latest_run_cluster() {
-        // Two prior runs survive in the snapshot:
-        //   • Run-1 (older) stamped session "old" at T-3h
-        //   • Run-2 (newer) stamped session "recent" at T-1h
-        // Only "recent" should carry `⟳ from last ccsight run` — "old"
-        // came from an even-older run and isn't the most recent prior
-        // ccsight context.
-        let mut paused_list = vec![paused("old", 10800, false), paused("recent", 3600, false)];
-        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
-        let app_start = Utc::now();
-        snap.sessions.insert(
-            "old".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "old".to_string(),
-                last_seen: app_start - chrono::Duration::hours(3),
-                cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/old.jsonl")),
-                name: None,
-            },
-        );
-        snap.sessions.insert(
-            "recent".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "recent".to_string(),
-                last_seen: app_start - chrono::Duration::hours(1),
-                cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/recent.jsonl")),
-                name: None,
-            },
-        );
-
-        let anchor = snap.prior_run_anchor();
-        mark_was_recently_live(&mut paused_list, &snap, anchor);
-
-        // recent (matches anchor) → flagged.
-        // old (3h ago, outside the cluster window) → not flagged.
-        let recent = paused_list
-            .iter()
-            .find(|p| p.session_id == "recent")
-            .unwrap();
-        let old = paused_list.iter().find(|p| p.session_id == "old").unwrap();
-        assert!(
-            recent.was_recently_live,
-            "session at anchor should be flagged ⟳"
-        );
-        assert!(
-            !old.was_recently_live,
-            "session from an older run (last_seen outside anchor cluster) must not be flagged ⟳"
-        );
-    }
-
-    #[test]
-    fn mark_excludes_sessions_that_died_one_poll_before_exit() {
-        // A session stamped one poll-cycle before exit (mid-run death) must
-        // not enter the cluster — only sessions on the anchor itself count
-        // as "alive at exit".
+    fn mark_flags_only_sessions_in_prior_alive() {
+        use super::super::live_snapshots::LiveSnapshotEntry;
+        // Two paused rows; only "in_prior" is in the frozen prior-alive set.
+        // It must get the ⟳ flag (and float to top); the other must not.
         let mut paused_list = vec![
-            paused("survivor", 1, false),
-            paused("died_mid_run", 1, false),
+            paused("recent_other", 10, false),
+            paused("in_prior", 999, false),
         ];
-        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
-        let app_start = Utc::now();
-        let final_poll = app_start - chrono::Duration::seconds(120);
-        let previous_poll = final_poll - chrono::Duration::seconds(5);
-        snap.sessions.insert(
-            "survivor".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "survivor".to_string(),
-                last_seen: final_poll,
+        let mut prior = std::collections::HashMap::new();
+        prior.insert(
+            "in_prior".to_string(),
+            LiveSnapshotEntry {
+                session_id: "in_prior".to_string(),
                 cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/survivor.jsonl")),
+                jsonl_path: Some(PathBuf::from("/tmp/in_prior.jsonl")),
                 name: None,
             },
         );
-        snap.sessions.insert(
-            "died_mid_run".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "died_mid_run".to_string(),
-                last_seen: previous_poll,
-                cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/died.jsonl")),
-                name: None,
-            },
-        );
-
-        let anchor = snap.prior_run_anchor();
-        mark_was_recently_live(&mut paused_list, &snap, anchor);
-
-        let survivor = paused_list
-            .iter()
-            .find(|p| p.session_id == "survivor")
-            .unwrap();
-        let died = paused_list
-            .iter()
-            .find(|p| p.session_id == "died_mid_run")
-            .unwrap();
-        assert!(survivor.was_recently_live);
+        mark_was_recently_live(&mut paused_list, &prior);
+        assert_eq!(paused_list[0].session_id, "in_prior");
+        assert!(paused_list[0].was_recently_live);
         assert!(
-            !died.was_recently_live,
-            "died_mid_run must not be flagged — was stamped 5s before the final poll"
-        );
-    }
-
-    #[test]
-    fn recomputing_anchor_after_refresh_corrupts_marking() {
-        // Pin the anti-pattern: callers must capture the anchor at boot
-        // (into `AppState::prior_run_last_refresh`) and never re-derive it
-        // mid-run. After the polling thread's `refresh()`, the snapshot's
-        // `last_refresh_at` jumps to the current run, so a recomputed
-        // anchor sits on current-run time — every prior session falls out
-        // of the cluster and silently loses its `⟳`.
-        let prior_exit = Utc::now() - chrono::Duration::minutes(30);
-        let mut snap = super::super::live_snapshot::LiveSnapshot::default();
-        snap.last_refresh_at = Some(prior_exit);
-        snap.sessions.insert(
-            "alive_at_prior_exit".to_string(),
-            super::super::live_snapshot::SnapshotEntry {
-                session_id: "alive_at_prior_exit".to_string(),
-                last_seen: prior_exit,
-                cwd: PathBuf::from("/tmp"),
-                jsonl_path: Some(PathBuf::from("/tmp/alive.jsonl")),
-                name: None,
-            },
-        );
-
-        let frozen_anchor = snap.prior_run_anchor();
-        assert_eq!(frozen_anchor, Some(prior_exit));
-
-        snap.refresh(&[]);
-        // `prior_run_anchor()`'s primary path needs `last_refresh_at < Utc::now()`.
-        // On low-resolution clocks under parallel test load, the back-to-back
-        // `now()` calls in refresh + prior_run_anchor can land on the same
-        // microsecond, dropping to the fallback. A 1ms sleep gives the clock
-        // room to advance so the anti-pattern reliably surfaces.
-        std::thread::sleep(std::time::Duration::from_millis(1));
-        let stale_anchor = snap.prior_run_anchor();
-        assert_ne!(
-            stale_anchor, frozen_anchor,
-            "refresh must visibly move the (incorrectly) recomputed anchor"
-        );
-
-        // Frozen anchor → session correctly flagged ⟳.
-        let mut paused_frozen = vec![paused("alive_at_prior_exit", 30, false)];
-        mark_was_recently_live(&mut paused_frozen, &snap, frozen_anchor);
-        assert!(
-            paused_frozen[0].was_recently_live,
-            "frozen anchor flags the prior-exit-alive session"
-        );
-
-        // Stale anchor → marker silently dropped (the bug we prevent).
-        let mut paused_stale = vec![paused("alive_at_prior_exit", 30, false)];
-        mark_was_recently_live(&mut paused_stale, &snap, stale_anchor);
-        assert!(
-            !paused_stale[0].was_recently_live,
-            "stale anchor sits on the current run and drops the marker"
+            !paused_list[1].was_recently_live,
+            "session absent from prior_alive must not be ⟳"
         );
     }
 

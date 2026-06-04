@@ -69,7 +69,8 @@ isn't obvious from the filename.
 | `aggregator/tool_category.rs` | UI section order: **Tools → Skills → Commands → Subagents**. `format_tool_short` strips category prefix (section already conveys it). |
 | `infrastructure/mcp_config.rs` | `is_underutilized(now, 30)` is the canonical "stale" predicate. Servers absent from current config are **inactive**, not stale. |
 | `infrastructure/live_sessions.rs` | `is_today()` is the single source of truth shared between sort tier and row glyph (busy / today / older). |
-| `infrastructure/live_snapshot.rs` | `last_refresh_at` anchors the `⟳` cluster; **must be frozen at boot in `AppState::prior_run_last_refresh`** — re-deriving mid-run silently drops markers. |
+| `infrastructure/live_snapshots.rs` | Per-poll alive-set history at `~/.ccsight/live_snapshots/<YYYY-MM-DD>-<HHMM>.json`. Diff-detected + 30-min debounce: a poll that sees no change is a no-op; same-window changes overwrite the latest file; cross-window changes create a new one. Drives the Live tab's `⟳ restorable` flag and `←/→ h/l` time-travel. Singular `LiveSnapshot` struct here = one historical record; the diagnostic singleton (latest alive-set + `last_refresh_at`) lives in `live_diagnostic.rs`. |
+| `infrastructure/live_diagnostic.rs` | Singleton `~/.ccsight/live_snapshot.json`. Diagnostic only: stores the last poll's alive metadata so external readers (MCP, debug scripts) can answer "when did the TUI last refresh". The Live tab's restorable logic does NOT read this file. |
 | `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `Stats::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field. |
 | `shell.rs` | `posix_shell_quote` is the only sanctioned interpolation for `cd ... && claude -r ...`. Lint #28 enforces. |
 | `state.rs` | Adding a field is compiler-checked at every `AppState { ... }` literal site (3+ places). |
@@ -113,6 +114,19 @@ govern, so they're seen at the moment of violation:
 - AppState init parity — every `AppState { ... }` literal lists every field.
 - Real-world identifier shapes — fully covered by lint #16 / #17 / #21.
 
+**Real data never becomes a literal**: lint #17's denylist is *reactive* — it
+only matches terms already listed, so a fresh project / directory / glob /
+domain name copied out of `~/.claude` or the local filesystem **while
+investigating real data** slips straight through (a real project directory
+name once reached a test fixture this way). Whenever observed data informs a
+test fixture, comment, doc example, or smoke-test path, abstract every real
+identifier to a generic placeholder *before* it lands in committed source:
+`config/` not a real dir, `multi-word-dir` not a real repo, `~/proj` not a
+real path, `**/*.{a,b}` not a real glob. Then add the term to
+`.lint-forbidden-terms` (git-ignored) so the reactive net also catches a
+relapse — and note that this doc, README, and source are all scanned, so the
+denylisted term itself must never appear here either.
+
 **Suppressing warnings (`#[allow(...)]`)**: never apply on a guess. Before
 adding `#[allow(dead_code)]` / `#[allow(clippy::...)]` / `#[allow(unused)]`,
 identify *why* the compiler / clippy flagged the symbol — read the macro
@@ -139,14 +153,12 @@ Always include a `Co-Authored-By` trailer for Claude-assisted commits; omit only
 
 ## Comments
 
-Comments explain invariants, not history. Don't write incidents, prior bug
-numbers, captured numbers (percentages, $ amounts, K/M magnitudes,
-versions, dates), or any phrasing that requires the reader to know what
-the code used to be. The file outlives the incident; "earlier this used
-X" / "previously the popup hid Y" / "this was renamed from Z" reads as a
-factual claim about a state the reader can't see and has no way to
-verify. Same for `e.g.`-style examples that quote real values: they read
-as illustrations but date as snapshots.
+Comments state invariants verifiable against the code in front of the
+reader. No history, incident numbers, captured values (%, $, K/M, dates,
+versions), `e.g.`-with-real-values, or "earlier/previously/was renamed"
+phrasings — those belong in the commit message. Lint #38 catches the
+common past-state words. `mod tests` docstrings are exempt (fixture
+arithmetic is part of the assertion).
 
 - ❌ `// regression in vA.B.C where two surfaces disagreed on the count.`
 - ❌ `// e.g. "94%" once crushed the bars to "0–1%".`
@@ -155,12 +167,14 @@ as illustrations but date as snapshots.
 - ✅ `// Truncating mid-number drops the K/M suffix and reads much smaller.`
 - ✅ `// `Ecosystem` covers Built-in + MCP + Skills + Subagents in one panel.`
 
-State the rule in terms a future reader can verify against the code in
-front of them. Past incidents, captured values, and rename history go in
-the commit message or PR description. Lint #38 detects the most common
-past-state phrasings (`earlier`, `previously`, `used to be`, `was
-renamed`, `pre-vN`). Test docstrings inside `mod tests` are exempt — they
-describe fixture arithmetic that is part of the assertion contract.
+### Length (lint #41)
+
+Per contiguous block: `//` / `///` ≤ 5 lines, `//!` ≤ 20 lines.
+Overflow → trim WHY to the invariant, refactor so less explanation is
+needed, or move narrative into the commit message / PR description. Two
+adjacent blocks split by a blank line are NOT a fix — usually one is
+redundant. Escape hatch `// lint-ok: long-comment` on the first line,
+only when every line is load-bearing.
 
 ## Tests — three layers
 
@@ -183,7 +197,8 @@ Green unit tests are not proof that a fix lands in production. For changes
 that depend on on-disk state (snapshot, cache, ~/.claude files), open the
 actual files and verify the fix engages:
 
-- `~/.ccsight/live_snapshot.json` — dump with `python3 -c "import json; ..."`
+- `~/.ccsight/live_snapshot.json` — diagnostic singleton; dump with `python3 -c "import json; ..."`
+- `~/.ccsight/live_snapshots/<YYYY-MM-DD>-<HHMM>.json` — alive-set history; `ls` to see frozen poll moments, `cat` to inspect a specific snapshot
 - `~/.claude/sessions/*.json` — `ls -la` + `cat <pid>.json`, check `kill -0`
 - `~/.claude/projects/*/<id>.jsonl` — `wc -l`, `head -1` / `tail -1`
 

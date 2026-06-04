@@ -15,33 +15,19 @@ pub use stats::{CacheStats, ProjectStats, Stats, StatsAggregator, TokenStats};
 pub use tool_category::*;
 
 pub(crate) fn extract_project_name(entries: &[crate::domain::LogEntry]) -> Option<String> {
-    // Use the FIRST cwd — sessions normally start in a stable project root
-    // and may `cd` into subdirectories during the conversation (e.g.
-    // `dev/tmp` → `dev/tmp/.docs` to read internal docs). Picking the latest
-    // cwd would re-bucket those into transient subdirectory "projects",
-    // fracturing one logical project into many. The canonical project
-    // identity is set at session start.
-    //
-    // Note: this looks like a violation of the
-    // session-representative-value rev() rule (used for `model`,
-    // `git_branch`, `custom_title`), but `cwd` is different: it's a
-    // navigation breadcrumb, not an explicit user choice to redefine the
-    // session's identity.
+    // FIRST cwd (not last): mid-session `cd` is navigation, not an
+    // identity change — using `rev()` like model / branch would split one
+    // project across each subdir the user visited.
     entries
         .iter()
         .find_map(|e| e.cwd.as_ref())
         .map(|cwd| format_project_path(cwd))
 }
 
-/// Last-used timestamp per `tool_usage` key (raw form: `Bash`, `skill:my-skill`,
-/// `agent:type-a`, `mcp__server__action`, …).
-///
-/// Walks every session in `daily_groups`; for each tool key seen in `day_tool_usage`,
-/// keeps the maximum `day_last_timestamp`. **MCP-server tools** skip subagent sessions
-/// (mirroring `infrastructure::compute_mcp_status`, where double-counting nested
-/// subagent activity bloats per-server stats). **Built-in / Skill / Subagent-meta**
-/// tools include subagents — otherwise tools used heavily inside subagents (e.g.
-/// `TodoWrite`) appear stale even when active recently in nested sessions.
+/// Max `day_last_timestamp` per `tool_usage` key. MCP-server tools skip
+/// subagent sessions (matches `infrastructure::compute_mcp_status`);
+/// Built-in / Skill / Subagent-meta include subagents so heavily-nested
+/// tools (e.g. TodoWrite) don't read as stale.
 pub fn compute_tool_last_used(
     daily_groups: &[DailyGroup],
 ) -> std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> {
@@ -81,6 +67,21 @@ pub(crate) fn extract_session_model(entries: &[crate::domain::LogEntry]) -> Opti
     })
 }
 
+pub(crate) fn format_project_path(path: &str) -> String {
+    let stripped = path
+        .strip_prefix("/Users/")
+        .or_else(|| path.strip_prefix("/home/"));
+    if let Some(stripped) = stripped {
+        if let Some(rest) = stripped.split_once('/') {
+            format!("~/{}", rest.1)
+        } else {
+            format!("~/{stripped}")
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,7 +98,7 @@ mod tests {
                 role: Role::Assistant,
                 content: Default::default(),
                 usage: None,
-                model: model.map(|m| m.to_string()),
+                model: model.map(std::string::ToString::to_string),
                 id: None,
             }),
             summary: None,
@@ -214,20 +215,5 @@ mod tests {
         )];
         let map = compute_tool_last_used(&groups);
         assert_eq!(map.get("mcp__server1__action").copied(), Some(ts(0)));
-    }
-}
-
-pub(crate) fn format_project_path(path: &str) -> String {
-    let stripped = path
-        .strip_prefix("/Users/")
-        .or_else(|| path.strip_prefix("/home/"));
-    if let Some(stripped) = stripped {
-        if let Some(rest) = stripped.split_once('/') {
-            format!("~/{}", rest.1)
-        } else {
-            format!("~/{stripped}")
-        }
-    } else {
-        path.to_string()
     }
 }
