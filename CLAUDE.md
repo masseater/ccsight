@@ -71,9 +71,9 @@ isn't obvious from the filename.
 | `infrastructure/live_sessions.rs` | `is_today()` is the single source of truth shared between sort tier and row glyph (busy / today / older). |
 | `infrastructure/live_snapshots.rs` | Per-poll alive-set history at `~/.ccsight/live_snapshots/<YYYY-MM-DD>-<HHMM>.json`. Diff-detected + 30-min debounce: a poll that sees no change is a no-op; same-window changes overwrite the latest file; cross-window changes create a new one. Drives the Live tab's `⟳ restorable` flag and `←/→ h/l` time-travel. Singular `LiveSnapshot` struct here = one historical record; the diagnostic singleton (latest alive-set + `last_refresh_at`) lives in `live_diagnostic.rs`. |
 | `infrastructure/live_diagnostic.rs` | Singleton `~/.ccsight/live_snapshot.json`. Diagnostic only: stores the last poll's alive metadata so external readers (MCP, debug scripts) can answer "when did the TUI last refresh". The Live tab's restorable logic does NOT read this file. |
-| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `Stats::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field. |
+| `infrastructure/cache.rs` | `CachedFileStats` is single-shape (no partial flag). Both `StatsAggregator::aggregate_with_shared_cache` (TUI) and `DailyGrouper::group_by_date_with_shared_cache` (`--daily`) write fully-populated entries derived from the same entry-walk — anything else gets re-parsed on the other reader's next pass. Bump `CACHE_VERSION` when adding a field. |
 | `shell.rs` | `posix_shell_quote` is the only sanctioned interpolation for `cd ... && claude -r ...`. Lint #28 enforces. |
-| `state.rs` | Adding a field is compiler-checked at every `AppState { ... }` literal site (3+ places). |
+| `state.rs` | Adding a field is compiler-checked at every exhaustive `AppState { ... }` literal (`new_initial` + `test_helpers::make_test_app_state`). |
 
 ## Rules
 
@@ -108,7 +108,7 @@ govern, so they're seen at the moment of violation:
 - TextInput / UTF-8 safety → `state.rs::TextInput`
 - Scroll / cursor coord unity → `handlers::mcp_popup::mcp_pre_server_offset`
 - Session-representative value → `aggregator::extract_session_model`
-- Footer span format → first `let help_spans = vec![ ... ]` in `ui/dashboard.rs`
+- Footer span format → `ui/mod.rs::help_bar` (every tab's bar routes through it)
 
 **Compiler-enforced** (no rule needed):
 - AppState init parity — every `AppState { ... }` literal lists every field.
@@ -185,6 +185,18 @@ only when every line is load-bearing.
 | Smoke (tmux) | Real-data, async paths (index build, summary), cross-popup key sequences. | `scripts/smoke.sh`; capture with `tmux capture-pane -p`. |
 
 Pick the lowest layer that exercises what you changed.
+
+The StatsAggregator↔DailyGrouper token-agreement check runs at three
+intensities so the per-commit gate stays fast without losing real-data
+coverage: **commit** — `stats_and_grouper_agree_on_sampled_real_files`
+samples a few real `~/.claude` files (oldest/newest + random middle), fast,
+no-ops on CI; **push** — the pre-push hook runs the `#[ignore]`d
+`test_stats_and_grouper_agree_on_token_totals` over ALL real data (slow,
+exhaustive); **CI** — `stats_and_grouper_agree_on_fixture` (deterministic
+2-file fixture, also pins absolute values), since CI has no real data. No
+real `~/.claude` content is ever committed. CI smoke (`scripts/smoke-ci.sh`)
+drives the TUI through every tab + a popup under tmux with poll-until-ready,
+not just a first-frame capture.
 
 **`cargo clippy -- -D warnings` (CI gate) does NOT check `#[cfg(test)]` code.**
 Unused vars and dead_code in test blocks slip through. After touching test

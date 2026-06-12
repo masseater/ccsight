@@ -33,9 +33,10 @@ jobs:
       - run: cargo build --locked --release
       - run: bash scripts/lint.sh
       - run: shellcheck --severity=warning scripts/*.sh scripts/hooks/*
-      # Headless TUI launch + first-frame capture. Catches regressions
-      # that compile clean but panic during initial render (popup geometry
-      # errors, theme constant typos, etc.).
+      # Headless TUI launch over a small fixture, driven through every tab and
+      # a detail popup (poll-until-ready, not sleep). Catches regressions that
+      # compile clean but panic during render or navigation — popup geometry,
+      # theme typos, hit-test/scroll math — which the unit/render layers miss.
       - run: bash scripts/smoke-ci.sh
       # Security advisories for the dependency tree. Uses the maintained
       # RustSec action; fails the build when any RUSTSEC-* applies.

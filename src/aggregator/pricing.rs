@@ -10,7 +10,13 @@ use crate::aggregator::TokenStats;
 
 static GLOBAL_CALCULATOR: LazyLock<CostCalculator> = LazyLock::new(CostCalculator::new);
 
-const FAMILIES: &[(&str, &str)] = &[("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")];
+const FAMILIES: &[(&str, &str)] = &[
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet"),
+    ("haiku", "Haiku"),
+    ("fable", "Fable"),
+    ("mythos", "Mythos"),
+];
 
 pub fn normalize_model_name(model: &str) -> String {
     for &(family, display) in FAMILIES {
@@ -54,7 +60,10 @@ pub fn normalize_model_name(model: &str) -> String {
             }
         }
 
-        return display.to_string();
+        // Family matched but no version digits (e.g. a "-preview" id): keep
+        // the raw name. Collapsing to the bare family label would merge it
+        // with versioned siblings' namespace and hide WHICH id is unpriced.
+        return model.to_string();
     }
 
     // Unknown model family — keep the raw API name so the UI can show it individually
@@ -101,6 +110,33 @@ impl CostCalculator {
 
         // Per-model rates from platform.claude.com/docs/en/about-claude/pricing.
         // 5m cache write = base × 1.25; 1h cache write = base × 2.0; cache read = base × 0.10.
+
+        // Claude Fable 5: base $10 / $50 (verified against platform.claude.com/docs
+        // pricing page); cache rates use the standard multipliers (1.25x / 2x / 0.1x).
+        pricing.insert(
+            "claude-fable-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 10.0,
+                output_cost_per_mtok: 50.0,
+                cache_write_5m_cost_per_mtok: 12.5,
+                cache_write_1h_cost_per_mtok: 20.0,
+                cache_read_cost_per_mtok: 1.0,
+            },
+        );
+
+        // Claude Mythos 5: same rates as Fable 5 ($10 / $50, standard cache
+        // multipliers) per the official models-overview pricing table; offered
+        // through Project Glasswing, so it can appear in real data.
+        pricing.insert(
+            "claude-mythos-5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 10.0,
+                output_cost_per_mtok: 50.0,
+                cache_write_5m_cost_per_mtok: 12.5,
+                cache_write_1h_cost_per_mtok: 20.0,
+                cache_read_cost_per_mtok: 1.0,
+            },
+        );
 
         // Claude Opus 4.8: base $5 / $25 (verified against platform.claude.com/docs pricing page)
         pricing.insert(
@@ -331,10 +367,8 @@ impl CostCalculator {
     ) -> std::collections::HashSet<String> {
         let mut result = std::collections::HashSet::new();
         for model in model_tokens.keys() {
-            if !self.has_pricing(Some(model))
-                && let Some(simplified) = Self::simplify_model_name(model)
-            {
-                result.insert(simplified);
+            if !self.has_pricing(Some(model)) {
+                result.insert(Self::simplify_model_name(model));
             }
         }
         result
@@ -347,10 +381,9 @@ impl CostCalculator {
         let mut aggregated: HashMap<String, f64> = HashMap::new();
 
         for (model, tokens) in model_tokens {
-            if let Some(simplified) = Self::simplify_model_name(model) {
-                let cost = self.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
-                *aggregated.entry(simplified).or_insert(0.0) += cost;
-            }
+            let simplified = Self::simplify_model_name(model);
+            let cost = self.calculate_cost(tokens, Some(model)).unwrap_or(0.0);
+            *aggregated.entry(simplified).or_insert(0.0) += cost;
         }
 
         let mut costs: Vec<(String, f64)> = aggregated.into_iter().collect();
@@ -364,25 +397,25 @@ impl CostCalculator {
         let mut aggregated: HashMap<String, TokenStats> = HashMap::new();
 
         for (model, tokens) in model_tokens {
-            if let Some(simplified) = Self::simplify_model_name(model) {
-                let entry = aggregated.entry(simplified).or_default();
-                entry.input_tokens += tokens.input_tokens;
-                entry.output_tokens += tokens.output_tokens;
-                entry.cache_creation_tokens += tokens.cache_creation_tokens;
-                entry.cache_read_tokens += tokens.cache_read_tokens;
-                entry.cache_creation_5m_tokens += tokens.cache_creation_5m_tokens;
-                entry.cache_creation_1h_tokens += tokens.cache_creation_1h_tokens;
-            }
+            aggregated
+                .entry(Self::simplify_model_name(model))
+                .or_default()
+                .merge(tokens);
         }
 
         aggregated
     }
 
-    fn simplify_model_name(model: &str) -> Option<String> {
+    /// Bucket name for a model in the cost / token-by-model views. Synthetic
+    /// (`<...>`) and empty models collapse into one `Other` bucket (they
+    /// can't be priced); everything else uses its normalized display name.
+    /// `Other` is the unpriceable bucket, distinct from `normalize_model_name`'s
+    /// `unknown` display fallback.
+    fn simplify_model_name(model: &str) -> String {
         if model.starts_with('<') || model.is_empty() {
-            return Some("Other".to_string());
+            return "Other".to_string();
         }
-        Some(normalize_model_name(model))
+        normalize_model_name(model)
     }
 
     pub fn get_pricing(&self, model: Option<&str>) -> Option<&ModelPricing> {
@@ -433,6 +466,29 @@ mod tests {
         assert!(calculator.get_pricing(Some("claude-sonnet-4")).is_some());
         assert!(calculator.get_pricing(Some("claude-opus-4-5")).is_some());
         assert!(calculator.get_pricing(Some("claude-opus-4-8")).is_some());
+        assert!(calculator.get_pricing(Some("claude-fable-5")).is_some());
+        assert!(calculator.get_pricing(Some("claude-mythos-5")).is_some());
+        // Mythos Preview has no published rates — it must stay unpriced (the
+        // UI marks it "$?") rather than borrowing Mythos 5's, and must not
+        // substring-match the claude-mythos-5 entry.
+        assert!(
+            calculator
+                .get_pricing(Some("claude-mythos-preview"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_normalize_fable_and_mythos_families() {
+        assert_eq!(normalize_model_name("claude-fable-5"), "Fable 5");
+        assert_eq!(normalize_model_name("claude-mythos-5"), "Mythos 5");
+        // Version-less family id keeps its raw name — collapsing it to a
+        // bare "Mythos" would sit indistinguishably next to "Mythos 5" while
+        // carrying different (absent) pricing.
+        assert_eq!(
+            normalize_model_name("claude-mythos-preview"),
+            "claude-mythos-preview"
+        );
     }
 
     #[test]
@@ -554,15 +610,15 @@ mod tests {
     fn test_simplify_model_name() {
         assert_eq!(
             CostCalculator::simplify_model_name("claude-opus-4-5-20251101"),
-            Some("Opus 4.5".to_string())
+            "Opus 4.5"
         );
         assert_eq!(
             CostCalculator::simplify_model_name("claude-sonnet-4-20250514"),
-            Some("Sonnet 4".to_string())
+            "Sonnet 4"
         );
         assert_eq!(
             CostCalculator::simplify_model_name("claude-3-5-haiku-20241022"),
-            Some("Haiku 3.5".to_string())
+            "Haiku 3.5"
         );
     }
 
@@ -734,21 +790,15 @@ mod tests {
         // unknown models into a single opaque "Other" bucket.
         assert_eq!(
             CostCalculator::simplify_model_name("some-random-model"),
-            Some("some-random-model".to_string())
+            "some-random-model"
         );
     }
 
     #[test]
     fn test_simplify_model_name_empty_and_placeholder() {
         // Empty / placeholder values still go to "Other" because they are not real models.
-        assert_eq!(
-            CostCalculator::simplify_model_name(""),
-            Some("Other".to_string())
-        );
-        assert_eq!(
-            CostCalculator::simplify_model_name("<unknown>"),
-            Some("Other".to_string())
-        );
+        assert_eq!(CostCalculator::simplify_model_name(""), "Other");
+        assert_eq!(CostCalculator::simplify_model_name("<unknown>"), "Other");
     }
 
     #[test]
@@ -778,6 +828,10 @@ mod tests {
     fn test_all_defined_models_have_pricing() {
         let calculator = CostCalculator::new();
         let expected_models = [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-opus-4-5",
             "claude-opus-4-1",

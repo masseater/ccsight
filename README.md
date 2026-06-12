@@ -7,12 +7,12 @@ reconcile spend across projects and models, and search every past conversation
 ## Features
 
 - **Dashboard** — cost (with 5m vs 1h cache-write TTL separated), daily / monthly trends, top projects, models, tools, languages, activity heatmap, hourly pattern
-- **Live** — currently-running and recently-paused sessions, copy-resume command, post-reboot recovery via local snapshots, time-travel through past snapshots with `←/→`
+- **Live** — currently-running and recently-paused sessions, copy-resume command, post-reboot recovery via local snapshots, time-travel through past snapshots
 - **Daily View** — per-day sessions + activity graph + project / model / tool breakdown + conversation viewer
 - **Insights** — metrics (cost, tokens, cache, tool success, subagent overhead), today vs average, weekly / monthly trends — each with detail popups
 - **Conversation** — multi-pane, syntax highlighting, in-pane search, per-turn latency / cost / token breakdown
-- **Search** — full-text (tantivy) + inline filter tokens + persistent history (`↑/↓`)
-- **Pin** — mark sessions, reorder with `Shift+J/K`, browse across dates
+- **Search** — full-text (tantivy) + inline filter tokens + persistent history
+- **Pin** — mark sessions, reorder them, browse across dates
 - **MCP Server** — `--mcp` exposes `stats`, `sessions`, `search`, `live_sessions` to other Claude clients
 - **Caching** — on-disk cache + incremental full-text index for fast startup
 
@@ -54,6 +54,15 @@ ccsight --limit 50         # Load only the 50 most recent sessions (faster start
 
 Run `ccsight --help` for the full flag list. Press `?` in the TUI for key bindings.
 
+### Reading the numbers
+
+Token figures labelled **work** — and the headline "tokens" totals — count
+input + output only. Cache reads and writes are tracked separately: they
+dominate raw volume, but the bulk of that volume is cache reads, billed at a
+small fraction of the fresh-input rate. **Cost** always includes everything:
+input, output, both cache-write TTLs, and cache reads. A `$?` (or trailing
+`*`) marks figures involving a model with no known pricing.
+
 ### Search filters
 
 Press `/` inside the TUI to open the search popup. Plain queries match
@@ -71,12 +80,10 @@ Tokens can be combined freely with each other and with free text:
 
 ```text
 /filter:today project:ccsight             # today's ccsight sessions
-/filter:live branch:main                  # currently-running on main branch
 /filter:month model:opus mcp setup        # last 30 days, Opus, containing "mcp setup"
-/filter:date:YYYY-MM-DD release           # specific date narrowed by content
 ```
 
-The Live tab pre-fills `filter:live ` for `/`, and the search popup chips up recognised tokens so you can confirm parsing.
+The Live tab pre-fills `filter:live `, and the search popup chips up recognised tokens so you can confirm parsing.
 
 ## MCP Server
 
@@ -89,17 +96,13 @@ The Live tab pre-fills `filter:live ` for `/`, and the search popup chips up rec
 
 The first three accept `date_from` / `date_to` (`YYYY-MM-DD`, local timezone); `live_sessions` always reports the current poll.
 
-Register with Claude Code (simplest, user-scoped — works in every project):
+Register with Claude Code (user-scoped — works in every project):
 
 ```bash
 claude mcp add --scope user ccsight -- ccsight --mcp
 ```
 
-For Claude Desktop or hand-rolled configs, add this block under `mcpServers` in `~/.claude.json` or `~/Library/Application Support/Claude/claude_desktop_config.json`, then restart the host:
-
-```json
-{ "mcpServers": { "ccsight": { "command": "ccsight", "args": ["--mcp"] } } }
-```
+Other MCP hosts: add `ccsight --mcp` as a stdio server in the host's config.
 
 ## Data Source
 
@@ -108,9 +111,9 @@ Reads inputs from these locations:
 - **`~/.claude/projects/<project>/<session>.jsonl`** — session logs (conversation
   history, tool calls, token usage). Discovered recursively at startup.
 - **`~/.claude.json`** + enabled-plugin `.mcp.json` — Claude Code's MCP config.
-  Used to classify each MCP server as **active** (used in last 30d), **stale**
-  (configured but idle ≥30d, including never used), or **inactive** (in logs
-  but no longer in any config).
+  Used to classify each MCP server as **active**, **stale** (configured but
+  idle, including never used), or **inactive** (in logs but no longer in any
+  config).
 - **`~/.claude/{skills,commands,agents}/`** + enabled-plugin paths — installed
   Skills / Commands / Subagents. Surfaced as zero-call rows in the Tools popup
   for entries you've installed but never invoked.
@@ -118,15 +121,9 @@ Reads inputs from these locations:
   — Claude Desktop "Cowork" sessions. Read via a side-channel format; if a
   release breaks it, individual sessions silent-skip rather than crashing.
 
-State written by ccsight (cache + index are removed by `--clear-cache`; pins
-and the live history are kept):
-
-- `~/.ccsight/cache.json` — parsed-session JSON cache (incremental)
-- `~/.ccsight/index/` — tantivy full-text index segments
-- `~/.ccsight/pins.json` — pinned-session list
-- `~/.ccsight/live_snapshot.json` — latest alive-session poll (diagnostic only)
-- `~/.ccsight/live_snapshots/<date>-<HHMM>.json` — alive-set history; powers
-  `⟳ restorable` and `←/→ h/l` time-travel. 7-day retention
+State lives under `~/.ccsight/`: the parsed-session cache, the full-text
+index, pins, and live-session history. `--clear-cache` removes the cache and
+index; pins and live history are kept.
 
 ## License
 

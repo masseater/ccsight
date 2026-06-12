@@ -52,6 +52,55 @@ pub fn search_history_path() -> Result<PathBuf> {
     Ok(state_root()?.join("search_history.json"))
 }
 
+/// Create the state root and restrict it to the owner (0o700). The directory
+/// holds conversation-derived data whose per-file modes vary (tantivy writes
+/// world-readable index segments), so the directory itself is the privacy
+/// boundary. Best-effort — startup must not block on a chmod failure.
+/// Also sweeps crash-stranded atomic-write tmps (see [`sweep_stale_tmps`]).
+pub fn ensure_private_state_root() {
+    let Ok(root) = state_root() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    }
+    sweep_stale_tmps(&root);
+    if let Ok(snaps) = live_snapshots_dir() {
+        sweep_stale_tmps(&snaps);
+    }
+}
+
+/// Remove crash-stranded `*.json.tmp.<pid>` files. Atomic writes use
+/// per-process tmp names, so a SIGKILL mid-save (Claude Desktop reaps its MCP
+/// instances freely) strands a tmp no later writer truncates — a cache tmp is
+/// tens of MB and would otherwise accumulate forever. The mtime guard keeps a
+/// concurrently-writing process's in-flight tmp safe.
+fn sweep_stale_tmps(dir: &std::path::Path) {
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.contains(".json.tmp.") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_AFTER);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Idempotent legacy-path migration into `~/.ccsight/`. Never overwrites
 /// an existing target. Errors silenced — startup must not block; next
 /// run retries.

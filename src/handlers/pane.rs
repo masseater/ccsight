@@ -126,6 +126,65 @@ pub(crate) fn open_conversation_in_pane(state: &mut AppState) {
     state.show_conversation = true;
 }
 
+/// Persist pins, surfacing a save failure as a toast. Pins are the only
+/// user-curated state ccsight writes, so a silent save failure would lose
+/// them without the user knowing (see MEMORY pins-safety).
+pub(crate) fn persist_pins(state: &mut AppState) {
+    if let Err(e) = state.pins.save() {
+        state.toast(format!("Pin save failed: {e}"));
+    }
+}
+
+/// Toggle a session's pinned state, persist, and request a redraw.
+pub(crate) fn toggle_pin(state: &mut AppState, path: &std::path::Path) {
+    state.pins.toggle(path);
+    persist_pins(state);
+    state.needs_draw = true;
+}
+
+/// Open the Session Detail popup for the selected Live session. Live sessions
+/// can sit outside the active filter, so it looks up in `original_daily_groups`
+/// and stashes via `session_detail_override`. Returns false (and toasts) when
+/// the session isn't indexed yet. Shared by the `i` key and the `[i]` mouse
+/// zone so both behave identically.
+pub(crate) fn open_live_session_detail(state: &mut AppState) -> bool {
+    let live_info = crate::live_selected_session(state).map(|live| {
+        let started = live
+            .started_at
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        (
+            live.jsonl_path.clone(),
+            live.pid,
+            live.status.clone().unwrap_or_else(|| "—".to_string()),
+            started,
+        )
+    });
+    let Some((Some(jsonl), pid, status, started)) = live_info else {
+        return false;
+    };
+    let found = state.original_daily_groups.iter().find_map(|g| {
+        g.sessions
+            .iter()
+            .find(|s| s.file_path == jsonl && !s.is_subagent)
+            .cloned()
+    });
+    if let Some(session) = found {
+        state.session_detail_override = Some(session);
+        state.session_detail_live_extra = Some((pid, status, started));
+        state.active_popup = crate::ActivePopup::Detail;
+        state.session_detail_scroll = 0;
+        true
+    } else {
+        state.toast("Session not yet indexed; ccsight reloads every 30s");
+        false
+    }
+}
+
 /// Extract text from the rendered terminal buffer for a rectangular mouse
 /// selection. When `conv_area` is `Some`, the selection is clamped to that
 /// rect (Conversation pane / popup); when `wrap_flags` is also `Some`, the

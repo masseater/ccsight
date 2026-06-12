@@ -99,6 +99,41 @@ pub fn wrap_text_with_continuation(text: &str, max_width: usize) -> (Vec<String>
     (lines, flags)
 }
 
+/// Horizontal bar: `filled` `█` cells padded to `width` with `░`. Saturating
+/// by construction — a `filled` exceeding `width` (ratio > 1 from an
+/// out-of-range value) renders full instead of panicking on `usize` underflow.
+/// The single home for bar strings; lint #44 forbids bare `repeat(w - filled)`.
+pub fn hbar(filled: usize, width: usize) -> String {
+    let filled = filled.min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Truncate `s` to `max_width` display columns (UnicodeWidth-aware), ending
+/// with `…` when cut. The single home for display-name truncation — render
+/// sites must call this, never `chars().take(n)` (which drops the ellipsis
+/// and miscounts CJK width). Lint #43 enforces no re-implementation.
+pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut width = 0;
+    let mut result = String::new();
+    for ch in s.chars() {
+        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_w > max_width.saturating_sub(1) {
+            break;
+        }
+        result.push(ch);
+        width += ch_w;
+    }
+    result.push('…');
+    result
+}
+
 /// Render a `part / total` ratio as an integer percentage. When the raw
 /// share is non-zero but rounds down to zero, returns the `less-than`
 /// indicator so tiny non-zero rows in ranked panels (Projects, Languages)
@@ -214,6 +249,41 @@ pub fn parse_text_with_code_blocks(text: &str) -> Vec<TextSegment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn hbar_fills_and_pads_to_width() {
+        assert_eq!(UnicodeWidthStr::width(hbar(3, 10).as_str()), 10);
+        assert_eq!(hbar(0, 4), "░░░░");
+        assert_eq!(hbar(4, 4), "████");
+    }
+
+    #[test]
+    fn hbar_saturates_when_filled_exceeds_width() {
+        // ratio > 1 (out-of-range value) must render full, never panic on
+        // usize underflow.
+        assert_eq!(hbar(99, 5), "█████");
+        // width 0 is the other underflow edge — must be empty, not panic.
+        assert_eq!(hbar(5, 0), "");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_is_display_width_aware() {
+        // CJK chars are 2 columns wide; the cut must count COLUMNS, not chars
+        // — a chars().take() regression overflows the cell on CJK names.
+        let out = truncate_with_ellipsis("日本語の長い名前", 8);
+        assert!(out.ends_with('…'), "cut output must end with ellipsis");
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 8);
+
+        // A 2-wide char that doesn't fit in the final column must under-fill
+        // rather than overflow.
+        let tight = truncate_with_ellipsis("ああああ", 6);
+        assert!(UnicodeWidthStr::width(tight.as_str()) <= 6);
+
+        // Within budget → unchanged; zero budget → empty.
+        assert_eq!(truncate_with_ellipsis("abc", 8), "abc");
+        assert_eq!(truncate_with_ellipsis("abc", 0), "");
+    }
 
     #[test]
     fn test_format_number_small() {

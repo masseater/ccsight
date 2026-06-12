@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, NaiveDate, Timelike, Utc};
 
+use crate::aggregator::stats::DailyStats;
 use crate::aggregator::{StatsAggregator, TokenStats};
 use crate::domain::EntryType;
 use crate::infrastructure::Cache;
@@ -55,6 +56,15 @@ impl SessionInfo {
     /// Centralised so callers don't keep re-typing the addition.
     pub fn work_tokens(&self) -> u64 {
         self.day_input_tokens + self.day_output_tokens
+    }
+
+    /// True when any of this day's models lacks a pricing entry — that
+    /// model's share of [`Self::cost`] is silently 0, so displays must mark
+    /// the figure ("$?" / "*") instead of presenting it as a real total.
+    pub fn has_unpriced_model(&self, calculator: &crate::aggregator::CostCalculator) -> bool {
+        self.day_tokens_by_model
+            .keys()
+            .any(|model| calculator.get_pricing(Some(model)).is_none())
     }
 
     /// Per-day cost summed over `day_tokens_by_model`. Single source so
@@ -263,9 +273,9 @@ impl DailyGrouper {
         let session_start_date = session_first.with_timezone(&Local).date_naive();
 
         // Project name resolution shares one helper with the cache writer in
-        // `stats.rs`. For Cowork audit.jsonl this swaps the sandbox /
-        // outputs-dir cwd for the metadata `processName`; non-cowork files
-        // are returned unchanged.
+        // `stats.rs`. For Cowork audit.jsonl this swaps the sandbox cwd for
+        // the metadata's `userSelectedFolders` (real project) or a single
+        // `Cowork` bucket; non-cowork files are returned unchanged.
         let project_name = crate::infrastructure::resolve_project_name(
             file,
             Self::extract_project_name_from_entries(&entries),
@@ -366,26 +376,13 @@ impl DailyGrouper {
         for entry in &entries {
             if let Some(ts) = entry.timestamp {
                 let date = ts.with_timezone(&Local).date_naive();
-                let stats = daily_stats.entry(date).or_insert_with(|| DailyStats {
-                    first_timestamp: ts,
-                    last_timestamp: ts,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    user_msgs: 0,
-                    assistant_msgs: 0,
-                    tokens_by_model: HashMap::new(),
-                    hourly_activity: HashMap::new(),
-                    hourly_work_activity: HashMap::new(),
-                    tool_usage: HashMap::new(),
-                    language_usage: HashMap::new(),
-                    extension_usage: HashMap::new(),
-                });
+                let stats = daily_stats.entry(date).or_default();
 
-                if ts < stats.first_timestamp {
-                    stats.first_timestamp = ts;
+                if stats.first_timestamp.is_none() || Some(ts) < stats.first_timestamp {
+                    stats.first_timestamp = Some(ts);
                 }
-                if ts > stats.last_timestamp {
-                    stats.last_timestamp = ts;
+                if stats.last_timestamp.is_none() || Some(ts) > stats.last_timestamp {
+                    stats.last_timestamp = Some(ts);
                 }
 
                 if let Some(ref message) = entry.message {
@@ -529,13 +526,10 @@ impl DailyGrouper {
                     file_cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
                     file_cache_read_tokens += ts.cache_read_tokens;
                     day_tokens_total += ts.cache_creation_tokens + ts.cache_read_tokens;
-                    let agg = file_model_tokens.entry(model.clone()).or_default();
-                    agg.input_tokens += ts.input_tokens;
-                    agg.output_tokens += ts.output_tokens;
-                    agg.cache_creation_tokens += ts.cache_creation_tokens;
-                    agg.cache_creation_5m_tokens += ts.cache_creation_5m_tokens;
-                    agg.cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
-                    agg.cache_read_tokens += ts.cache_read_tokens;
+                    file_model_tokens
+                        .entry(model.clone())
+                        .or_default()
+                        .merge(ts);
                 }
                 for (k, v) in &ds.tool_usage {
                     *file_tool_usage.entry(k.clone()).or_insert(0) += v;
@@ -561,8 +555,8 @@ impl DailyGrouper {
                 cached_daily.insert(
                     date.to_string(),
                     crate::infrastructure::CachedDailyStats {
-                        first_timestamp: Some(ds.first_timestamp),
-                        last_timestamp: Some(ds.last_timestamp),
+                        first_timestamp: ds.first_timestamp,
+                        last_timestamp: ds.last_timestamp,
                         input_tokens: ds.input_tokens,
                         output_tokens: ds.output_tokens,
                         tokens_by_model: ds.tokens_by_model.clone(),
@@ -576,7 +570,7 @@ impl DailyGrouper {
                     },
                 );
             }
-            let last_ts = daily_stats.values().map(|d| d.last_timestamp).max();
+            let last_ts = daily_stats.values().filter_map(|d| d.last_timestamp).max();
             let session_duration_mins = last_ts.map(|l| (l - session_first).num_minutes());
             let full_entry = crate::infrastructure::CachedFileStats {
                 modified_secs: std::fs::metadata(file)
@@ -638,8 +632,8 @@ impl DailyGrouper {
                         project_name: project_name.clone(),
                         git_branch: git_branch.clone(),
                         session_first_timestamp: session_first,
-                        day_first_timestamp: stats.first_timestamp,
-                        day_last_timestamp: stats.last_timestamp,
+                        day_first_timestamp: stats.first_timestamp.unwrap_or(session_first),
+                        day_last_timestamp: stats.last_timestamp.unwrap_or(session_first),
                         day_input_tokens: stats.input_tokens,
                         day_output_tokens: stats.output_tokens,
                         day_user_msgs: stats.user_msgs,
@@ -784,21 +778,6 @@ fn clean_user_message_preview(raw: &str) -> String {
     // Collapse all whitespace runs to single spaces so multi-line messages
     // become single-line previews.
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-struct DailyStats {
-    first_timestamp: DateTime<Utc>,
-    last_timestamp: DateTime<Utc>,
-    input_tokens: u64,
-    output_tokens: u64,
-    user_msgs: u64,
-    assistant_msgs: u64,
-    tokens_by_model: HashMap<String, ModelTokens>,
-    hourly_activity: HashMap<u8, u64>,
-    hourly_work_activity: HashMap<u8, u64>,
-    tool_usage: HashMap<String, usize>,
-    language_usage: HashMap<String, usize>,
-    extension_usage: HashMap<String, usize>,
 }
 
 #[cfg(test)]

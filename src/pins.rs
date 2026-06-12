@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -80,34 +80,12 @@ impl Pins {
                 "Cannot save pins: HOME is not set (data_path is /dev/null fallback)"
             ));
         }
-        if let Some(parent) = self.data_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.data_path.with_extension("json.tmp");
-        let file = File::create(&temp_path)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&temp_path, permissions)?;
-        }
-
         let data = PinsData {
             version: PINS_VERSION,
             pins: self.entries.clone(),
         };
-
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &data)?;
-        writer.flush()?;
-        writer.into_inner()?.sync_all()?;
-
-        if let Err(e) = fs::rename(&temp_path, &self.data_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(e.into());
-        }
+        let bytes = serde_json::to_vec(&data)?;
+        crate::infrastructure::atomic_write(&self.data_path, &bytes)?;
         Ok(())
     }
 

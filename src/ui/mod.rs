@@ -140,27 +140,7 @@ pub fn truncate_to_display_width(s: &str, max_width: usize) -> String {
 /// Truncate so the result fits within `max_width` columns, appending `…`
 /// when truncation occurred. Returns the original string when it already
 /// fits. `max_width` < 1 produces an empty string.
-pub fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut width = 0;
-    let mut result = String::new();
-    for ch in s.chars() {
-        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_w > max_width.saturating_sub(1) {
-            break;
-        }
-        result.push(ch);
-        width += ch_w;
-    }
-    result.push('…');
-    result
-}
+pub use crate::text::truncate_with_ellipsis;
 
 /// Strip a project path down to its basename. Reserved for AI prompt
 /// generation (`summary.rs`) and for the `state.project_label` fallback —
@@ -195,6 +175,56 @@ pub fn cost_style(cost: f64) -> Style {
         theme::SUCCESS
     };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+/// Cost display that surfaces unknown pricing instead of a silent $0: "$?"
+/// when the whole figure is unknown, `format_cost` + "*" when only part of
+/// the session's models are priced (the figure is a lower bound). Pair with
+/// [`cost_style_marked`] so the mark also reads as a warning.
+pub(crate) fn format_cost_marked(cost: f64, unpriced: bool, precision: usize) -> String {
+    if !unpriced {
+        return format_cost(cost, precision);
+    }
+    if cost == 0.0 {
+        "$?".to_string()
+    } else {
+        format!("{}*", format_cost(cost, precision))
+    }
+}
+
+/// Style companion to [`format_cost_marked`]: unknown-pricing figures render
+/// in the warning color (matching the Models panel's unpriced mark) instead
+/// of the cost scale, which would paint a fake zero as cheap green.
+pub(crate) fn cost_style_marked(cost: f64, unpriced: bool) -> Style {
+    if unpriced {
+        Style::default().fg(theme::WARNING)
+    } else {
+        cost_style(cost)
+    }
+}
+
+/// Bottom help bar from `(key, action)` pairs, in the documented format:
+/// `key:action`, single-space separator, leading space on the first key, no
+/// trailing space after the last action (Footer format rule in gotchas.md).
+/// Every tab's bar routes through here so a new keybind can't pick up a
+/// per-tab styling or spacing variant.
+pub(crate) fn help_bar(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(pairs.len() * 2);
+    for (i, (key, action)) in pairs.iter().enumerate() {
+        let key_txt = if i == 0 {
+            format!(" {key}")
+        } else {
+            (*key).to_string()
+        };
+        let action_txt = if i + 1 == pairs.len() {
+            format!(":{action}")
+        } else {
+            format!(":{action} ")
+        };
+        spans.push(Span::styled(key_txt, Style::default().fg(theme::PRIMARY)));
+        spans.push(Span::styled(action_txt, Style::default().fg(theme::DIM)));
+    }
+    Line::from(spans)
 }
 
 pub(crate) fn format_cost(cost: f64, precision: usize) -> String {
@@ -619,11 +649,11 @@ pub fn update_pane_search_matches(pane: &mut ConversationPane) {
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
-    state.active_popup_area = None;
-    state.tools_detail_tab_areas.clear();
-    state.tools_panel_category_areas.clear();
-    state.mcp_server_row_areas.clear();
-    state.project_detail_row_areas.clear();
+    state.layout.active_popup_area = None;
+    state.layout.tools_detail_tab_areas.clear();
+    state.layout.tools_panel_category_areas.clear();
+    state.layout.mcp_server_row_areas.clear();
+    state.layout.project_detail_row_areas.clear();
 
     let show_warning =
         state.retention_warning.is_some() && !state.retention_warning_dismissed && !state.loading;
@@ -957,17 +987,15 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         }
     }
 
-    if state.show_detail && !state.show_conversation {
+    if state.show_detail() && !state.show_conversation {
         draw_detail_popup(frame, area, state);
     }
 
-    if state.show_dashboard_detail && !state.show_project_detail {
-        // Project detail stacks on top of Projects detail; suppress the
-        // underlying frame so its borders don't bleed around the inner popup.
+    if state.show_dashboard_detail() {
         dashboard::draw_dashboard_detail_popup(frame, area, state);
     }
 
-    if state.show_insights_detail {
+    if state.show_insights_detail() {
         insights::draw_insights_detail_popup(frame, area, state);
     }
 
@@ -976,10 +1004,10 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         // captured the last time draw_tabs ran are stale. They sit on the
         // exact row range that the conv view overwrites, and would otherwise
         // match clicks on widgets placed there (e.g. the per-pane [i] button).
-        state.filter_popup_area_trigger = None;
-        state.project_popup_area_trigger = None;
-        state.pin_view_trigger = None;
-        state.help_trigger = None;
+        state.layout.filter_popup_area_trigger = None;
+        state.layout.project_popup_area_trigger = None;
+        state.layout.pin_view_trigger = None;
+        state.layout.help_trigger = None;
 
         let conv_layout = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
         let conv_area = conv_layout[0];
@@ -1026,13 +1054,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
             if show_session_list {
                 draw_split_session_list(frame, layout[0], state, state.active_pane_index.is_none());
             } else {
-                state.session_list_area = None;
+                state.layout.session_list_area = None;
             }
 
             // Store pane areas for click detection
-            state.pane_areas.clear();
+            state.layout.pane_areas.clear();
             for i in 0..pane_count {
-                state.pane_areas.push(layout[i + layout_offset]);
+                state.layout.pane_areas.push(layout[i + layout_offset]);
             }
 
             let sessions: &[SessionInfo] = state
@@ -1058,33 +1086,25 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     &state.project_labels,
                 );
                 if is_active {
-                    state.conversation_content_area = ca;
+                    state.layout.conversation_content_area = ca;
                 }
             }
         } else {
-            state.pane_areas.clear();
+            state.layout.pane_areas.clear();
         }
 
-        let help_spans = vec![
-            Span::styled(" Esc", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":back ", Style::default().fg(theme::DIM)),
-            Span::styled("↑↓", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":scroll ", Style::default().fg(theme::DIM)),
-            Span::styled("/", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":search ", Style::default().fg(theme::DIM)),
-            Span::styled("i", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":info ", Style::default().fg(theme::DIM)),
-            Span::styled("s", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":summary ", Style::default().fg(theme::DIM)),
-            Span::styled("y", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":copy ", Style::default().fg(theme::DIM)),
-            Span::styled("H/L", Style::default().fg(theme::PRIMARY)),
-            Span::styled(":day", Style::default().fg(theme::DIM)),
-        ];
-        let help_line = Paragraph::new(Line::from(help_spans));
+        let help_line = Paragraph::new(help_bar(&[
+            ("Esc", "back"),
+            ("↑↓", "scroll"),
+            ("/", "search"),
+            ("i", "info"),
+            ("s", "summary"),
+            ("y", "copy"),
+            ("H/L", "day"),
+        ]));
         frame.render_widget(help_line, help_area);
 
-        if state.show_detail {
+        if state.show_detail() {
             let fp = state
                 .active_pane_index
                 .and_then(|i| state.panes.get(i))
@@ -1110,29 +1130,30 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
                     &state.project_labels,
                     &cumulative,
                     None,
+                    state.session_detail_recent.as_deref(),
                 );
-                state.active_popup_area = Some(pa);
+                state.layout.active_popup_area = Some(pa);
             }
         }
     }
 
-    if state.show_filter_popup {
+    if state.show_filter_popup() {
         draw_filter_popup(frame, area, state);
     }
 
-    if state.show_project_popup {
+    if state.show_project_popup() {
         draw_project_popup(frame, area, state);
     }
 
-    if state.show_summary {
+    if state.show_summary() {
         draw_summary(frame, chunks[3], state);
     }
 
-    if state.show_help {
+    if state.show_help() {
         draw_help_popup(frame, area, state);
     }
 
-    if state.show_project_detail {
+    if state.show_project_detail() {
         draw_project_detail_popup(frame, area, state);
     }
 
@@ -1148,7 +1169,7 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
         };
 
         let clamp_area = if state.show_conversation {
-            state.conversation_content_area.filter(|ca| {
+            state.layout.conversation_content_area.filter(|ca| {
                 start_row >= ca.y
                     && start_row < ca.y + ca.height
                     && start_col >= ca.x
@@ -1222,18 +1243,22 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         ),
     ];
 
-    let session_count: usize = state
-        .daily_groups
-        .iter()
-        .map(|g| g.user_sessions().count())
-        .sum();
-    // Always render session count, including 0. Suppressing on 0 made the header
-    // collapse into `CCSIGHT · cache N/M` with no indication that the active filter
-    // matched nothing — users mistook it for a load failure.
-    spans.push(Span::styled(
-        format!("  ·  {session_count} sessions"),
-        Style::default().fg(dim),
-    ));
+    // Suppress during the initial load — `0 sessions` next to the splash
+    // reads as "no data / load failed". Once loaded, always render it
+    // (including 0): a real `0` means the active filter matched nothing,
+    // which users mistook for a load failure when the span was hidden. The
+    // cache / index spans below stay visible while loading.
+    if !state.loading {
+        let session_count: usize = state
+            .daily_groups
+            .iter()
+            .map(|g| g.user_sessions().count())
+            .sum();
+        spans.push(Span::styled(
+            format!("  ·  {session_count} sessions"),
+            Style::default().fg(dim),
+        ));
+    }
 
     if let Some(ref cache) = state.cache_stats
         && cache.cached_files > 0
@@ -1331,7 +1356,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
     ];
 
     // Clear and rebuild tab areas
-    state.tab_areas.clear();
+    state.layout.tab_areas.clear();
     let mut current_x = area.x + 1; // Start after initial space
 
     let mut all_spans = vec![Span::styled(" ", Style::default())];
@@ -1345,6 +1370,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
         // Store clickable area for this tab
         state
+            .layout
             .tab_areas
             .push((*tab, Rect::new(current_x, area.y, tab_width as u16, 1)));
 
@@ -1410,7 +1436,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let gap = (right_x - current_x) as usize;
 
         let filter_area = Rect::new(right_x, area.y, filter_width, 1);
-        state.filter_popup_area_trigger = Some(filter_area);
+        state.layout.filter_popup_area_trigger = Some(filter_area);
         let filter_style = if state.period_filter != crate::PeriodFilter::All {
             Style::default()
                 .fg(theme::TEXT_DARK)
@@ -1423,7 +1449,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
         all_spans.push(Span::styled(filter_label, filter_style));
 
         let project_area = Rect::new(right_x + filter_width, area.y, project_width, 1);
-        state.project_popup_area_trigger = Some(project_area);
+        state.layout.project_popup_area_trigger = Some(project_area);
         let project_style = if state.project_filter.is_some() {
             Style::default()
                 .fg(theme::TEXT_DARK)
@@ -1436,21 +1462,21 @@ fn draw_tabs(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
         if pin_count > 0 {
             let pin_area = Rect::new(right_x + filter_width + project_width, area.y, pin_width, 1);
-            state.pin_view_trigger = Some(pin_area);
+            state.layout.pin_view_trigger = Some(pin_area);
             all_spans.push(Span::styled(pin_label, Style::default().fg(theme::WARNING)));
         } else {
-            state.pin_view_trigger = None;
+            state.layout.pin_view_trigger = None;
         }
 
         let help_x = right_x + filter_width + project_width + pin_width;
         let help_area = Rect::new(help_x, area.y, help_width, 1);
-        state.help_trigger = Some(help_area);
+        state.layout.help_trigger = Some(help_area);
         all_spans.push(Span::styled(help_label, Style::default().fg(theme::DIM)));
     } else {
-        state.filter_popup_area_trigger = None;
-        state.project_popup_area_trigger = None;
-        state.pin_view_trigger = None;
-        state.help_trigger = None;
+        state.layout.filter_popup_area_trigger = None;
+        state.layout.project_popup_area_trigger = None;
+        state.layout.pin_view_trigger = None;
+        state.layout.help_trigger = None;
     }
 
     let tab_line = Paragraph::new(Line::from(all_spans));
@@ -1742,35 +1768,23 @@ fn draw_live(frame: &mut Frame, area: Rect, state: &mut AppState) {
         width: paused_area.width.saturating_sub(2),
         height: paused_area.height.saturating_sub(2),
     };
-    state.live_list_area = Some((active_inner, state.live_scroll, active_count));
-    state.live_paused_list_area = Some((paused_inner, state.live_paused_scroll));
+    state.layout.live_list_area = Some((active_inner, state.live_scroll, active_count));
+    state.layout.live_paused_list_area = Some((paused_inner, state.live_paused_scroll));
 
     // Vocab matches Daily's session-list footer (:session for ↑↓, :view for
     // Enter, :info for i) so the same keys read the same way across tabs.
-    let help_spans = vec![
-        Span::styled(" ?", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":help ", Style::default().fg(theme::DIM)),
-        Span::styled("q", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":quit ", Style::default().fg(theme::DIM)),
-        Span::styled("↑↓", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":session ", Style::default().fg(theme::DIM)),
-        Span::styled("i", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":info ", Style::default().fg(theme::DIM)),
-        Span::styled("Enter", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":view ", Style::default().fg(theme::DIM)),
-        Span::styled("Space", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":pin ", Style::default().fg(theme::DIM)),
-        Span::styled("y", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":copy resume ", Style::default().fg(theme::DIM)),
-        Span::styled("←→", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":date ", Style::default().fg(theme::DIM)),
-        Span::styled("m", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":pins", Style::default().fg(theme::DIM)),
-    ];
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(Line::from(help_spans)),
-        chunks[1],
-    );
+    let help_line = help_bar(&[
+        ("?", "help"),
+        ("q", "quit"),
+        ("↑↓", "session"),
+        ("i", "info"),
+        ("Enter", "view"),
+        ("Space", "pin"),
+        ("y", "copy resume"),
+        ("←→", "date"),
+        ("m", "pins"),
+    ]);
+    frame.render_widget(ratatui::widgets::Paragraph::new(help_line), chunks[1]);
 }
 
 /// Past view: a single section listing the frozen alive set from one
@@ -1918,31 +1932,20 @@ fn draw_live_past(frame: &mut Frame, area: Rect, state: &mut AppState) {
     };
     // Past view = single section, so active_count == past_visible.len()
     // (every row participates in the same group). No paused frame here.
-    state.live_list_area = Some((inner_rect, state.live_scroll, past_visible.len()));
-    state.live_paused_list_area = None;
+    state.layout.live_list_area = Some((inner_rect, state.live_scroll, past_visible.len()));
+    state.layout.live_paused_list_area = None;
 
-    let help_spans = vec![
-        Span::styled(" ?", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":help ", Style::default().fg(theme::DIM)),
-        Span::styled("q", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":quit ", Style::default().fg(theme::DIM)),
-        Span::styled("↑↓", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":session ", Style::default().fg(theme::DIM)),
-        Span::styled("i", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":info ", Style::default().fg(theme::DIM)),
-        Span::styled("Enter", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":view ", Style::default().fg(theme::DIM)),
-        Span::styled("y", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":copy resume ", Style::default().fg(theme::DIM)),
-        Span::styled("←→", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":date ", Style::default().fg(theme::DIM)),
-        Span::styled("t", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":now", Style::default().fg(theme::DIM)),
-    ];
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(Line::from(help_spans)),
-        chunks[1],
-    );
+    let help_line = help_bar(&[
+        ("?", "help"),
+        ("q", "quit"),
+        ("↑↓", "session"),
+        ("i", "info"),
+        ("Enter", "view"),
+        ("y", "copy resume"),
+        ("←→", "date"),
+        ("t", "now"),
+    ]);
+    frame.render_widget(ratatui::widgets::Paragraph::new(help_line), chunks[1]);
 }
 
 /// Compact "start → last" range string for a Live row. Today-only ranges
@@ -2124,11 +2127,7 @@ fn render_live_row<'a>(
     let branch_short = session_meta.and_then(|m| {
         m.git_branch.as_ref().map(|b| {
             let name = b.split('/').next_back().unwrap_or(b);
-            if name.chars().count() > 12 {
-                format!("{}…", name.chars().take(11).collect::<String>())
-            } else {
-                name.to_string()
-            }
+            crate::text::truncate_with_ellipsis(name, 12)
         })
     });
 
@@ -2144,7 +2143,9 @@ fn render_live_row<'a>(
 
     let session_cost: f64 =
         session_meta.map_or(0.0, |m| m.cost(crate::aggregator::CostCalculator::global()));
-    let cost_str = format_cost(session_cost, 0);
+    let session_unpriced = session_meta
+        .is_some_and(|m| m.has_unpriced_model(crate::aggregator::CostCalculator::global()));
+    let cost_str = format_cost_marked(session_cost, session_unpriced, 0);
 
     let model_field = session_meta.and_then(|m| m.model.as_ref());
     let model_short = model_field.map(|m| crate::aggregator::normalize_model_name(m));
@@ -2238,7 +2239,7 @@ fn render_live_row<'a>(
     ));
     line1_spans.push(Span::styled(
         format!(" {cost_str}"),
-        cost_style(session_cost),
+        cost_style_marked(session_cost, session_unpriced),
     ));
     // Model badge is the lowest-priority trailing element — drop it
     // entirely on rows so tight that even `[i]` would otherwise be clipped.
@@ -2275,9 +2276,7 @@ fn render_live_row<'a>(
         ));
         width + 2
     } else {
-        let truncate_to = id_budget.saturating_sub(1).max(1);
-        let mut display: String = s.session_id.chars().take(truncate_to).collect();
-        display.push('…');
+        let display = crate::text::truncate_with_ellipsis(&s.session_id, id_budget);
         let width = unicode_width::UnicodeWidthStr::width(display.as_str());
         line1_spans.push(Span::styled(
             format!("  {display}"),
@@ -2444,7 +2443,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
         )
         .centered();
 
-    state.daily_header_area = Some(header_chunk);
+    state.layout.daily_header_area = Some(header_chunk);
     frame.render_widget(nav, header_chunk);
 
     let continued_count = sessions.iter().filter(|s| s.is_continued).count();
@@ -2509,6 +2508,9 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     let calculator = CostCalculator::global();
     let total_day_cost: f64 = all_sessions.iter().map(|s| s.cost(calculator)).sum();
+    let day_unpriced = all_sessions
+        .iter()
+        .any(|s| s.has_unpriced_model(calculator));
 
     let show_timeline = area.width >= 80;
     let (timeline_area, breakdown_area) = if let Some(stats_area) = stats_chunk {
@@ -2605,7 +2607,10 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                     ),
                     Span::styled(sub_suffix, Style::default().fg(theme::DIM)),
                     Span::styled(" ", Style::default().fg(theme::DIM)),
-                    Span::styled(format_cost(total_day_cost, 0), cost_style(total_day_cost)),
+                    Span::styled(
+                        format_cost_marked(total_day_cost, day_unpriced, 0),
+                        cost_style_marked(total_day_cost, day_unpriced),
+                    ),
                 ])
                 .alignment(ratatui::layout::Alignment::Center),
             );
@@ -2616,7 +2621,10 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                         format!("{active_hours}h "),
                         Style::default().fg(theme::SUCCESS),
                     ),
-                    Span::styled(format_cost(total_day_cost, 0), cost_style(total_day_cost)),
+                    Span::styled(
+                        format_cost_marked(total_day_cost, day_unpriced, 0),
+                        cost_style_marked(total_day_cost, day_unpriced),
+                    ),
                 ])
                 .alignment(ratatui::layout::Alignment::Center),
             );
@@ -2728,7 +2736,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             .collect()
     }
 
-    state.breakdown_panel_area = breakdown_area;
+    state.layout.breakdown_panel_area = breakdown_area;
     let breakdown_popup_data = if let Some(breakdown_rect) = breakdown_area {
         let outer_block = Block::default()
             .borders(Borders::ALL)
@@ -2853,7 +2861,8 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 .sum();
             let tokens_str = crate::format_number(session_tokens);
             let session_cost: f64 = s.cost(session_calculator);
-            let cost_str = format_cost(session_cost, 0);
+            let session_unpriced = s.has_unpriced_model(session_calculator);
+            let cost_str = format_cost_marked(session_cost, session_unpriced, 0);
 
             let model_short = s.model.as_ref().map_or_else(
                 || "?".to_string(),
@@ -2901,11 +2910,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
             let branch_short = s.git_branch.as_ref().map(|b| {
                 let name = b.split('/').next_back().unwrap_or(b);
-                if name.chars().count() > 12 {
-                    format!("{}…", name.chars().take(11).collect::<String>())
-                } else {
-                    name.to_string()
-                }
+                crate::text::truncate_with_ellipsis(name, 12)
             });
 
             let mut line1_spans = vec![Span::raw(prefix)];
@@ -2947,7 +2952,7 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
             ));
             line1_spans.push(Span::styled(
                 format!(" {cost_str}"),
-                cost_style(session_cost),
+                cost_style_marked(session_cost, session_unpriced),
             ));
             line1_spans.push(Span::styled(
                 format!(" [{model_short}]"),
@@ -3051,33 +3056,21 @@ fn draw_daily(frame: &mut Frame, area: Rect, state: &mut AppState) {
         visible_items_count,
     );
 
-    state.session_list_area = Some((sessions_chunk, scroll_offset, item_height as usize));
+    state.layout.session_list_area = Some((sessions_chunk, scroll_offset, item_height as usize));
 
-    let help_spans = vec![
-        Span::styled(" ?", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":help ", Style::default().fg(theme::DIM)),
-        Span::styled("q", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":quit ", Style::default().fg(theme::DIM)),
-        Span::styled("←→", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":day ", Style::default().fg(theme::DIM)),
-        Span::styled("↑↓", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":session ", Style::default().fg(theme::DIM)),
-        Span::styled("i", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":info ", Style::default().fg(theme::DIM)),
-        Span::styled("Enter", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":view ", Style::default().fg(theme::DIM)),
-        Span::styled("S", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":summary ", Style::default().fg(theme::DIM)),
-        Span::styled("b", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":breakdown ", Style::default().fg(theme::DIM)),
-        Span::styled("/", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":search ", Style::default().fg(theme::DIM)),
-        Span::styled("Space", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":pin ", Style::default().fg(theme::DIM)),
-        Span::styled("m", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":pins", Style::default().fg(theme::DIM)),
-    ];
-    let help_line = Paragraph::new(Line::from(help_spans));
+    let help_line = Paragraph::new(help_bar(&[
+        ("?", "help"),
+        ("q", "quit"),
+        ("←→", "day"),
+        ("↑↓", "session"),
+        ("i", "info"),
+        ("Enter", "view"),
+        ("S", "summary"),
+        ("b", "breakdown"),
+        ("/", "search"),
+        ("Space", "pin"),
+        ("m", "pins"),
+    ]));
     frame.render_widget(help_line, help_chunk);
 
     if let Some((items, models_start, tools_start)) = breakdown_popup_data {
@@ -3453,7 +3446,7 @@ fn draw_split_session_list(frame: &mut Frame, area: Rect, state: &mut AppState, 
     let mut list_state =
         ratatui::widgets::ListState::default().with_selected(Some(state.selected_session));
     frame.render_stateful_widget(list, area, &mut list_state);
-    state.session_list_area = Some((inner, list_state.offset(), item_height));
+    state.layout.session_list_area = Some((inner, list_state.offset(), item_height));
 }
 
 fn draw_conversation_pane(
@@ -3848,6 +3841,7 @@ fn draw_conversation_pane(
         };
         let work_tokens = session.work_tokens();
         let cost: f64 = session.cost(calculator);
+        let unpriced = session.has_unpriced_model(calculator);
 
         let summary = session
             .summary
@@ -3896,7 +3890,10 @@ fn draw_conversation_pane(
                 format!("  {}", crate::format_number(work_tokens)),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(format!("  {}", format_cost(cost, 0)), cost_style(cost)),
+            Span::styled(
+                format!("  {}", format_cost_marked(cost, unpriced, 0)),
+                cost_style_marked(cost, unpriced),
+            ),
             Span::styled(format!("  {short_id}"), Style::default().fg(theme::FAINT)),
         ];
         if !session.day_tool_usage.is_empty() {
@@ -3904,9 +3901,12 @@ fn draw_conversation_pane(
             // Tiebreaker: alphabetical by name (HashMap iteration order
             // is randomized, so tied counts would shuffle per frame).
             tools.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            // Width budget must measure the SAME string the row renders —
+            // the unpriced mark is one column wider than the plain form, and
+            // an underestimate lets the tool list overrun the pane.
             let prefix_width = dur.len()
                 + crate::format_number(work_tokens).len()
-                + format_cost(cost, 0).len()
+                + format_cost_marked(cost, unpriced, 0).len()
                 + short_id.len()
                 + 10;
             let max_width = info_rect.width.saturating_sub(2) as usize;
@@ -4373,7 +4373,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .border_style(Style::default().fg(theme::PRIMARY));
 
     let inner = block.inner(area);
-    state.summary_popup_area = Some(area);
+    state.layout.summary_popup_area = Some(area);
     frame.render_widget(block, area);
 
     if state.generating_summary {
@@ -4499,6 +4499,22 @@ fn draw_summary(frame: &mut Frame, area: Rect, state: &mut AppState) {
     frame.render_widget(paragraph, padded_inner);
 }
 
+/// Shared geometry for the major detail popups (Session / Dashboard / Insights)
+/// so they present at one consistent size instead of three ad-hoc rectangles.
+/// Centered in `area`, clamped to fit smaller terminals. 90 cols clears the
+/// widest fixed row (Session Detail's Tokens breakdown); 36 rows fit the stats
+/// plus a recent-conversation preview without immediate scrolling.
+pub(super) fn detail_popup_area(area: Rect) -> Rect {
+    let width = 90u16.min(area.width.saturating_sub(4));
+    let height = 36u16.min(area.height.saturating_sub(4));
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
 fn draw_session_detail(
     frame: &mut Frame,
     area: Rect,
@@ -4511,21 +4527,16 @@ fn draw_session_detail(
     // `(pid, status, started_at)` to append as a "Process" row. Set only
     // when the popup is opened from the Live tab; daily-tab opens pass None.
     live_extra: Option<&(u32, String, String)>,
+    // Last few `(role, one-line text)` messages for the "Recent conversation"
+    // section. `None` = still loading (shows "loading…").
+    recent: Option<&[(String, String)]>,
 ) -> Rect {
     use ratatui::widgets::Clear;
 
-    // 88 cols gives the Tokens row (work + total + in/out/cw/cr breakdown)
-    // room without clipping the trailing cr value, while still leaving a
-    // visible margin around the popup on a 120- or 140-wide terminal.
-    // Narrower terminals fall back to area width via the saturating sub.
-    let popup_width = 88u16.min(area.width.saturating_sub(4));
-    let popup_height = 24u16.min(area.height.saturating_sub(4));
-    let popup_area = Rect {
-        x: (area.width.saturating_sub(popup_width)) / 2,
-        y: (area.height.saturating_sub(popup_height)) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
+    // Shared size with the Dashboard / Insights detail popups (see
+    // `detail_popup_area`) so the three present identically.
+    let popup_area = detail_popup_area(area);
+    let popup_width = popup_area.width;
 
     frame.render_widget(Clear, popup_area);
 
@@ -4555,6 +4566,7 @@ fn draw_session_detail(
 
     let calculator = crate::aggregator::CostCalculator::global();
     let cost: f64 = session.cost(calculator);
+    let unpriced = session.has_unpriced_model(calculator);
 
     let model_name = session.model.as_ref().map_or_else(
         || "?".to_string(),
@@ -4620,6 +4632,42 @@ fn draw_session_detail(
         Span::raw("  "),
         Span::styled(summary_text, Style::default().fg(theme::TEXT_BRIGHT)),
     ]));
+
+    // Recent conversation: last few user/assistant text messages, one line
+    // each, oldest-first (newest sits next to the stats below). `None` = the
+    // background load hasn't returned yet; an empty result skips the section.
+    let show_recent = recent.is_none_or(|r| !r.is_empty());
+    if show_recent {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Recent conversation",
+            Style::default().fg(theme::PRIMARY).bold(),
+        )));
+        match recent {
+            None => lines.push(Line::from(Span::styled("    loading…", label_style))),
+            Some(msgs) => {
+                let avail = popup_width.saturating_sub(2).saturating_sub(6) as usize;
+                for (role, text) in msgs {
+                    let is_user = role == "user";
+                    let glyph_style = if is_user {
+                        Style::default().fg(theme::PRIMARY)
+                    } else {
+                        Style::default().fg(theme::DIM)
+                    };
+                    let text_style = if is_user {
+                        Style::default().fg(theme::LABEL_SUBTLE)
+                    } else {
+                        Style::default().fg(theme::DIM)
+                    };
+                    let glyph = if is_user { "❯" } else { "⬡" };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("    {glyph} "), glyph_style),
+                        Span::styled(truncate_with_ellipsis(text, avail), text_style),
+                    ]));
+                }
+            }
+        }
+    }
     lines.push(Line::from(""));
 
     // Time
@@ -4842,7 +4890,10 @@ fn draw_session_detail(
     ]));
     lines.push(Line::from(vec![
         Span::styled("  Cost      ", label_style),
-        Span::styled(format_cost(cost, 2), cost_style(cost)),
+        Span::styled(
+            format_cost_marked(cost, unpriced, 2),
+            cost_style_marked(cost, unpriced),
+        ),
     ]));
 
     if multi_day {
@@ -4883,7 +4934,10 @@ fn draw_session_detail(
         ]));
         lines.push(Line::from(vec![
             Span::styled("  Cost      ", label_style),
-            Span::styled(format_cost(cumulative.cost, 2), cost_style(cumulative.cost)),
+            Span::styled(
+                format_cost_marked(cumulative.cost, cumulative.unpriced, 2),
+                cost_style_marked(cumulative.cost, cumulative.unpriced),
+            ),
         ]));
     }
 
@@ -4900,9 +4954,11 @@ fn draw_session_detail(
         for (model, tokens) in &models {
             let normalized = crate::aggregator::normalize_model_name(model);
             let clr = model_color(model);
-            let model_cost = calculator
-                .calculate_cost(tokens, Some(model))
-                .unwrap_or(0.0);
+            // `None` here is the per-model unpriced signal — render "$?" so
+            // the row can't read as a free model next to the marked Cost row.
+            let model_cost = calculator.calculate_cost(tokens, Some(model));
+            let unknown = model_cost.is_none();
+            let model_cost = model_cost.unwrap_or(0.0);
             lines.push(Line::from(vec![
                 Span::styled(format!("    {normalized:<16}"), Style::default().fg(clr)),
                 Span::styled(
@@ -4910,8 +4966,8 @@ fn draw_session_detail(
                     Style::default().fg(theme::PRIMARY),
                 ),
                 Span::styled(
-                    format!("  {}", format_cost(model_cost, 0)),
-                    cost_style(model_cost),
+                    format!("  {}", format_cost_marked(model_cost, unknown, 0)),
+                    cost_style_marked(model_cost, unknown),
                 ),
             ]));
         }
@@ -5017,8 +5073,9 @@ fn draw_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         &state.project_labels,
         &cumulative,
         live_extra.as_ref(),
+        state.session_detail_recent.as_deref(),
     );
-    state.active_popup_area = Some(popup_area);
+    state.layout.active_popup_area = Some(popup_area);
 }
 
 struct SessionCumulative {
@@ -5028,6 +5085,9 @@ struct SessionCumulative {
     cache_creation: u64,
     cache_read: u64,
     cost: f64,
+    /// Any contributing day carried an unpriced model — `cost` is a lower
+    /// bound and displays must mark it instead of presenting a real total.
+    unpriced: bool,
     user_msgs: u64,
     assistant_msgs: u64,
     /// `None` when no sessions matched (empty result). Avoids the sentinel
@@ -5049,6 +5109,7 @@ fn compute_session_cumulative(
         cache_creation: 0,
         cache_read: 0,
         cost: 0.0,
+        unpriced: false,
         user_msgs: 0,
         assistant_msgs: 0,
         earliest_start: None,
@@ -5068,6 +5129,7 @@ fn compute_session_cumulative(
                 }
                 let cost: f64 = s.cost(calculator);
                 cum.cost += cost;
+                cum.unpriced |= s.has_unpriced_model(calculator);
                 cum.earliest_start = Some(match cum.earliest_start {
                     Some(prev) if prev < s.day_first_timestamp => prev,
                     _ => s.day_first_timestamp,
@@ -5150,11 +5212,7 @@ fn draw_breakdown_detail_popup(
         };
 
         let bar_len = (pct / 100.0 * 8.0).round().min(8.0) as usize;
-        let bar = format!(
-            "{}{}",
-            "█".repeat(bar_len.max(1)),
-            "░".repeat(8 - bar_len.max(1))
-        );
+        let bar = crate::text::hbar(bar_len.max(1), 8);
 
         // pct already carries the share scaled to hundreds; reuse the
         // canonical formatter so the sub-one bucket renders consistently.
@@ -5222,7 +5280,7 @@ fn draw_filter_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
         height: popup_height,
     };
 
-    state.filter_popup_area = Some(popup_area);
+    state.layout.filter_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -5337,7 +5395,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
         height: popup_height,
     };
 
-    state.project_popup_area = Some(popup_area);
+    state.layout.project_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
     // Inner content rows = popup_height - 2 (top + bottom border). `title_bottom`
@@ -5569,7 +5627,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     let today = chrono::Local::now().date_naive();
     let path = state.project_detail_path.clone();
     if path.is_empty() {
-        state.show_project_detail = false;
+        state.active_popup = crate::ActivePopup::None;
         return;
     }
 
@@ -5581,7 +5639,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         width: popup_width,
         height: popup_height,
     };
-    state.active_popup_area = Some(popup_area);
+    state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
     // Aggregate everything in one pass over the daily groups so we don't walk
@@ -5612,11 +5670,14 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         chrono::NaiveDate,
         u64,
         f64,
+        bool, // unpriced — cost is a lower bound, mark it
         Option<String>,
         std::path::PathBuf,
         Option<String>,
         i64,
     )> = Vec::new();
+    let mut project_unpriced = false;
+    let mut unpriced_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     for group in &state.daily_groups {
         for session in &group.sessions {
             if session.is_subagent || session.project_name != path {
@@ -5630,12 +5691,15 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             total_turns += session.day_user_msgs;
             let sess_cost: f64 = session.cost(calculator);
             total_cost += sess_cost;
+            let sess_unpriced = session.has_unpriced_model(calculator);
+            project_unpriced |= sess_unpriced;
             for (model, tokens) in &session.day_tokens_by_model {
-                let c = calculator
-                    .calculate_cost(tokens, Some(model))
-                    .unwrap_or(0.0);
+                let c = calculator.calculate_cost(tokens, Some(model));
                 let normalized = crate::aggregator::normalize_model_name(model);
-                *model_cost.entry(normalized).or_insert(0.0) += c;
+                if c.is_none() {
+                    unpriced_models.insert(normalized.clone());
+                }
+                *model_cost.entry(normalized).or_insert(0.0) += c.unwrap_or(0.0);
             }
             for (tool, count) in &session.day_tool_usage {
                 *tool_count.entry(tool.clone()).or_insert(0) += count;
@@ -5651,6 +5715,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
                 group.date,
                 sess_tokens,
                 sess_cost,
+                sess_unpriced,
                 session.model.clone(),
                 session.file_path.clone(),
                 session.git_branch.clone(),
@@ -5697,7 +5762,10 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     // popup's inner width (88 cols) even when `(N session-days)` is shown.
     content.push(Line::from(vec![
         Span::styled("  Cost  ", label_dim),
-        Span::styled(format_cost(total_cost, 2), cost_style(total_cost)),
+        Span::styled(
+            format_cost_marked(total_cost, project_unpriced, 2),
+            cost_style_marked(total_cost, project_unpriced),
+        ),
         Span::styled("   Tokens ", label_dim),
         Span::styled(crate::format_number(total_tokens), primary_bold),
         Span::styled("   Sessions ", label_dim),
@@ -5737,8 +5805,10 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
     ]));
     content.push(Line::from(""));
 
-    // Top models by cost share (cumulative across all days).
-    if total_cost > 0.0 {
+    // Top models by cost share (cumulative across all days). Unpriced models
+    // must keep the section alive (their share is unknown, not zero) — hiding
+    // it would erase the only clue that the project's cost is a lower bound.
+    if total_cost > 0.0 || !unpriced_models.is_empty() {
         let mut models: Vec<(String, f64)> = model_cost.into_iter().collect();
         models.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         content.push(Line::from(Span::styled(
@@ -5746,10 +5816,19 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
             Style::default().fg(theme::PRIMARY).bold(),
         )));
         for (name, cost) in models.iter().take(5) {
-            let pct_str = crate::text::format_pct_f64(*cost, total_cost);
+            let unknown = unpriced_models.contains(name);
+            let pct_str = if unknown {
+                "—".to_string()
+            } else {
+                crate::text::format_pct_f64(*cost, total_cost)
+            };
             let clr = model_color(name);
             let bar_w = 18usize;
-            let filled = ((cost / total_cost) * bar_w as f64).round() as usize;
+            let filled = if total_cost > 0.0 {
+                ((cost / total_cost) * bar_w as f64).round() as usize
+            } else {
+                0
+            };
             let bar = format!(
                 "{}{}",
                 "█".repeat(filled.min(bar_w)),
@@ -5759,7 +5838,10 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
                 Span::raw("  "),
                 Span::styled(bar, Style::default().fg(clr)),
                 Span::styled(format!("  {name:<14}"), Style::default().fg(clr)),
-                Span::styled(format!("{} ", format_cost(*cost, 0)), primary_bold),
+                Span::styled(
+                    format!("{} ", format_cost_marked(*cost, unknown, 0)),
+                    cost_style_marked(*cost, unknown),
+                ),
                 Span::styled(pct_str, label_dim),
             ]));
         }
@@ -5815,7 +5897,7 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
         "      date       branch   duration   tokens     cost      model",
         Style::default().fg(theme::LABEL_SUBTLE),
     )]));
-    for (i, (date, tokens, cost, model, file_path, branch, duration_mins)) in
+    for (i, (date, tokens, cost, unpriced, model, file_path, branch, duration_mins)) in
         sessions_rev.iter().take(10).enumerate()
     {
         let model_short = model.as_ref().map_or_else(
@@ -5846,7 +5928,10 @@ fn draw_project_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState
                 format!("{:>9}", crate::format_number(*tokens)),
                 Style::default().fg(theme::PRIMARY),
             ),
-            Span::styled(format!("  {}", format_cost(*cost, 2)), cost_style(*cost)),
+            Span::styled(
+                format!("  {}", format_cost_marked(*cost, *unpriced, 2)),
+                cost_style_marked(*cost, *unpriced),
+            ),
             Span::styled(
                 format!("  [{model_short}]"),
                 Style::default().fg(theme::SECONDARY),
@@ -5934,7 +6019,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
         height: popup_height,
     };
 
-    state.active_popup_area = Some(popup_area);
+    state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
     let mut content = vec![
@@ -6100,7 +6185,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
     frame.render_widget(Clear, popup_area);
 
     let inner = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(popup_area);
-    state.search_results_area = Some(inner[1]);
+    state.layout.search_results_area = Some(inner[1]);
 
     // Pre-parse the input so the title can echo back the recognised
     // filters as bracketed chips. Treats the title as feedback: the
@@ -6287,7 +6372,8 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                 let tokens = crate::format_number(session.work_tokens());
 
                 let session_cost: f64 = session.cost(cost_calculator);
-                let cost_str = format_cost(session_cost, 0);
+                let session_unpriced = session.has_unpriced_model(cost_calculator);
+                let cost_str = format_cost_marked(session_cost, session_unpriced, 0);
 
                 let model_short = session
                     .model
@@ -6388,7 +6474,7 @@ fn draw_search_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState)
                         if selected {
                             sel_style
                         } else {
-                            cost_style(session_cost)
+                            cost_style_marked(session_cost, session_unpriced)
                         },
                     ),
                     Span::styled(
@@ -6987,6 +7073,108 @@ mod tests {
         text
     }
 
+    // Golden footers: the exact bottom-bar text per tab, in the documented
+    // `key:action` single-space format. Written against the hand-rolled span
+    // lists BEFORE the help_bar consolidation so the refactor is provably
+    // byte-identical; afterwards they pin the helper's spacing rules.
+    #[test]
+    fn tab_footers_render_exact_golden_strings() {
+        let cases: [(crate::Tab, &str); 3] = [
+            (
+                crate::Tab::Dashboard,
+                " ?:help q:quit ←→:panel ↑↓:scroll Enter:detail /:search m:pins",
+            ),
+            (
+                crate::Tab::Daily,
+                " ?:help q:quit ←→:day ↑↓:session i:info Enter:view S:summary b:breakdown /:search Space:pin m:pins",
+            ),
+            (
+                crate::Tab::Insights,
+                " ?:help q:quit ←→:panel ↑↓:scroll Enter:detail /:search m:pins",
+            ),
+        ];
+        for (tab, golden) in cases {
+            let mut state = create_test_state();
+            state.tab = tab;
+            let text = render_to_text(&mut state, 140, 45);
+            assert!(
+                text.contains(golden),
+                "footer golden mismatch for tab — expected {golden:?} in:\n{}",
+                text.lines().rev().take(3).collect::<Vec<_>>().join("\n")
+            );
+        }
+    }
+
+    // The Activity panel's bottom border carries a left date label and a
+    // right-aligned intensity legend; the legend must drop (not overlap the
+    // date) when the panel can't fit both.
+    #[test]
+    fn activity_legend_shown_wide_dropped_narrow() {
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        let wide = render_to_text(&mut state, 140, 45);
+        assert!(wide.contains("Less"), "intensity legend at 140 cols");
+
+        // 30 cols leaves the panel narrower than date + legend; the date
+        // keeps the border line and the legend must drop, not overlap it.
+        let mut state = create_test_state();
+        state.tab = crate::Tab::Dashboard;
+        let narrow = render_to_text(&mut state, 30, 20);
+        assert!(
+            !narrow.contains("Less"),
+            "legend must drop when date + legend can't both fit"
+        );
+    }
+
+    #[test]
+    fn format_cost_marked_surfaces_unknown_pricing() {
+        // Fully unknown → "$?", partially priced → lower bound + "*",
+        // fully priced → plain format_cost.
+        assert_eq!(format_cost_marked(0.0, true, 0), "$?");
+        assert_eq!(format_cost_marked(5.0, true, 0), "$5.0*");
+        assert_eq!(format_cost_marked(5.0, false, 0), "$5.0");
+    }
+
+    // A session whose model has no pricing entry must show "$?" in the Daily
+    // list — a silent $0 reads as "this session was free", which is wrong.
+    #[test]
+    fn daily_row_unknown_model_cost_shows_question_not_zero() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let session = make_session_with_tokens("~/proj", 1000, 500, "mystery-model-x");
+        let mut state = make_test_app_state(vec![make_daily_group(date, vec![session])]);
+        state.tab = crate::Tab::Daily;
+        let text = render_to_text(&mut state, 140, 45);
+        assert!(
+            text.contains("$?"),
+            "unknown pricing must render $?, not $0"
+        );
+    }
+
+    /// Render, then return only the text WITHIN the active popup's rect
+    /// (`state.layout.active_popup_area`, set by `draw`). Scoping `contains()` to the
+    /// popup avoids the false-positive class where a match lands on the panel
+    /// BEHIND the popup (e.g. a stripped name that also appears in a background
+    /// list). Empty string when no popup is open.
+    fn render_popup_text(state: &mut crate::AppState, width: u16, height: u16) -> String {
+        let buffer = render_buffer(state, width, height);
+        let Some(rect) = state.layout.active_popup_area else {
+            return String::new();
+        };
+        let mut text = String::new();
+        let x1 = (rect.x + rect.width).min(buffer.area.width);
+        let y1 = (rect.y + rect.height).min(buffer.area.height);
+        for y in rect.y..y1 {
+            for x in rect.x..x1 {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     fn render_buffer(
         state: &mut crate::AppState,
         width: u16,
@@ -7015,35 +7203,38 @@ mod tests {
         use ratatui::layout::Rect;
         let mut state = create_test_state();
         state.show_conversation = true;
-        state.help_trigger = Some(Rect {
+        state.layout.help_trigger = Some(Rect {
             x: 1,
             y: 1,
             width: 3,
             height: 1,
         });
-        state.filter_popup_area_trigger = Some(Rect {
+        state.layout.filter_popup_area_trigger = Some(Rect {
             x: 1,
             y: 1,
             width: 5,
             height: 1,
         });
-        state.project_popup_area_trigger = Some(Rect {
+        state.layout.project_popup_area_trigger = Some(Rect {
             x: 1,
             y: 1,
             width: 5,
             height: 1,
         });
-        state.pin_view_trigger = Some(Rect {
+        state.layout.pin_view_trigger = Some(Rect {
             x: 1,
             y: 1,
             width: 3,
             height: 1,
         });
         let _ = render_to_text(&mut state, 140, 45);
-        assert!(state.help_trigger.is_none(), "help_trigger must clear");
-        assert!(state.filter_popup_area_trigger.is_none());
-        assert!(state.project_popup_area_trigger.is_none());
-        assert!(state.pin_view_trigger.is_none());
+        assert!(
+            state.layout.help_trigger.is_none(),
+            "help_trigger must clear"
+        );
+        assert!(state.layout.filter_popup_area_trigger.is_none());
+        assert!(state.layout.project_popup_area_trigger.is_none());
+        assert!(state.layout.pin_view_trigger.is_none());
     }
 
     #[test]
@@ -7127,7 +7318,7 @@ mod tests {
     fn test_draw_insights_detail_popup_renders() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
-        state.show_insights_detail = true;
+        state.active_popup = crate::ActivePopup::InsightsDetail;
 
         let panel_markers = [
             (0, "Cache Hit Rate"),
@@ -7149,7 +7340,7 @@ mod tests {
     fn test_draw_dashboard_detail_popup_renders() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
 
         let panel_markers = [
             (0, "Daily Costs"),
@@ -7188,7 +7379,7 @@ mod tests {
             .insert("skill:my-skill".to_string(), 3);
         state.stats.tool_usage.insert("agent:type-a".to_string(), 2);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
 
         let text = render_to_text(&mut state, 140, 35);
@@ -7226,7 +7417,7 @@ mod tests {
             .tool_usage
             .insert("skill:my-skill".to_string(), 3);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
 
         // Render populates `tools_detail_tab_areas` as a side effect.
@@ -7238,10 +7429,10 @@ mod tests {
             .expect("tab bar line should be in the rendered buffer");
 
         assert!(
-            !state.tools_detail_tab_areas.is_empty(),
+            !state.layout.tools_detail_tab_areas.is_empty(),
             "tab click areas should be recorded after render"
         );
-        for (idx, rect) in &state.tools_detail_tab_areas {
+        for (idx, rect) in &state.layout.tools_detail_tab_areas {
             assert_eq!(
                 rect.y as usize, drawn_row,
                 "tab {idx} click Rect (y={}) must align with the drawn tab row {drawn_row}",
@@ -7276,7 +7467,7 @@ mod tests {
             state.tool_last_used.insert(k.to_string(), ts);
         }
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.dashboard_ecosystem_sort = crate::state::RankSort::Recency;
         // Render each section (0=Tools,1=Skills,2=Commands,3=Subagents) — none
@@ -7357,7 +7548,7 @@ mod tests {
         );
         state.tab = crate::Tab::Dashboard;
         state.dashboard_panel = 0;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         // Past the end — the popup clamps to the last full line-based page.
         state.dashboard_scroll[0] = 9999;
         let text = render_to_text(&mut state, 140, 35);
@@ -7376,7 +7567,7 @@ mod tests {
             .tool_usage
             .insert("mcp__server1__tool".to_string(), 4);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
 
         state.dashboard_ecosystem_sort = crate::state::RankSort::Recency;
@@ -7410,7 +7601,7 @@ mod tests {
                 .insert(format!("mcp__srv{n:02}__tool"), 60 - n);
         }
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.tools_detail_section = 0; // Tools tab (Built-in + MCP)
         state.dashboard_scroll[3] = 4; // force a scrolled viewport
@@ -7421,10 +7612,10 @@ mod tests {
             "the body must actually be scrolled to exercise the offset"
         );
         assert!(
-            !state.mcp_server_row_areas.is_empty(),
+            !state.layout.mcp_server_row_areas.is_empty(),
             "server rows should be recorded after render"
         );
-        for (idx, rect) in &state.mcp_server_row_areas {
+        for (idx, rect) in &state.layout.mcp_server_row_areas {
             let row_text: String = (0..buffer.area.width)
                 .map(|x| buffer[(x, rect.y)].symbol())
                 .collect();
@@ -7446,13 +7637,15 @@ mod tests {
             .tool_usage
             .insert("skill:my-skill".to_string(), 3);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
 
         // Active = 0 (Tools): body should show the synthetic Built-in group row
         // (collapsed by default — individual tool names appear only when expanded).
+        // `render_popup_text` scopes to the popup so background tool rows can't
+        // satisfy these assertions.
         state.tools_detail_section = 0;
-        let text = render_to_text(&mut state, 140, 35);
+        let text = render_popup_text(&mut state, 140, 35);
         assert!(
             text.contains("Built-in"),
             "Tools body should show the Built-in group row. Got:\n{text}"
@@ -7460,18 +7653,22 @@ mod tests {
 
         // Expanding the Built-in group should reveal Bash.
         state.mcp_expanded_servers.insert("Built-in".to_string());
-        let text = render_to_text(&mut state, 140, 35);
+        let text = render_popup_text(&mut state, 140, 35);
         assert!(
             text.contains("Bash"),
             "expanded Built-in group should show Bash. Got:\n{text}"
         );
 
-        // Active = 1 (Skills, since Tools merge collapsed Built-in+MCP into idx 0).
+        // Active = 1 (Skills; Tools merge collapsed Built-in+MCP into idx 0).
+        // The Skills section shows the stripped name (`format_tool_short` drops
+        // the `skill:` prefix). Scope to the popup rect: the raw `skill:my-skill`
+        // key also renders in the Ecosystem panel BEHIND the popup, so a
+        // whole-frame assertion would false-positive on it.
         state.tools_detail_section = 1;
-        let text = render_to_text(&mut state, 140, 35);
+        let text = render_popup_text(&mut state, 140, 35);
         assert!(
-            text.contains("skill:my-skill"),
-            "Skills body should show skill:my-skill. Got:\n{text}"
+            text.contains("my-skill") && !text.contains("skill:my-skill"),
+            "Skills popup body should show the stripped name `my-skill`. Got:\n{text}"
         );
     }
 
@@ -7493,7 +7690,7 @@ mod tests {
                 .insert(format!("skill:my-skill{i:02}"), 1);
         }
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.tools_detail_section = 1;
         state.dashboard_scroll[3] = 0;
@@ -7523,7 +7720,7 @@ mod tests {
         let mut state = create_test_state();
         state.stats.tool_usage.insert("Bash".to_string(), 5);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.tools_detail_section = 2; // Subagents (empty)
 
@@ -7711,7 +7908,7 @@ mod tests {
             .tool_usage
             .insert("mcp__server1__action2".to_string(), 2);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.tools_detail_section = 0;
         assert!(state.mcp_expanded_servers.is_empty());
@@ -7758,7 +7955,7 @@ mod tests {
             .tool_sessions
             .insert("mcp__server1__action2".to_string(), 2);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.tools_detail_section = 0;
         state.mcp_expanded_servers.insert("server1".to_string());
@@ -7812,7 +8009,7 @@ mod tests {
             .mcp_server_sessions
             .insert("orgA/serverB".to_string(), 1);
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 3;
         state.tools_detail_section = 0; // Tools tab (Built-in + MCP merged)
 
@@ -7960,7 +8157,7 @@ mod tests {
         // warning so the user is not silently undercharged in the cost summary.
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 2; // Models panel
 
         // Inject the unknown model into both:
@@ -7998,7 +8195,7 @@ mod tests {
         // Regression: `Xs` suffix is confusable with seconds. Must be `X ses`.
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 1; // Projects
 
         let text = render_to_text(&mut state, 140, 35);
@@ -8015,7 +8212,7 @@ mod tests {
     #[test]
     fn test_draw_help_overlay_renders() {
         let mut state = create_test_state();
-        state.show_help = true;
+        state.active_popup = crate::ActivePopup::Help;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
             text.contains("Switch tabs"),
@@ -8214,7 +8411,7 @@ mod tests {
             render_to_text(&mut state, 120, 35);
         }
 
-        state.show_insights_detail = true;
+        state.active_popup = crate::ActivePopup::InsightsDetail;
         for panel in 0..4 {
             state.insights_panel = panel;
             render_to_text(&mut state, 120, 35);
@@ -8225,7 +8422,7 @@ mod tests {
     fn test_insights_detail_popup_calendar_days_consistency() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
-        state.show_insights_detail = true;
+        state.active_popup = crate::ActivePopup::InsightsDetail;
         state.insights_panel = 0;
 
         let text = render_to_text(&mut state, 120, 35);
@@ -8251,7 +8448,7 @@ mod tests {
         // show_insights_detail is checked outside of tab guard in draw()
         // Verify it doesn't panic on Dashboard or Daily tabs
         let mut state = create_test_state();
-        state.show_insights_detail = true;
+        state.active_popup = crate::ActivePopup::InsightsDetail;
         state.insights_panel = 0;
 
         state.tab = crate::Tab::Dashboard;
@@ -8265,7 +8462,7 @@ mod tests {
     fn test_model_efficiency_in_detail_popup() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Dashboard;
-        state.show_dashboard_detail = true;
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.dashboard_panel = 2;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
@@ -8293,7 +8490,7 @@ mod tests {
     fn test_monthly_actual_in_insights_detail() {
         let mut state = create_test_state();
         state.tab = crate::Tab::Insights;
-        state.show_insights_detail = true;
+        state.active_popup = crate::ActivePopup::InsightsDetail;
         state.insights_panel = 3;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
@@ -8405,7 +8602,7 @@ mod tests {
     #[test]
     fn test_filter_popup_renders() {
         let mut state = create_test_state();
-        state.show_filter_popup = true;
+        state.active_popup = crate::ActivePopup::FilterPopup;
         state.filter_popup_selected = 2;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
@@ -8422,7 +8619,7 @@ mod tests {
     #[test]
     fn test_help_popup_shows_filter_keybind() {
         let mut state = create_test_state();
-        state.show_help = true;
+        state.active_popup = crate::ActivePopup::Help;
         let text = render_to_text(&mut state, 120, 40);
         assert!(
             text.contains("period filter"),
@@ -8433,7 +8630,7 @@ mod tests {
     #[test]
     fn test_project_popup_renders() {
         let mut state = create_test_state();
-        state.show_project_popup = true;
+        state.active_popup = crate::ActivePopup::ProjectPopup;
         state.project_popup_selected = 1;
         let text = render_to_text(&mut state, 120, 35);
         assert!(
@@ -8535,9 +8732,9 @@ mod tests {
         state.tab = crate::Tab::Daily;
         state.selected_day = 1;
         state.selected_session = 0;
-        state.show_detail = true;
+        state.active_popup = crate::ActivePopup::Detail;
 
-        let text = render_to_text(&mut state, 140, 40);
+        let text = render_popup_text(&mut state, 140, 40);
         let expected = past_date.format("[%Y-%m-%d (%a)]").to_string();
         assert!(
             text.contains(&expected),
@@ -8547,6 +8744,88 @@ mod tests {
         assert!(
             !text.contains("[Today]"),
             "past-day popup must not label its slice as [Today] — got:\n{text}"
+        );
+    }
+
+    // A mixed-model session (one priced, one unpriced) must mark BOTH the
+    // Cost row (lower-bound "*") and the unpriced model's breakdown row
+    // ("$?") — an unmarked $0 next to a marked total reads as a free model.
+    #[test]
+    fn session_detail_marks_unpriced_model_in_cost_and_breakdown() {
+        use crate::test_helpers::helpers::{
+            make_daily_group, make_session_with_tokens, make_test_app_state,
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let mut session = make_session_with_tokens("~/proj", 1000, 500, "claude-sonnet-4-6");
+        session.day_tokens_by_model.insert(
+            "mystery-model-x".to_string(),
+            crate::aggregator::TokenStats {
+                input_tokens: 200,
+                output_tokens: 100,
+                ..Default::default()
+            },
+        );
+        let mut state = make_test_app_state(vec![make_daily_group(date, vec![session])]);
+        state.tab = crate::Tab::Daily;
+        state.selected_day = 0;
+        state.selected_session = 0;
+        state.active_popup = crate::ActivePopup::Detail;
+
+        let text = render_popup_text(&mut state, 140, 40);
+        assert!(
+            text.contains("$?"),
+            "unpriced model's breakdown row must show $? — got:\n{text}"
+        );
+        assert!(
+            text.contains('*'),
+            "mixed-model Cost row must carry the lower-bound mark — got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_session_detail_recent_conversation_renders_and_loading_state() {
+        use crate::test_helpers::helpers::{make_daily_group, make_session, make_test_app_state};
+        let date = chrono::Local::now().date_naive();
+        let groups = vec![make_daily_group(
+            date,
+            vec![make_session("~/proj", None, Some("main"))],
+        )];
+        let mut state = make_test_app_state(groups.clone());
+        state.original_daily_groups = groups;
+        state.tab = crate::Tab::Daily;
+        state.selected_day = 0;
+        state.selected_session = 0;
+        state.active_popup = crate::ActivePopup::Detail;
+
+        // Loaded → section renders the messages with role glyphs. Scope to
+        // the popup rect so background panels can't satisfy the assertions.
+        state.session_detail_recent = Some(vec![
+            (
+                "user".to_string(),
+                "how should the preview look".to_string(),
+            ),
+            ("assistant".to_string(), "one line per message".to_string()),
+        ]);
+        let text = render_popup_text(&mut state, 140, 40);
+        assert!(
+            text.contains("Recent conversation"),
+            "section header: {text}"
+        );
+        assert!(
+            text.contains("how should the preview look"),
+            "user message text: {text}"
+        );
+        assert!(
+            text.contains('❯') && text.contains('⬡'),
+            "user/assistant role glyphs: {text}"
+        );
+
+        // Still loading (background task not yet returned) → placeholder.
+        state.session_detail_recent = None;
+        let text = render_popup_text(&mut state, 140, 40);
+        assert!(
+            text.contains("Recent conversation") && text.contains("loading"),
+            "loading placeholder: {text}"
         );
     }
 

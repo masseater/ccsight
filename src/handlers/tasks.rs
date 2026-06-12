@@ -31,12 +31,11 @@ pub(crate) fn spawn_clipboard_write(text: String) -> mpsc::Receiver<Result<(), S
 }
 
 /// Spawn an AI session-summary task (generate or regenerate) and stash the
-/// receiver in `state.summary_task`. Also flips the `generating_summary` /
-/// `show_summary` / `summary_type` UI flags so the popup is shown immediately.
+/// receiver in `state.summary_task`. Also sets `generating_summary`,
+/// `active_popup = Summary`, and `summary_type` so the popup shows immediately.
 pub(crate) fn start_session_summary(state: &mut AppState, session: SessionInfo, regenerate: bool) {
     state.generating_summary = true;
-    state.show_summary = true;
-    state.show_detail = false;
+    state.active_popup = crate::ActivePopup::Summary;
     state.summary_type = Some(SummaryType::Session(Box::new(session.clone())));
     let summary_date = state.daily_groups.get(state.selected_day).map(|g| g.date);
     let (tx, rx) = mpsc::channel();
@@ -55,8 +54,7 @@ pub(crate) fn start_session_summary(state: &mut AppState, session: SessionInfo, 
 /// effects as [`start_session_summary`] but for `SummaryType::Day`.
 pub(crate) fn start_day_summary(state: &mut AppState, group: DailyGroup, regenerate: bool) {
     state.generating_summary = true;
-    state.show_summary = true;
-    state.show_detail = false;
+    state.active_popup = crate::ActivePopup::Summary;
     state.summary_type = Some(SummaryType::Day(group.clone()));
     let (tx, rx) = mpsc::channel();
     state.summary_task = Some(rx);

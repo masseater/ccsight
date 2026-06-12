@@ -198,6 +198,33 @@ pub fn load_conversation(
     Ok(messages)
 }
 
+/// Last `n` user/assistant messages that carry visible text, oldest-first,
+/// each collapsed to a single line `(role, text)`. Tool-only / thinking-only
+/// turns are skipped so the Session Detail "Recent conversation" preview reads
+/// as an actual exchange rather than a wall of `(tool use)`.
+pub fn recent_message_previews(
+    messages: &[ConversationMessage],
+    n: usize,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for msg in messages.iter().rev() {
+        let Some(text) = msg.blocks.iter().find_map(|b| match b {
+            ConversationBlock::Text(t) if !t.trim().is_empty() => Some(t.trim()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        // Collapse newlines / runs of whitespace so each message is one line.
+        let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        out.push((msg.role.clone(), one_line));
+        if out.len() == n {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
 fn summarize_tool_input(name: &str, input: &serde_json::Value) -> String {
     let str_field = |key: &str| {
         input
@@ -554,5 +581,54 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert!(msgs[0].timestamp.is_some());
+    }
+
+    fn msg(role: &str, blocks: Vec<ConversationBlock>) -> ConversationMessage {
+        ConversationMessage {
+            role: role.to_string(),
+            blocks,
+            timestamp: None,
+            timestamp_utc: None,
+            model: None,
+            tokens: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn recent_previews_takes_last_n_text_messages_oldest_first() {
+        use ConversationBlock::{Text, Thinking, ToolUse};
+        let messages = vec![
+            msg("user", vec![Text("first".into())]),
+            msg("assistant", vec![Thinking("...".into())]), // no text → skipped
+            msg("assistant", vec![Text("second\nline".into())]),
+            msg(
+                "user",
+                vec![ToolUse {
+                    name: "Read".into(),
+                    input_summary: "x".into(),
+                }],
+            ), // no text → skipped
+            msg("user", vec![Text("third".into())]),
+            msg("assistant", vec![Text("fourth".into())]),
+        ];
+        // Last 3 text-bearing messages, oldest-first, newlines collapsed.
+        assert_eq!(
+            recent_message_previews(&messages, 3),
+            vec![
+                ("assistant".to_string(), "second line".to_string()),
+                ("user".to_string(), "third".to_string()),
+                ("assistant".to_string(), "fourth".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_previews_empty_when_no_text() {
+        let messages = vec![msg(
+            "assistant",
+            vec![ConversationBlock::Thinking("t".into())],
+        )];
+        assert!(recent_message_previews(&messages, 6).is_empty());
     }
 }

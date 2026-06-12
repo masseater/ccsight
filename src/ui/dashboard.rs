@@ -15,6 +15,23 @@ use super::{calc_scroll, cost_style, format_cost};
 use crate::AppState;
 use crate::aggregator::CostCalculator;
 
+/// Border + title styles for a dashboard panel, keyed off focus. Single source
+/// for the seven panels' focused-color rule (gotchas.md Block Construction
+/// Consistency); the ◈/◇ marker stays per-panel since its glyph form varies.
+fn panel_styles(selected: bool) -> (Style, Style) {
+    if selected {
+        (
+            Style::default().fg(theme::PRIMARY),
+            Style::default().fg(theme::PRIMARY),
+        )
+    } else {
+        (
+            Style::default().fg(theme::BORDER),
+            Style::default().fg(theme::DIM),
+        )
+    }
+}
+
 fn resample_sparkline(
     data: &[(NaiveDate, u64)],
     width: usize,
@@ -96,7 +113,7 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
     .split(bottom_rows[1]);
 
     // Store panel areas for click detection
-    state.dashboard_panel_areas = vec![
+    state.layout.dashboard_panel_areas = vec![
         top_row[0],     // 0: Recent Costs
         top_row[1],     // 1: Top Projects
         bottom_row[0],  // 2: Model Tokens
@@ -138,26 +155,18 @@ pub(super) fn draw_dashboard(frame: &mut Frame, area: Rect, state: &mut AppState
         state.dashboard_scroll[4],
     );
 
-    // Footer: `<key>:<action>` pairs, key=PRIMARY, action=DIM, trailing
-    // space inside action separates pairs. New global keybinds must be
-    // added to every `help_spans` site across `ui/*.rs` (no shared helper).
-    let help_spans = vec![
-        Span::styled(" ?", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":help ", Style::default().fg(theme::DIM)),
-        Span::styled("q", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":quit ", Style::default().fg(theme::DIM)),
-        Span::styled("←→", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":panel ", Style::default().fg(theme::DIM)),
-        Span::styled("↑↓", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":scroll ", Style::default().fg(theme::DIM)),
-        Span::styled("Enter", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":detail ", Style::default().fg(theme::DIM)),
-        Span::styled("/", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":search ", Style::default().fg(theme::DIM)),
-        Span::styled("m", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":pins", Style::default().fg(theme::DIM)),
-    ];
-    let help_line = Paragraph::new(Line::from(help_spans));
+    // Footer: route through `help_bar` — keys/format live in one place. A
+    // global keybind still needs adding at each tab's bar (see gotchas.md
+    // Bottom Bar sync), but spacing/styling can no longer drift per site.
+    let help_line = Paragraph::new(super::help_bar(&[
+        ("?", "help"),
+        ("q", "quit"),
+        ("←→", "panel"),
+        ("↑↓", "scroll"),
+        ("Enter", "detail"),
+        ("/", "search"),
+        ("m", "pins"),
+    ]));
     frame.render_widget(help_line, chunks[3]);
 }
 
@@ -461,51 +470,52 @@ fn draw_heatmap(frame: &mut Frame, area: Rect, state: &AppState, selected: bool,
 
     let start_str = adjusted_start.format("%m-%d").to_string();
     let end_str = display_end.min(today).format("%m-%d").to_string();
-    let legend_bottom = Line::from(vec![
-        Span::styled(
-            format!(" {start_str} - {end_str}  Less "),
-            Style::default().fg(theme::LABEL_SUBTLE),
-        ),
+    // The date range labels the heatmap's start→end axis, so it stays
+    // bottom-left aligned with the cells; the intensity key reads cleaner
+    // tucked to the bottom-right.
+    let date_label = Line::from(Span::styled(
+        format!(" {start_str} - {end_str} "),
+        Style::default().fg(theme::LABEL_SUBTLE),
+    ));
+    let intensity_legend = Line::from(vec![
+        Span::styled("Less ", Style::default().fg(theme::LABEL_SUBTLE)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_EMPTY)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_LOW)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_MID)),
         Span::styled("■ ", Style::default().fg(theme::HEATMAP_HIGH)),
         Span::styled("■ ", Style::default().fg(theme::PRIMARY)),
         Span::styled(" More ", Style::default().fg(theme::LABEL_SUBTLE)),
-    ]);
+    ])
+    .alignment(Alignment::Right);
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
 
     let actual_end = display_end.min(today);
-    // ISO 8601 separator (`-`) for YY-MM, matching the Monthly graph labels
-    // and the project-wide date-style rule (no locale-dependent slashes in
-    // numeric date forms).
+    // Year-qualified full dates (`YY-MM-DD`) so the span reads unambiguously:
+    // the bottom legend's `%m-%d` axis labels (`06-08 - 06-05`) look reversed
+    // when the window crosses a year, so the title carries the authoritative
+    // range with the year. ISO 8601 `-` separator per the project date rule.
     let marker = if selected { '◈' } else { '◇' };
     let title = format!(
-        " {marker} Activity {}-{} - {}-{}",
-        adjusted_start.format("%y"),
-        adjusted_start.format("%m"),
-        actual_end.format("%y"),
-        actual_end.format("%m"),
+        " {marker} Activity {} - {}",
+        adjusted_start.format("%y-%m-%d"),
+        actual_end.format("%y-%m-%d"),
     );
 
-    let heatmap = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(Span::styled(title, title_style))
-            .title_bottom(legend_bottom),
-    );
+    // The date (left) and intensity key (right) share the bottom border row;
+    // on a too-narrow panel a right-aligned legend would overwrite the date,
+    // so drop the legend below the width that fits both.
+    let date_w = start_str.len() + end_str.len() + 5; // " MM-DD - MM-DD "
+    const LEGEND_W: usize = 21; // "Less ■ ■ ■ ■ ■  More "
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(title, title_style))
+        .title_bottom(date_label);
+    if available_width >= date_w + LEGEND_W {
+        block = block.title_bottom(intensity_legend);
+    }
+    let heatmap = Paragraph::new(lines).block(block);
 
     frame.render_widget(heatmap, area);
 }
@@ -581,16 +591,7 @@ fn draw_hourly_pattern(
         format!(" Peak: - ({}/day) ", crate::format_number(total_avg))
     };
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
     let prefix = if selected { "◈" } else { "◇" };
 
     let block = Block::default()
@@ -652,17 +653,7 @@ fn draw_top_projects(
         })
         .collect();
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
 
     // When there are no projects (e.g. empty filter result), show `0/0`
     // instead of the misleading `1/1` that the previous `.max(1)` produced.
@@ -748,17 +739,7 @@ fn draw_model_tokens(
         })
         .collect();
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
 
     let sort_label = state.dashboard_models_sort.label();
     let pos = if models.is_empty() { 0 } else { scroll + 1 };
@@ -1069,7 +1050,7 @@ fn draw_tool_usage(
             Span::raw(" ".repeat(pad)),
             Span::styled("▶", Style::default().fg(arrow_color)),
         ]));
-        state.tools_panel_category_areas.push((
+        state.layout.tools_panel_category_areas.push((
             *section_idx,
             ratatui::layout::Rect::new(inner_x, inner_y + row_offset as u16, inner_width, 1),
         ));
@@ -1147,16 +1128,7 @@ fn draw_tool_usage(
         }
     }
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
     let marker = if selected { '◈' } else { '◇' };
     // Header shows only call count to avoid the dual-meaning trap of "uniq":
     // each Tier 1 row already prints its own per-category uniq with the
@@ -1337,17 +1309,7 @@ fn draw_languages(frame: &mut Frame, area: Rect, state: &AppState, selected: boo
         })
         .collect();
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
 
     let pos = if entries.is_empty() { 0 } else { scroll + 1 };
     let sort_label = state.dashboard_languages_sort.label();
@@ -1424,17 +1386,7 @@ fn draw_recent_costs(
         })
         .collect();
 
-    let border_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::BORDER)
-    };
-
-    let title_style = if selected {
-        Style::default().fg(theme::PRIMARY)
-    } else {
-        Style::default().fg(theme::DIM)
-    };
+    let (border_style, title_style) = panel_styles(selected);
 
     // Empty filter result → show `0/0`, not `1/1`. See Projects panel rationale.
     let total = state.daily_costs.len();
@@ -2034,25 +1986,6 @@ fn push_month_divider_line(
 
 /// Width-aware ellipsis truncation shared by the detail-popup panel
 /// builders below. Pure; counts display columns, not bytes.
-fn popup_truncate(s: &str, max_len: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if UnicodeWidthStr::width(s) <= max_len {
-        s.to_string()
-    } else {
-        let mut width = 0;
-        let mut result = String::new();
-        for ch in s.chars() {
-            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width + ch_w > max_len.saturating_sub(1) {
-                break;
-            }
-            result.push(ch);
-            width += ch_w;
-        }
-        format!("{result}…")
-    }
-}
-
 fn detail_panel_costs(
     state: &mut AppState,
     today: NaiveDate,
@@ -2125,7 +2058,7 @@ fn detail_panel_costs(
             0.0
         };
         let filled = (ratio * bar_width as f64).round() as usize;
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let bar = crate::text::hbar(filled, bar_width);
         let intensity = (ratio * 0.7 + 0.3).min(1.0);
         let bar_color = theme::primary_with_intensity(intensity);
 
@@ -2268,7 +2201,7 @@ fn detail_panel_projects(
     {
         let ratio = stats.work_tokens as f64 / max_tokens as f64;
         let filled = (ratio * bar_width as f64).round() as usize;
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let bar = crate::text::hbar(filled, bar_width);
         let intensity = (ratio * 0.7 + 0.3).min(1.0);
         let bar_color = Color::Rgb(
             (140.0 + 78.0 * intensity) as u8,
@@ -2277,7 +2210,7 @@ fn detail_panel_projects(
         );
         // Show basename only; the absolute path is in the popup title.
         let basename = name.rsplit('/').next().unwrap_or(name.as_str());
-        let display_name = popup_truncate(basename, name_width);
+        let display_name = super::truncate_with_ellipsis(basename, name_width);
         let cost = project_cost.get(name.as_str()).copied().unwrap_or(0.0);
         let active_days = project_active_days.get(name.as_str()).copied().unwrap_or(0);
         let date_range = match (
@@ -2335,7 +2268,7 @@ fn detail_panel_projects(
         }
         let row_end = lines.len();
         let row_height = (row_end - row_start) as u16;
-        state.project_detail_row_areas.push((
+        state.layout.project_detail_row_areas.push((
             i,
             Rect::new(inner_x, body_y0 + row_start as u16, row_width, row_height),
         ));
@@ -2464,9 +2397,16 @@ fn detail_panel_models(
         let filled = (ratio * bar_width as f64).round() as usize;
         let unknown = state.models_without_pricing.contains(model);
         let bar = if unknown {
-            format!("{}{}", "░".repeat(filled), " ".repeat(bar_width - filled))
+            // Unknown-pricing variant: dotted fill + space pad (no hbar — its
+            // `░` pad would imply a known scale). Saturating like hbar.
+            let f = filled.min(bar_width);
+            format!(
+                "{}{}",
+                "░".repeat(f),
+                " ".repeat(bar_width.saturating_sub(f))
+            )
         } else {
-            format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled))
+            crate::text::hbar(filled, bar_width)
         };
         let bar_color = if unknown {
             theme::WARNING
@@ -2479,7 +2419,7 @@ fn detail_panel_models(
             )
         };
 
-        let display_name = popup_truncate(model, name_width);
+        let display_name = super::truncate_with_ellipsis(model, name_width);
         let token_info = if unknown {
             format!(
                 "in:{} out:{} cache:{}  $? (pricing undefined)",
@@ -2810,6 +2750,7 @@ fn detail_panel_ecosystem(
         // Record click area for non-empty sections (empty is not clickable)
         if !empty {
             state
+                .layout
                 .tools_detail_tab_areas
                 .push((i, Rect::new(cursor_x, tab_bar_y, tab_width, 1)));
         }
@@ -3063,7 +3004,7 @@ fn detail_panel_ecosystem(
             };
             let pct_str = crate::text::format_pct(agg.calls as u64, pct_denom as u64);
             let filled = (ratio * bar_width as f64).round() as usize;
-            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+            let bar = crate::text::hbar(filled, bar_width);
             // Built-in row gets the Built-in palette so it stays visually
             // distinct from MCP servers in the same list. Both colors
             // come from `theme::CAT_*` aliases so the canonical
@@ -3076,7 +3017,7 @@ fn detail_panel_ecosystem(
             let row_rgb_table = if agg.is_builtin { BUILTIN_RGB } else { MCP_RGB };
             let (r, g, b) = rgb_from_table(&row_rgb_table, ratio);
             let bar_color = Color::Rgb(r, g, b);
-            let display_name = popup_truncate(group, group_name_width);
+            let display_name = super::truncate_with_ellipsis(group, group_name_width);
             let sessions = if agg.is_builtin {
                 // Sum of distinct sessions across built-in tool keys is
                 // misleading (sessions overlap), so prefer the per-tool
@@ -3118,7 +3059,7 @@ fn detail_panel_ecosystem(
             let body_pos = lines.len().saturating_sub(header_rows);
             if body_pos >= scroll && body_pos < scroll + visible_body {
                 let server_row_y = base_y + header_rows as u16 + (body_pos - scroll) as u16;
-                state.mcp_server_row_areas.push((
+                state.layout.mcp_server_row_areas.push((
                     i,
                     Rect::new(inner_x, server_row_y, popup_area.width.saturating_sub(2), 1),
                 ));
@@ -3205,7 +3146,7 @@ fn detail_panel_ecosystem(
                         .copied()
                         .unwrap_or(0);
                     let tool_name_width = content_width.saturating_sub(40);
-                    let t_name = popup_truncate(&short, tool_name_width);
+                    let t_name = super::truncate_with_ellipsis(&short, tool_name_width);
                     let tool_selected = selected_tool_idx == Some(ti);
                     let t_name_style = if tool_selected {
                         Style::default()
@@ -3289,7 +3230,7 @@ fn detail_panel_ecosystem(
             let (r, g, b) = rgb_from_table(&sec.bar_rgb_table, ratio);
             let bar_color = Color::Rgb(r, g, b);
             let display_raw = (sec.format_name)(name);
-            let display_name = popup_truncate(&display_raw, name_width);
+            let display_name = super::truncate_with_ellipsis(&display_raw, name_width);
             let ses = state.stats.tool_sessions.get(*name).copied().unwrap_or(0);
             let last_used_str = match state
                 .tool_last_used
@@ -3329,7 +3270,7 @@ fn detail_panel_ecosystem(
         let bar_empty = "░".repeat(bar_width);
         for key in &unused_keys {
             let display_raw = (sec.format_name)(key);
-            let display_name = popup_truncate(&display_raw, name_width);
+            let display_name = super::truncate_with_ellipsis(&display_raw, name_width);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:>3}. ", row_idx + 1),
@@ -3452,9 +3393,9 @@ fn detail_panel_languages(
             (80.0 + 85.0 * intensity) as u8,
             (90.0 + 90.0 * intensity) as u8,
         );
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let bar = crate::text::hbar(filled, bar_width);
         let pct_str = crate::text::format_pct(count as u64, total_usage as u64);
-        let name_label = popup_truncate(&display_name, name_width);
+        let name_label = super::truncate_with_ellipsis(&display_name, name_width);
         let name_color = if is_known {
             theme::LABEL_MUTED
         } else {
@@ -3571,7 +3512,7 @@ fn detail_panel_activity_weekly(
             (160.0 + 58.0 * intensity) as u8,
             (180.0 + 75.0 * intensity) as u8,
         );
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let bar = crate::text::hbar(filled, bar_width);
         lines.push(Line::from(vec![
             Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
             Span::styled(
@@ -3686,7 +3627,7 @@ fn detail_panel_activity_daily(
             (160.0 + 58.0 * intensity) as u8,
             (180.0 + 75.0 * intensity) as u8,
         );
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let bar = crate::text::hbar(filled, bar_width);
 
         body.push(Line::from(vec![
             Span::styled(format!("  {:>3}. ", i + 1), Style::default().fg(theme::DIM)),
@@ -3756,7 +3697,7 @@ fn detail_panel_hourly(
         let filled = (ratio * bar_width as f64).round() as usize;
         let intensity = (ratio * 0.7 + 0.3).min(1.0);
         let bar_color = theme::primary_with_intensity(intensity);
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let bar = crate::text::hbar(filled, bar_width);
         let pct = if total_avg > 0 {
             tokens as f64 / total_avg as f64 * 100.0
         } else {
@@ -3783,18 +3724,14 @@ pub(super) fn draw_dashboard_detail_popup(frame: &mut Frame, area: Rect, state: 
     // `costs_header_lines`) stay time-pure and take `today` as a parameter so they
     // can be tested deterministically at any calendar boundary.
     let today = chrono::Local::now().date_naive();
-    let popup_width = 90.min(area.width.saturating_sub(4));
-    let popup_height = area.height.saturating_sub(4).min(30);
+    // Shared size with the Session / Insights detail popups (see
+    // `super::detail_popup_area`) so the three present identically.
+    let popup_area = super::detail_popup_area(area);
+    let popup_width = popup_area.width;
+    let popup_height = popup_area.height;
     let content_width = popup_width.saturating_sub(4) as usize;
 
-    let popup_area = Rect {
-        x: area.width.saturating_sub(popup_width) / 2,
-        y: area.height.saturating_sub(popup_height) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
-
-    state.active_popup_area = Some(popup_area);
+    state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
     let scroll = state.dashboard_scroll[state.dashboard_panel];

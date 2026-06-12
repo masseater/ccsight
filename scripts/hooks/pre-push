@@ -40,4 +40,14 @@ if ! bash scripts/lint.sh; then
     exit 1
 fi
 
+# Push is infrequent, so spend the time the per-commit gate can't: run the
+# EXHAUSTIVE real-data aggregation-agreement check over ALL of `~/.claude`
+# (the commit gate only samples it). No-ops in environments without local
+# Claude data. Slow (minutes on a large history) by design.
+echo "[pre-push] cargo test -- --ignored (full real-data agreement) ..."
+if ! cargo test --quiet test_stats_and_grouper_agree_on_token_totals -- --ignored 2>&1; then
+    echo "[pre-push] FAILED: full real-data aggregation paths diverged."
+    exit 1
+fi
+
 echo "[pre-push] OK"

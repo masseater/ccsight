@@ -91,23 +91,9 @@ impl LiveSnapshot {
     }
 
     pub(crate) fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
-        use std::io::Write;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        // Pretty JSON: these files are debug-inspected by hand (CLAUDE.md).
+        let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        super::atomic_write(path, &json)
     }
 
     /// Per-poll writer (no-op / overwrite / new file) targeting the

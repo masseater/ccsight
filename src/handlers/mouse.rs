@@ -16,8 +16,16 @@ pub(crate) fn in_area(column: u16, row: u16, area: &ratatui::layout::Rect) -> bo
 /// dismisses the topmost overlay (per [`crate::dismiss_overlay`]).
 pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Popups are topmost - check them first
-    if state.show_filter_popup && !state.filter_input_mode {
-        if let Some(area) = state.filter_popup_area
+    if state.show_filter_popup() {
+        // Date-input mode is modal: a click can't move the selection, and
+        // letting it fall through would close the popup underneath while
+        // leaving filter_input_mode orphaned. dismiss_overlay exits input
+        // mode first (the popup stays open), matching Esc.
+        if state.filter_input_mode {
+            crate::dismiss_overlay(state);
+            return;
+        }
+        if let Some(area) = state.layout.filter_popup_area
             && in_area(column, row, &area)
         {
             let relative_row = (row - area.y).saturating_sub(1) as usize;
@@ -31,8 +39,8 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         return;
     }
 
-    if state.show_project_popup {
-        if let Some(area) = state.project_popup_area
+    if state.show_project_popup() {
+        if let Some(area) = state.layout.project_popup_area
             && in_area(column, row, &area)
         {
             let relative_row = (row - area.y).saturating_sub(1) as usize;
@@ -49,7 +57,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 
     if state.search_mode
         && !state.search_results.is_empty()
-        && let Some(area) = state.search_results_area
+        && let Some(area) = state.layout.search_results_area
         && in_area(column, row, &area)
     {
         let item_height = 2usize;
@@ -74,8 +82,8 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Projects detail popup (panel 1): clicking a project row moves the
     // cursor. Guarded by `!show_project_detail` so a click that falls through
     // an open per-project popup doesn't reset the cursor underneath.
-    if state.show_dashboard_detail && state.dashboard_panel == 1 && !state.show_project_detail {
-        for (idx, area) in state.project_detail_row_areas.clone() {
+    if state.show_dashboard_detail() && state.dashboard_panel == 1 && !state.show_project_detail() {
+        for (idx, area) in state.layout.project_detail_row_areas.clone() {
             if in_area(column, row, &area) {
                 state.dashboard_scroll[1] = idx;
                 return;
@@ -84,8 +92,8 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     }
 
     // Tool Usage detail popup: tab click switches section.
-    if state.show_dashboard_detail && state.dashboard_panel == 3 {
-        for (idx, area) in state.tools_detail_tab_areas.clone() {
+    if state.show_dashboard_detail() && state.dashboard_panel == 3 {
+        for (idx, area) in state.layout.tools_detail_tab_areas.clone() {
             if in_area(column, row, &area) {
                 state.tools_detail_section = idx;
                 state.dashboard_scroll[state.dashboard_panel] = 0;
@@ -102,7 +110,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         }
         // Tools tab: clicking a server row toggles expansion and moves cursor.
         if state.tools_detail_section == 0 {
-            for (idx, area) in state.mcp_server_row_areas.clone() {
+            for (idx, area) in state.layout.mcp_server_row_areas.clone() {
                 if in_area(column, row, &area) {
                     state.mcp_selected_server = idx;
                     state.mcp_selected_tool = None;
@@ -123,10 +131,10 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Detail-style popups (help/summary/detail/dashboard_detail/insights_detail):
     // click inside does nothing (preserves text selection), click outside dismisses.
     if crate::has_blocking_popup(state) {
-        let popup_area = if state.show_summary {
-            state.summary_popup_area
+        let popup_area = if state.show_summary() {
+            state.layout.summary_popup_area
         } else {
-            state.active_popup_area
+            state.layout.active_popup_area
         };
         if popup_area.is_some_and(|a| in_area(column, row, &a)) {
             return;
@@ -136,33 +144,33 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     }
 
     // Check if click is on help trigger button
-    if let Some(area) = state.help_trigger
+    if let Some(area) = state.layout.help_trigger
         && in_area(column, row, &area)
     {
-        state.show_help = true;
+        state.active_popup = crate::ActivePopup::Help;
         state.help_scroll = 0;
         return;
     }
 
     // Check if click is on filter/project trigger buttons in tab bar
     if !state.show_conversation {
-        if let Some(area) = state.filter_popup_area_trigger
+        if let Some(area) = state.layout.filter_popup_area_trigger
             && in_area(column, row, &area)
         {
-            state.show_filter_popup = true;
+            state.active_popup = crate::ActivePopup::FilterPopup;
             state.filter_popup_selected = 0;
             return;
         }
-        if let Some(area) = state.project_popup_area_trigger
+        if let Some(area) = state.layout.project_popup_area_trigger
             && in_area(column, row, &area)
         {
             state.rebuild_project_list();
-            state.show_project_popup = true;
+            state.active_popup = crate::ActivePopup::ProjectPopup;
             state.project_popup_selected = 0;
             state.project_popup_scroll = 0;
             return;
         }
-        if let Some(area) = state.pin_view_trigger
+        if let Some(area) = state.layout.pin_view_trigger
             && in_area(column, row, &area)
             && !state.pins.entries().is_empty()
         {
@@ -181,7 +189,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 
     // Check if click is on a tab (only when not showing conversation)
     if !state.show_conversation {
-        let clicked_tab = state.tab_areas.iter().find_map(|(tab, area)| {
+        let clicked_tab = state.layout.tab_areas.iter().find_map(|(tab, area)| {
             if in_area(column, row, area) {
                 Some(*tab)
             } else {
@@ -189,14 +197,14 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
             }
         });
         if let Some(tab) = clicked_tab {
-            state.show_dashboard_detail = false;
-            state.show_insights_detail = false;
-            state.show_detail = false;
-            state.daily_breakdown_focus = false;
-            state.daily_breakdown_scroll = 0;
-            if state.show_summary || state.generating_summary {
+            // clear_summary() must run BEFORE the popup is cleared — it reads
+            // show_summary() to decide whether there is summary state to drop.
+            if state.show_summary() || state.generating_summary {
                 state.clear_summary();
             }
+            state.active_popup = crate::ActivePopup::None;
+            state.daily_breakdown_focus = false;
+            state.daily_breakdown_scroll = 0;
             state.tab = tab;
             return;
         }
@@ -205,7 +213,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Check if click is on session list title (mode toggle) in conversation view
     if state.show_conversation
         && state.tab == Tab::Daily
-        && let Some((area, _, _)) = state.session_list_area
+        && let Some((area, _, _)) = state.layout.session_list_area
         && column >= area.x
         && column < area.x + area.width
         && area.y > 0
@@ -231,7 +239,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Check if click is on session list (in conversation view)
     if state.show_conversation
         && state.tab == Tab::Daily
-        && let Some((area, scroll, item_height)) = state.session_list_area
+        && let Some((area, scroll, item_height)) = state.layout.session_list_area
         && column >= area.x
         && column < area.x + area.width
         && row >= area.y
@@ -252,7 +260,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         // [i] button: per-pane right-aligned indicator on the info-area
         // summary row. Coords must match draw_conversation_pane's info_rect
         // (top-right of pane, occupies 3 cells just inside the right border).
-        for (idx, area) in state.pane_areas.iter().enumerate() {
+        for (idx, area) in state.layout.pane_areas.iter().enumerate() {
             let has_session = state.panes.get(idx).is_some_and(|p| p.file_path.is_some());
             if !has_session {
                 continue;
@@ -262,13 +270,13 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
             let btn_row = area.y + 1;
             if row == btn_row && column >= btn_left && column < btn_right {
                 state.active_pane_index = Some(idx);
-                state.show_detail = true;
+                state.active_popup = crate::ActivePopup::Detail;
                 state.session_detail_scroll = 0;
                 return;
             }
         }
 
-        for (idx, area) in state.pane_areas.iter().enumerate() {
+        for (idx, area) in state.layout.pane_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 state.active_pane_index = Some(idx);
                 // Conversation lines start below the top border AND the
@@ -305,12 +313,12 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // that section pre-selected. Checked BEFORE the generic panel-click handler so
     // the row click takes priority over panel selection.
     if state.tab == Tab::Dashboard && !state.show_conversation {
-        let category_areas = state.tools_panel_category_areas.clone();
+        let category_areas = state.layout.tools_panel_category_areas.clone();
         for (section_idx, area) in category_areas {
             if in_area(column, row, &area) {
                 state.dashboard_panel = 3;
                 state.tools_detail_section = section_idx;
-                state.show_dashboard_detail = true;
+                state.active_popup = crate::ActivePopup::DashboardDetail;
                 state.dashboard_scroll[3] = 0;
                 // Tools tab is section 0 — reset the MCP cursor on entry so
                 // a stale value from the prior popup view doesn't push the
@@ -326,7 +334,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 
     // Check if click is on a dashboard panel
     if state.tab == Tab::Dashboard && !state.show_conversation {
-        for (idx, area) in state.dashboard_panel_areas.iter().enumerate() {
+        for (idx, area) in state.layout.dashboard_panel_areas.iter().enumerate() {
             if column >= area.x
                 && column < area.x + area.width
                 && row >= area.y
@@ -340,7 +348,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 
     // Check if click is on an insights panel
     if state.tab == Tab::Insights && !state.show_conversation {
-        for (idx, area) in state.insights_panel_areas.iter().enumerate() {
+        for (idx, area) in state.layout.insights_panel_areas.iter().enumerate() {
             if column >= area.x
                 && column < area.x + area.width
                 && row >= area.y
@@ -355,7 +363,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Check if click is on Daily header (left/right navigation)
     if state.tab == Tab::Daily
         && !state.show_conversation
-        && let Some(area) = state.daily_header_area
+        && let Some(area) = state.layout.daily_header_area
         && in_area(column, row, &area)
     {
         let mid = area.x + area.width / 2;
@@ -378,7 +386,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
     // Check if click is on a session in Daily view
     if state.tab == Tab::Daily
         && !state.show_conversation
-        && let Some((area, scroll, item_height)) = state.session_list_area
+        && let Some((area, scroll, item_height)) = state.layout.session_list_area
         && column >= area.x
         && column < area.x + area.width
         && row >= area.y
@@ -401,7 +409,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
                 // at relative_y 0, 2, 4, … (multiples of item_height).
                 let on_line1 = relative_y.is_multiple_of(item_height);
                 if on_line1 && column >= info_btn_left && column < info_btn_right {
-                    state.show_detail = true;
+                    state.active_popup = crate::ActivePopup::Detail;
                     state.session_detail_scroll = 0;
                 }
             }
@@ -424,11 +432,13 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
         };
         // (frame_inner_rect, scroll, row_count, global_base)
         let frame = if let Some((area, scroll, count)) =
-            state.live_list_area.filter(|&(a, _, _)| in_rect(a))
+            state.layout.live_list_area.filter(|&(a, _, _)| in_rect(a))
         {
             Some((area, scroll, count, 0usize))
-        } else if let Some((area, scroll)) =
-            state.live_paused_list_area.filter(|&(a, _)| in_rect(a))
+        } else if let Some((area, scroll)) = state
+            .layout
+            .live_paused_list_area
+            .filter(|&(a, _)| in_rect(a))
         {
             Some((area, scroll, state.live_paused.len(), active_count))
         } else {
@@ -450,38 +460,7 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
                     let info_btn_right = area.x + area.width.saturating_sub(1);
                     let on_line1 = line_idx == row_line0;
                     if on_line1 && column >= info_btn_left && column < info_btn_right {
-                        // Reuse the `i` key path so the popup wiring stays in
-                        // one place (see handlers::keyboard `Char('i')` arm).
-                        let live_info = crate::live_selected_session(state).map(|live| {
-                            let started = live
-                                .started_at
-                                .map(|t| {
-                                    t.with_timezone(&chrono::Local)
-                                        .format("%Y-%m-%d %H:%M")
-                                        .to_string()
-                                })
-                                .unwrap_or_default();
-                            (
-                                live.jsonl_path.clone(),
-                                live.pid,
-                                live.status.clone().unwrap_or_else(|| "—".to_string()),
-                                started,
-                            )
-                        });
-                        if let Some((Some(jsonl), pid, status, started)) = live_info {
-                            let found = state.original_daily_groups.iter().find_map(|g| {
-                                g.sessions
-                                    .iter()
-                                    .find(|s| s.file_path == jsonl && !s.is_subagent)
-                                    .cloned()
-                            });
-                            if let Some(session) = found {
-                                state.session_detail_override = Some(session);
-                                state.session_detail_live_extra = Some((pid, status, started));
-                                state.show_detail = true;
-                                state.session_detail_scroll = 0;
-                            }
-                        }
+                        crate::handlers::pane::open_live_session_detail(state);
                     }
                 }
             }
@@ -496,8 +475,8 @@ pub(crate) fn handle_mouse_click(state: &mut AppState, column: u16, row: u16) {
 /// Handles a left-button double-click — only used for popups + Daily session
 /// list (open conversation) + breakdown focus.
 pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
-    if state.show_summary {
-        if let Some(popup_area) = state.summary_popup_area
+    if state.show_summary() {
+        if let Some(popup_area) = state.layout.summary_popup_area
             && !in_area(column, row, &popup_area)
         {
             state.clear_summary();
@@ -505,11 +484,17 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
         return;
     }
 
-    if state.show_filter_popup && !state.filter_input_mode {
+    if state.show_filter_popup() {
+        // Same modal rule as single-click: never let a double-click fall
+        // through to the UI underneath while date input is active.
+        if state.filter_input_mode {
+            crate::dismiss_overlay(state);
+            return;
+        }
         if state.filter_popup_selected < PeriodFilter::ALL_VARIANTS.len() {
             state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected];
             state.apply_filter();
-            state.show_filter_popup = false;
+            state.active_popup = crate::ActivePopup::None;
         } else {
             state.filter_input_mode = true;
             let text = match state.period_filter {
@@ -526,7 +511,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
         return;
     }
 
-    if state.show_project_popup {
+    if state.show_project_popup() {
         if state.project_popup_selected == 0 {
             state.project_filter = None;
         } else {
@@ -538,7 +523,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
             }
         }
         state.apply_filter();
-        state.show_project_popup = false;
+        state.active_popup = crate::ActivePopup::None;
         return;
     }
 
@@ -556,15 +541,15 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     // Double-click on a project row → per-project popup (mirrors Enter).
     // Sort here must match dashboard.rs panel 1 (incl. lint #30 tiebreaker)
     // so `idx` lands on the same row the user sees.
-    if state.show_dashboard_detail && state.dashboard_panel == 1 && !state.show_project_detail {
-        for (idx, area) in state.project_detail_row_areas.clone() {
+    if state.show_dashboard_detail() && state.dashboard_panel == 1 && !state.show_project_detail() {
+        for (idx, area) in state.layout.project_detail_row_areas.clone() {
             if in_area(column, row, &area) {
                 let mut projects: Vec<_> = state.stats.project_stats.iter().collect();
                 state.sort_projects(&mut projects);
                 if let Some((name, _)) = projects.get(idx) {
                     state.project_detail_path = (*name).clone();
                     state.project_detail_scroll = 0;
-                    state.show_project_detail = true;
+                    state.active_popup = crate::ActivePopup::ProjectDetail;
                     state.dashboard_scroll[1] = idx;
                 }
                 return;
@@ -578,7 +563,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
 
     if state.show_conversation
         && state.tab == Tab::Daily
-        && let Some((area, scroll, item_height)) = state.session_list_area
+        && let Some((area, scroll, item_height)) = state.layout.session_list_area
         && in_area(column, row, &area)
     {
         let relative_y = (row - area.y) as usize;
@@ -593,7 +578,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
 
     if !state.show_conversation
         && state.tab == Tab::Daily
-        && let Some((area, scroll, item_height)) = state.session_list_area
+        && let Some((area, scroll, item_height)) = state.layout.session_list_area
         && in_area(column, row, &area)
     {
         let relative_y = (row - area.y) as usize;
@@ -610,7 +595,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
 
     if !state.show_conversation
         && state.tab == Tab::Daily
-        && let Some(area) = state.breakdown_panel_area
+        && let Some(area) = state.layout.breakdown_panel_area
         && in_area(column, row, &area)
     {
         state.daily_breakdown_focus = true;
@@ -619,20 +604,20 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
     }
 
     if !state.show_conversation && state.tab == Tab::Dashboard {
-        for (idx, area) in state.dashboard_panel_areas.iter().enumerate() {
+        for (idx, area) in state.layout.dashboard_panel_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 state.dashboard_panel = idx;
-                state.show_dashboard_detail = true;
+                state.active_popup = crate::ActivePopup::DashboardDetail;
                 return;
             }
         }
     }
 
     if !state.show_conversation && state.tab == Tab::Insights {
-        for (idx, area) in state.insights_panel_areas.iter().enumerate() {
+        for (idx, area) in state.layout.insights_panel_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 state.insights_panel = idx;
-                state.show_insights_detail = true;
+                state.active_popup = crate::ActivePopup::InsightsDetail;
                 state.insights_detail_scroll = 0;
                 return;
             }
@@ -643,7 +628,7 @@ pub(crate) fn handle_double_click(state: &mut AppState, column: u16, row: u16) {
 /// Handles a wheel scroll event — popup-aware, panel-aware. `up = true` means
 /// the user scrolled the wheel toward themselves (content moves down visually).
 pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, up: bool) {
-    if state.show_filter_popup {
+    if state.show_filter_popup() {
         let max = PeriodFilter::ALL_VARIANTS.len();
         if up {
             state.filter_popup_selected = state.filter_popup_selected.saturating_sub(1);
@@ -653,7 +638,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_project_popup {
+    if state.show_project_popup() {
         let max = state.project_list.len().saturating_sub(1);
         if up {
             state.project_popup_selected = state.project_popup_selected.saturating_sub(1);
@@ -663,7 +648,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_project_detail {
+    if state.show_project_detail() {
         if up {
             state.project_detail_scroll = state.project_detail_scroll.saturating_sub(SCROLL_LINES);
         } else {
@@ -672,7 +657,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_summary {
+    if state.show_summary() {
         if up {
             state.summary_scroll = state.summary_scroll.saturating_sub(SCROLL_LINES);
         } else {
@@ -691,7 +676,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_help {
+    if state.show_help() {
         if up {
             state.help_scroll = state.help_scroll.saturating_sub(1);
         } else {
@@ -700,7 +685,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_detail {
+    if state.show_detail() {
         if up {
             state.session_detail_scroll = state.session_detail_scroll.saturating_sub(1);
         } else {
@@ -709,7 +694,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_insights_detail {
+    if state.show_insights_detail() {
         if up {
             state.insights_detail_scroll =
                 state.insights_detail_scroll.saturating_sub(SCROLL_LINES);
@@ -720,7 +705,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
         return;
     }
 
-    if state.show_dashboard_detail {
+    if state.show_dashboard_detail() {
         if up {
             state.dashboard_scroll[state.dashboard_panel] =
                 state.dashboard_scroll[state.dashboard_panel].saturating_sub(1);
@@ -735,7 +720,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
     }
 
     if state.show_conversation {
-        if let Some((area, _, _)) = state.session_list_area
+        if let Some((area, _, _)) = state.layout.session_list_area
             && in_area(column, row, &area)
         {
             let max = crate::get_conv_session_count(state).saturating_sub(1);
@@ -747,7 +732,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
             return;
         }
 
-        for (idx, area) in state.pane_areas.iter().enumerate() {
+        for (idx, area) in state.layout.pane_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 if let Some(pane) = state.panes.get_mut(idx) {
                     if up {
@@ -787,7 +772,7 @@ pub(crate) fn handle_mouse_scroll(state: &mut AppState, column: u16, row: u16, u
     }
 
     if state.tab == Tab::Dashboard {
-        for (idx, area) in state.dashboard_panel_areas.iter().enumerate() {
+        for (idx, area) in state.layout.dashboard_panel_areas.iter().enumerate() {
             if in_area(column, row, area) {
                 let (scroll_up, scroll_down) = if idx == 5 { (!up, up) } else { (up, !up) };
                 if scroll_up {
@@ -858,7 +843,7 @@ mod tests {
         state.show_conversation = false;
         // session_list_area: full-width 140 col panel, height 10, starting at row 13.
         // item_height = 2 (line1 + line2 per session).
-        state.session_list_area = Some((
+        state.layout.session_list_area = Some((
             Rect {
                 x: 0,
                 y: 13,
@@ -877,7 +862,10 @@ mod tests {
         // Row 14 = line1 of session 0 (area.y=13, relative_y=1, line_in_session=0).
         // Column 137 falls within [136, 139) — the [i] hit zone.
         handle_mouse_click(&mut state, 137, 14);
-        assert!(state.show_detail, "clicking [i] should open session detail");
+        assert!(
+            state.show_detail(),
+            "clicking [i] should open session detail"
+        );
         assert_eq!(state.selected_session, 0);
     }
 
@@ -886,7 +874,7 @@ mod tests {
         let mut state = daily_state_for_click();
         // Row 14 line1 of session 0, but column 10 is far from [i].
         handle_mouse_click(&mut state, 10, 14);
-        assert!(!state.show_detail, "non-[i] click must not open detail");
+        assert!(!state.show_detail(), "non-[i] click must not open detail");
         assert_eq!(state.selected_session, 0);
     }
 
@@ -897,7 +885,7 @@ mod tests {
         // Even at the info-button column, line2 must not trigger the popup.
         handle_mouse_click(&mut state, 137, 15);
         assert!(
-            !state.show_detail,
+            !state.show_detail(),
             "line2 click in info column must not open detail"
         );
     }
@@ -914,7 +902,7 @@ mod tests {
         let mut pane = crate::state::ConversationPane::default();
         pane.file_path = Some(session.file_path.clone());
         state.panes.push(pane);
-        state.pane_areas = vec![Rect {
+        state.layout.pane_areas = vec![Rect {
             x: 70,
             y: 5,
             width: 70,
@@ -929,7 +917,7 @@ mod tests {
         // row=6 (area.y+1), col=137 → inside [136, 139)
         handle_mouse_click(&mut state, 137, 6);
         assert!(
-            state.show_detail,
+            state.show_detail(),
             "[i] in conv pane should open session detail"
         );
         assert_eq!(state.active_pane_index, Some(0));
@@ -941,7 +929,7 @@ mod tests {
         // Click inside pane body (not on the info button row/column).
         handle_mouse_click(&mut state, 100, 10);
         assert!(
-            !state.show_detail,
+            !state.show_detail(),
             "body click in conv pane should not open session detail"
         );
         assert_eq!(state.active_pane_index, Some(0));
@@ -954,7 +942,7 @@ mod tests {
         state.panes[0].file_path = None;
         handle_mouse_click(&mut state, 137, 6);
         assert!(
-            !state.show_detail,
+            !state.show_detail(),
             "without a session, [i] click must not open detail"
         );
     }
@@ -974,7 +962,7 @@ mod tests {
         let mut state = make_test_app_state(vec![group]);
         state.tab = Tab::Daily;
         state.show_conversation = false;
-        state.session_list_area = Some((
+        state.layout.session_list_area = Some((
             Rect {
                 x: 0,
                 y: 13,
@@ -1017,7 +1005,7 @@ mod tests {
         let mut state = make_test_app_state(vec![group]);
         state.search_mode = true;
         state.search_results = vec![mk_search_result(), mk_search_result(), mk_search_result()];
-        state.search_results_area = Some(Rect {
+        state.layout.search_results_area = Some(Rect {
             x: 0,
             y: 6,
             width: 100,
@@ -1065,7 +1053,7 @@ mod tests {
         state.live_active = vec![paused_live("act")]; // active_count == 1
         state.live_paused = vec![paused_live("a"), paused_live("b")];
         // Active frame (inner): line 0 = status, row 0 at body lines 1-3.
-        state.live_list_area = Some((
+        state.layout.live_list_area = Some((
             Rect {
                 x: 1,
                 y: 1,
@@ -1076,7 +1064,7 @@ mod tests {
             1,
         ));
         // Paused frame (inner) below: body line 0 = info, rows at 1 + r*3.
-        state.live_paused_list_area = Some((
+        state.layout.live_paused_list_area = Some((
             Rect {
                 x: 1,
                 y: 7,

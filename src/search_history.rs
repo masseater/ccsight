@@ -4,8 +4,6 @@
 //! the "restore last query" case; this module covers everything older.
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::Write;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -86,20 +84,11 @@ impl SearchHistory {
     #[cfg_attr(test, allow(dead_code))]
     fn save(&self) -> Result<()> {
         let path = crate::infrastructure::search_history_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let on_disk = OnDisk {
             entries: self.entries.iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec_pretty(&on_disk)?;
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
+        crate::infrastructure::atomic_write(&path, &bytes)?;
         Ok(())
     }
 

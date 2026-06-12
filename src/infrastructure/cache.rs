@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 // Bump on changes to: parser output, aggregator field semantics
 // (`extract_project_name`, `extract_session_model`, `git_branch`, etc.).
-const CACHE_VERSION: u32 = 33;
+const CACHE_VERSION: u32 = 34;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheData {
@@ -142,6 +142,17 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// Test-only: an empty cache that DOES persist to `path` (unlike
+    /// `new_empty`'s non-saving `/dev/null`), so a test can read back the
+    /// entries a writer produced and compare the two aggregation paths.
+    #[cfg(test)]
+    pub(crate) fn empty_at(cache_path: PathBuf) -> Self {
+        Self {
+            cache_path,
+            data: CacheData::default(),
+        }
+    }
+
     pub fn new_empty() -> Self {
         Self {
             cache_path: PathBuf::from("/dev/null"), // Fallback path, won't be saved
@@ -174,42 +185,11 @@ impl Cache {
                 "Cannot save cache: HOME is not set (cache_path is /dev/null fallback)"
             ));
         }
-        if let Some(parent) = self.cache_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Atomic write: write to temp file, then rename
-        let temp_path = self.cache_path.with_extension("json.tmp");
-        let file = match File::create(&temp_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Stale file with wrong ownership — try to remove and recreate
-                let _ = fs::remove_file(&temp_path);
-                let _ = fs::remove_file(&self.cache_path);
-                File::create(&temp_path)?
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        // Set restrictive permissions (0600) on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&temp_path, permissions)?;
-        }
-
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &self.data)?;
-        writer.flush()?;
-        writer.into_inner()?.sync_all()?;
-
-        // Atomic rename (POSIX guarantees this is atomic on same filesystem)
-        if let Err(e) = fs::rename(&temp_path, &self.cache_path) {
-            // Clean up temp file on failure
-            let _ = fs::remove_file(&temp_path);
-            return Err(e.into());
-        }
+        // Stream the serializer to disk — the cache JSON is tens of MB, and
+        // building it in memory first spikes RSS on every 30s-reload save.
+        crate::infrastructure::atomic_write_with(&self.cache_path, |w| {
+            serde_json::to_writer(w, &self.data).map_err(io::Error::from)
+        })?;
         Ok(())
     }
 

@@ -139,24 +139,40 @@ impl TokenStats {
             self.cache_creation_5m_tokens += usage.cache_creation_input_tokens;
         }
     }
+
+    /// Fold another already-aggregated `TokenStats` into this one. The single
+    /// home for combining two token counts — a new token field is added here
+    /// only, instead of in every per-field fold site.
+    pub fn merge(&mut self, other: &TokenStats) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_5m_tokens += other.cache_creation_5m_tokens;
+        self.cache_creation_1h_tokens += other.cache_creation_1h_tokens;
+    }
 }
 
 pub struct StatsAggregator;
 
+/// Per-day accumulator shared by both aggregation paths (`StatsAggregator`
+/// and `DailyGrouper`) so a new per-day field is declared once, not mirrored
+/// in two structs that silently drift. Timestamps are `Option` (empty until
+/// the first entry of the day folds in).
 #[derive(Debug, Clone, Default)]
-struct DailyStats {
-    first_timestamp: Option<DateTime<Utc>>,
-    last_timestamp: Option<DateTime<Utc>>,
-    input_tokens: u64,
-    output_tokens: u64,
-    user_msgs: u64,
-    assistant_msgs: u64,
-    tokens_by_model: HashMap<String, TokenStats>,
-    hourly_activity: HashMap<u8, u64>,
-    hourly_work_activity: HashMap<u8, u64>,
-    tool_usage: HashMap<String, usize>,
-    language_usage: HashMap<String, usize>,
-    extension_usage: HashMap<String, usize>,
+pub(crate) struct DailyStats {
+    pub(crate) first_timestamp: Option<DateTime<Utc>>,
+    pub(crate) last_timestamp: Option<DateTime<Utc>>,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) user_msgs: u64,
+    pub(crate) assistant_msgs: u64,
+    pub(crate) tokens_by_model: HashMap<String, TokenStats>,
+    pub(crate) hourly_activity: HashMap<u8, u64>,
+    pub(crate) hourly_work_activity: HashMap<u8, u64>,
+    pub(crate) tool_usage: HashMap<String, usize>,
+    pub(crate) language_usage: HashMap<String, usize>,
+    pub(crate) extension_usage: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -293,9 +309,9 @@ impl StatsAggregator {
             if let Ok(entries) = JsonlParser::parse_file(file) {
                 // For Cowork audit.jsonl the in-stream `cwd` is meaningless
                 // (sandbox / outputs subdir); `resolve_project_name` swaps in
-                // the sibling metadata's `processName`. Non-cowork files are
-                // unaffected. This is the single source of truth used by both
-                // the cache writer here and the grouper in `grouping.rs`.
+                // the metadata's `userSelectedFolders` (real project) or a
+                // single `Cowork` bucket. Non-cowork files are unaffected.
+                // Single source of truth: cache writer here + `grouping.rs`.
                 let project_name = crate::infrastructure::resolve_project_name(
                     file,
                     Self::extract_project_name_from_entries(&entries),
@@ -424,13 +440,11 @@ impl StatsAggregator {
         }
 
         for (model, cached_ts) in &cached.model_tokens {
-            let model_stats = stats.model_tokens.entry(model.clone()).or_default();
-            model_stats.input_tokens += cached_ts.input_tokens;
-            model_stats.output_tokens += cached_ts.output_tokens;
-            model_stats.cache_creation_tokens += cached_ts.cache_creation_tokens;
-            model_stats.cache_read_tokens += cached_ts.cache_read_tokens;
-            model_stats.cache_creation_5m_tokens += cached_ts.cache_creation_5m_tokens;
-            model_stats.cache_creation_1h_tokens += cached_ts.cache_creation_1h_tokens;
+            stats
+                .model_tokens
+                .entry(model.clone())
+                .or_default()
+                .merge(cached_ts);
         }
 
         let session_tokens = cached.input_tokens

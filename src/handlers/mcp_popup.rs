@@ -136,7 +136,7 @@ pub(crate) fn adjust_mcp_scroll(state: &mut AppState, servers: &[String]) {
     // Pinned header rows above the scrollable body: blank + Total + tab bar + separator.
     // The summary (and optional legend) lives in body[0..] and scrolls with the rest.
     const HEADER_ROWS: usize = 4;
-    let visible_body = state.active_popup_area.map_or(20, |a| {
+    let visible_body = state.layout.active_popup_area.map_or(20, |a| {
         (a.height as usize).saturating_sub(2 + HEADER_ROWS).max(1)
     });
     // mcp_cursor_row returns server-relative (server 0 = row 0); add the pre-server

@@ -41,9 +41,23 @@
 #   26  `try_recv()` must use `match` with Disconnected arm
 #   27  No `from_timestamp(0, 0).unwrap()` — use UNIX_EPOCH
 #   28  Shell commands via `format!` must use `posix_shell_quote`
-#   29  Atomic tmp+rename must `sync_all` before rename
+#   29  Atomic writes route through infrastructure::atomic_write
 #   30  HashMap-sourced single-key sort needs `.then_with(...)` tiebreaker
 #   31  No leading `Line::from("")` in popup content vecs (title sits on border)
+#   32  Rate suffix `/day` not `/d`           (cross-surface format strings)
+#   33  Session unit `/ses` not `/sess`       (UI alignment)
+#   34  Date+weekday needs a space before `(%a)`
+#   35  Short date dash form `%m-%d` not slash
+#   36  Cost precision only `.0` / `.2`        (UI files)
+#   37  Percentage via format_pct (not raw `{pct:.0}%`)
+#   38  No past-state phrasing in comments
+#   39  Cost `${:.0}` routes through format_cost sig-figs
+#   40  Test uses save_if_changed_in (not the bare API)
+#   41  Comment block length cap (`//`≤5, `//!`≤20)
+#   42  (retired)
+#   43  Display truncation via text::truncate_with_ellipsis
+#   44  No bare subtraction inside `.repeat()` (bar fills)
+#   45  Toasts route through state.toast() (not raw toast_message)
 
 set -e
 
@@ -742,32 +756,31 @@ if [ -n "$SHELL_FORMAT" ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
-# 29. Atomic file writes (`tmp + rename`) must flush before rename.
-# Writing the tmp via `fs::write` and renaming on success is the standard
-# atomic pattern, but the data isn't durable across a power loss until
-# `sync_all` is called. Enforce sync by checking that any function
-# performing `fs::rename(&tmp, &path)` also references `sync_all`. The
-# allowlist `lint-ok: best-effort-tmp` covers genuinely transient writes
-# (e.g. lock files that get recreated).
-RENAME_NO_FSYNC=$(python3 -c "
-import re, os
-pat_rename = re.compile(r'fs::rename\(.*tmp.*,.*path')
-pat_sync = re.compile(r'sync_all')
-for root, dirs, files in os.walk('src/infrastructure'):
-    for fname in files:
-        if not fname.endswith('.rs'):
-            continue
-        path = os.path.join(root, fname)
-        with open(path) as f:
-            content = f.read()
-        if 'lint-ok: best-effort-tmp' in content:
-            continue
-        if pat_rename.search(content) and not pat_sync.search(content):
-            print(f'  {path}: fs::rename(tmp, path) without sync_all elsewhere in file')
-" 2>/dev/null || true)
-if [ -n "$RENAME_NO_FSYNC" ]; then
-    echo "ERROR: tmp+rename atomic write without \`sync_all\` — data not durable on power loss. Call \`f.sync_all()\` before rename (see cache.rs::save), or annotate with \`// lint-ok: best-effort-tmp\`:"
-    echo "$RENAME_NO_FSYNC"
+# 29. Durable atomic writes must route through `infrastructure::atomic_write`.
+# The tmp + sync_all + 0o600 + rename + cleanup details live in ONE place
+# (src/infrastructure/atomic.rs). Re-rolling them per writer is what let the
+# 0o600 and APFS perms-timing diverge across five writers. Two nets:
+# (a) any tmp-ish `with_extension("…tmp…")` outside atomic.rs;
+# (b) the write-then-rename signature — a file (outside atomic.rs) that calls
+#     `fs::rename` AND creates/writes a file without referencing atomic_write.
+ATOMIC_HANDROLL=$(grep -rEn 'with_extension\("[^"]*tmp' src/ 2>/dev/null \
+    | grep -v 'src/infrastructure/atomic.rs' | grep -v 'lint-ok: atomic-write' || true)
+if [ -n "$ATOMIC_HANDROLL" ]; then
+    echo "ERROR: hand-rolled atomic write (tmp name) — route durable writes through \`crate::infrastructure::atomic_write\` (atomic.rs is the single home for sync_all / 0o600 / cleanup):"
+    echo "$ATOMIC_HANDROLL"
+    ERRORS=$((ERRORS + 1))
+fi
+ATOMIC_SIGNATURE=""
+for f in $(grep -rl 'fs::rename(' src/ 2>/dev/null | grep -v 'src/infrastructure/atomic.rs'); do
+    if grep -qE 'File::create\(|fs::write\(' "$f" 2>/dev/null \
+        && ! grep -q 'atomic_write' "$f" 2>/dev/null \
+        && ! grep -q 'lint-ok: atomic-write' "$f" 2>/dev/null; then
+        ATOMIC_SIGNATURE="$ATOMIC_SIGNATURE$f"$'\n'
+    fi
+done
+if [ -n "$ATOMIC_SIGNATURE" ]; then
+    echo "ERROR: write-then-rename signature outside atomic.rs (file creates/writes AND renames without atomic_write) — hand-rolled persistence loses sync_all / 0o600 / tmp-cleanup:"
+    echo "$ATOMIC_SIGNATURE"
     ERRORS=$((ERRORS + 1))
 fi
 
@@ -1159,6 +1172,88 @@ print('\n'.join(hits))
 if [ -n "$LONG_COMMENTS" ]; then
     echo 'ERROR: comment block exceeds length cap — trim to the invariant or mark with `// lint-ok: long-comment` on the first line (see CLAUDE.md Comments / Length):'
     echo "$LONG_COMMENTS"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 43. Display-name truncation must route through `text::truncate_with_ellipsis`.
+# Re-rolling a width-aware loop (`UnicodeWidthChar::width` + `…`) or a char-count
+# cut (`chars().take(n)` + `…`) drifts the ellipsis and miscounts CJK width,
+# bypassing the "long names end with …" rule. Flag both shapes outside text.rs.
+# Width measurers and the no-ellipsis `truncate_to_display_width` are unaffected
+# (no `…`). Escape hatch: `// lint-ok: truncate`.
+TRUNC_DUP=$(python3 - <<'PYEOF' 2>/dev/null || true
+import os, re
+take = re.compile(r'\.chars\(\)\.take\(')
+hits = []
+for root, _, files in os.walk('src'):
+    for fname in files:
+        if not fname.endswith('.rs') or fname == 'text.rs':
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            if 'lint-ok: truncate' in line:
+                continue
+            # char-count truncator: chars().take(...) with an ellipsis nearby.
+            if take.search(line) and '…' in ''.join(lines[i:i+3]):
+                hits.append(f'  {path}:L{i+1}: {line.strip()}')
+                continue
+            # width-aware truncator dup: ellipsis output with a width loop above.
+            ell_out = ("push('…')" in line) or ('…\"' in line)
+            if ell_out and 'UnicodeWidthChar::width' in ''.join(lines[max(0, i - 12):i]):
+                hits.append(f'  {path}:L{i+1}: {line.strip()}')
+print('\n'.join(hits))
+PYEOF
+)
+if [ -n "$TRUNC_DUP" ]; then
+    echo "ERROR: re-rolled display truncation — call crate::text::truncate_with_ellipsis (single home, CJK-width-aware) instead of chars().take()+… or a width loop+…:"
+    echo "$TRUNC_DUP"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 44. Bar fills must not bare-subtract inside `.repeat()` — `width - filled`
+# panics on `usize` underflow when `filled > width` (ratio > 1 from an
+# out-of-range value). Use `crate::text::hbar(filled, width)` for the standard
+# `█`/`░` bar, or `width.saturating_sub(filled)` / `filled.min(width)` for
+# styled-span or custom-glyph bars.
+REPEAT_BARE_SUB=$(python3 -c "
+import os, re
+pat = re.compile(r'\.repeat\([^)]*[A-Za-z0-9_)] - [A-Za-z0-9_(][^)]*\)')
+hits = []
+for root, _, files in os.walk('src/ui'):
+    for fname in files:
+        if not fname.endswith('.rs'):
+            continue
+        path = os.path.join(root, fname)
+        with open(path) as f:
+            for i, line in enumerate(f, 1):
+                if 'lint-ok: repeat-sub' in line:
+                    continue
+                m = pat.search(line)
+                if m and 'saturating_sub' not in m.group(0) and '.min(' not in m.group(0):
+                    hits.append(f'  {path}:L{i}: {line.strip()}')
+print('\n'.join(hits))
+" 2>/dev/null || true)
+if [ -n "$REPEAT_BARE_SUB" ]; then
+    echo "ERROR: bare subtraction inside .repeat() — underflow panics when filled > width. Use crate::text::hbar(filled, width) or width.saturating_sub(filled):"
+    echo "$REPEAT_BARE_SUB"
+    ERRORS=$((ERRORS + 1))
+fi
+
+# 45. Toasts must route through `state.toast(msg)`. Setting `toast_message`
+# directly risks leaving `toast_time` unset, which strands the toast on screen
+# (it never expires). Matches the assignment alone (`toast_message =`) so a
+# line-wrapped `Some(...)` on the next line is still caught. The only
+# sanctioned assignment is inside `AppState::toast` itself.
+# `= None` clears a toast (no toast_time needed) and is allowed; only a raw
+# `Some(...)` assignment risks the stranded-toast footgun.
+TOAST_RAW=$(grep -rnE '\.toast_message\s*=([^=]|$)' src/ 2>/dev/null \
+    | grep -v 'self.toast_message = Some(msg.into())' \
+    | grep -v 'toast_message = None' || true)
+if [ -n "$TOAST_RAW" ]; then
+    echo "ERROR: raw \`toast_message = Some(...)\` — call \`state.toast(msg)\` so toast_time is set together (an unset toast_time strands the toast):"
+    echo "$TOAST_RAW"
     ERRORS=$((ERRORS + 1))
 fi
 

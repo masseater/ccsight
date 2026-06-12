@@ -7,6 +7,29 @@ mod tests {
     use chrono::Datelike;
     use std::time::Instant;
 
+    /// Sum every session's per-model token fields (the DailyGrouper path) into
+    /// one `TokenStats` for comparison with the StatsAggregator total. Single
+    /// copy of the 6-field accumulation so a new `TokenStats` field can't be
+    /// silently omitted from one of the three agreement tests.
+    fn sum_grouper_tokens(
+        groups: &[crate::aggregator::DailyGroup],
+    ) -> crate::aggregator::TokenStats {
+        let mut g = crate::aggregator::TokenStats::default();
+        for group in groups {
+            for session in &group.sessions {
+                for ts in session.day_tokens_by_model.values() {
+                    g.input_tokens += ts.input_tokens;
+                    g.output_tokens += ts.output_tokens;
+                    g.cache_creation_tokens += ts.cache_creation_tokens;
+                    g.cache_read_tokens += ts.cache_read_tokens;
+                    g.cache_creation_5m_tokens += ts.cache_creation_5m_tokens;
+                    g.cache_creation_1h_tokens += ts.cache_creation_1h_tokens;
+                }
+            }
+        }
+        g
+    }
+
     #[test]
     fn test_format_number() {
         // Under 1K
@@ -118,47 +141,32 @@ mod tests {
         }
     }
 
-    /// Regression: `StatsAggregator` (Overview cost) and `DailyGrouper`
-    /// (Daily tab / `--daily`) are independent aggregation paths over the
-    /// same files. Token totals MUST match — past divergences came from
-    /// dedup / `skip_tokens` quirks. Both honor the cache_5m/1h split.
+    /// Real-data twin of `stats_and_grouper_agree_on_fixture`: the two
+    /// independent aggregation paths (StatsAggregator / DailyGrouper) must
+    /// agree on token totals across ALL `~/.claude` files. `#[ignore]` —
+    /// slow (~3min) and races a live ccsight session mutating JSONLs; run via
+    /// `cargo test -- --ignored`. The fixture twin guards the per-commit gate.
     #[test]
+    #[ignore = "real-data agreement check — slow + live-drift; run via --ignored"]
     fn test_stats_and_grouper_agree_on_token_totals() {
         let result = load_data(0).unwrap();
         if result.file_count == 0 {
             return;
         }
 
-        let mut g_input = 0u64;
-        let mut g_output = 0u64;
-        let mut g_cache_w = 0u64;
-        let mut g_cache_r = 0u64;
-        let mut g_cache_5m = 0u64;
-        let mut g_cache_1h = 0u64;
-        for group in &result.daily_groups {
-            for session in &group.sessions {
-                for ts in session.day_tokens_by_model.values() {
-                    g_input += ts.input_tokens;
-                    g_output += ts.output_tokens;
-                    g_cache_w += ts.cache_creation_tokens;
-                    g_cache_r += ts.cache_read_tokens;
-                    g_cache_5m += ts.cache_creation_5m_tokens;
-                    g_cache_1h += ts.cache_creation_1h_tokens;
-                }
-            }
-        }
+        let g = sum_grouper_tokens(&result.daily_groups);
 
         // Two aggregators open JSONLs independently; in a dev env with a
         // live ccsight session, kilotoken drift can leak between passes.
-        // Real regressions produced megatoken gaps, so 0.1% stays sharp.
+        // Real regressions produced megatoken gaps, so 0.5% stays sharp.
         let s = &result.stats.total_tokens;
         let pairs: [(u64, u64, &str); 6] = [
-            (g_input, s.input_tokens, "input"),
-            (g_output, s.output_tokens, "output"),
-            (g_cache_w, s.cache_creation_tokens, "cache_w"),
-            (g_cache_r, s.cache_read_tokens, "cache_r"),
-            (g_cache_5m, s.cache_creation_5m_tokens, "cache_5m"),
-            (g_cache_1h, s.cache_creation_1h_tokens, "cache_1h"),
+            (g.input_tokens, s.input_tokens, "input"),
+            (g.output_tokens, s.output_tokens, "output"),
+            (g.cache_creation_tokens, s.cache_creation_tokens, "cache_w"),
+            (g.cache_read_tokens, s.cache_read_tokens, "cache_r"),
+            (g.cache_creation_5m_tokens, s.cache_creation_5m_tokens, "cache_5m"),
+            (g.cache_creation_1h_tokens, s.cache_creation_1h_tokens, "cache_1h"),
         ];
         for (g, s, name) in pairs {
             let max = g.max(s);
@@ -170,6 +178,250 @@ mod tests {
                 diff <= allowed,
                 "{name}: grouper={g} stats={s} diff={diff} > allowed={allowed} \
                  — the two aggregation paths diverged beyond mid-test drift."
+            );
+        }
+    }
+
+    /// Deterministic, fast per-commit twin of the real-data check above. A
+    /// fixture exercises the divergence-prone paths: cross-file
+    /// `(msg_id, requestId)` dedup, a subagent (`isSidechain`), the cache
+    /// 5m/1h split, two models. Static data → the paths must agree EXACTLY
+    /// and the deduped totals are known, so it also pins absolute correctness.
+    #[test]
+    fn stats_and_grouper_agree_on_fixture() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ccsight_agree_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `projA` sorts before `projB`, so A1's hash is inserted first and
+        // B1 (its cross-file duplicate) is the one skipped — but the deduped
+        // TOTAL is identical either way (the two rows carry equal usage).
+        let file_a = dir.join("projA.jsonl");
+        let file_b = dir.join("projB.jsonl");
+        let mut fa = std::fs::File::create(&file_a).unwrap();
+        writeln!(
+            fa,
+            r#"{{"type":"user","uuid":"ua1","timestamp":"2026-01-01T10:00:00Z","sessionId":"sess-a","cwd":"/tmp/projA","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            fa,
+            r#"{{"type":"assistant","uuid":"aa1","parentUuid":"ua1","timestamp":"2026-01-01T10:00:01Z","sessionId":"sess-a","requestId":"req-1","message":{{"id":"msg-1","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"r1"}}],"usage":{{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":300,"cache_read_input_tokens":200,"cache_creation":{{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100}}}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            fa,
+            r#"{{"type":"assistant","uuid":"aa2","parentUuid":"aa1","timestamp":"2026-01-01T10:00:02Z","sessionId":"sess-a","requestId":"req-2","message":{{"id":"msg-2","role":"assistant","model":"claude-sonnet-4-20250514","content":[{{"type":"text","text":"r2"}}],"usage":{{"input_tokens":50,"output_tokens":20}}}}}}"#
+        )
+        .unwrap();
+        let mut fb = std::fs::File::create(&file_b).unwrap();
+        writeln!(
+            fb,
+            r#"{{"type":"user","uuid":"ub1","timestamp":"2026-01-01T11:00:00Z","sessionId":"sess-b","cwd":"/tmp/projB","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        // Cross-file duplicate of req-1/msg-1 → billed once.
+        writeln!(
+            fb,
+            r#"{{"type":"assistant","uuid":"ab1","parentUuid":"ub1","timestamp":"2026-01-01T11:00:01Z","sessionId":"sess-b","requestId":"req-1","message":{{"id":"msg-1","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"dup"}}],"usage":{{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":300,"cache_read_input_tokens":200,"cache_creation":{{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100}}}}}}}}"#
+        )
+        .unwrap();
+        // Subagent (isSidechain) — must be included identically in both totals.
+        writeln!(
+            fb,
+            r#"{{"type":"assistant","uuid":"ab2","parentUuid":"ab1","timestamp":"2026-01-01T11:00:02Z","sessionId":"sess-b","isSidechain":true,"requestId":"req-3","message":{{"id":"msg-3","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"text","text":"sub"}}],"usage":{{"input_tokens":100,"output_tokens":40}}}}}}"#
+        )
+        .unwrap();
+
+        let files = vec![file_a, file_b];
+        let (stats, _) = StatsAggregator::aggregate_with_shared_cache(
+            &files,
+            crate::infrastructure::Cache::new_empty(),
+        );
+        let mut cache = Some(crate::infrastructure::Cache::new_empty());
+        let groups = DailyGrouper::group_by_date_with_shared_cache(&files, &mut cache);
+
+        let g = sum_grouper_tokens(&groups);
+        let s = &stats.total_tokens;
+
+        // Deterministic data → the two paths must agree EXACTLY.
+        assert_eq!(g.input_tokens, s.input_tokens, "input agreement");
+        assert_eq!(g.output_tokens, s.output_tokens, "output agreement");
+        assert_eq!(
+            g.cache_creation_tokens, s.cache_creation_tokens,
+            "cache_w agreement"
+        );
+        assert_eq!(g.cache_read_tokens, s.cache_read_tokens, "cache_r agreement");
+        assert_eq!(
+            g.cache_creation_5m_tokens, s.cache_creation_5m_tokens,
+            "cache_5m agreement"
+        );
+        assert_eq!(
+            g.cache_creation_1h_tokens, s.cache_creation_1h_tokens,
+            "cache_1h agreement"
+        );
+
+        // Absolute totals after dedup (req-1/msg-1 counted once):
+        // input 1000+50+100, output 500+20+40, cache_w 300, cache_r 200.
+        assert_eq!(s.input_tokens, 1150, "deduped input total");
+        assert_eq!(s.output_tokens, 560, "deduped output total");
+        assert_eq!(s.cache_creation_tokens, 300, "deduped cache_w total");
+        assert_eq!(s.cache_read_tokens, 200, "deduped cache_r total");
+        assert_eq!(s.cache_creation_5m_tokens, 200, "5m split");
+        assert_eq!(s.cache_creation_1h_tokens, 100, "1h split");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-path cache consistency: StatsAggregator and DailyGrouper must write
+    /// IDENTICAL per-day `CachedDailyStats` (one path's cache is read by the other).
+    /// The token-agreement tests check only token TOTALS; this pins EVERY per-day
+    /// field (tool_usage, language, msgs, hourly) so a future `fold_entry` merge of
+    /// the two entry-walk loops can't silently diverge them.
+    #[test]
+    fn both_paths_write_identical_cached_daily_stats() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ccsight_harness_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("proj.jsonl");
+        let mut f = std::fs::File::create(&file).unwrap();
+        // User turn + assistant carrying usage AND a ToolUse(Read x.rs): exercises
+        // user_msgs / assistant_msgs / tool_usage / language / extension / tokens
+        // / hourly — the per-day fields the two loops populate via different code.
+        writeln!(
+            f,
+            r#"{{"type":"user","uuid":"u1","timestamp":"2026-01-01T10:00:00Z","sessionId":"s","cwd":"/tmp/proj","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:01Z","sessionId":"s","requestId":"r1","message":{{"id":"m1","role":"assistant","model":"claude-opus-4-8","content":[{{"type":"tool_use","id":"t1","name":"Read","input":{{"file_path":"/tmp/x.rs"}}}}],"usage":{{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":30,"cache_read_input_tokens":20,"cache_creation":{{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":10}}}}}}}}"#
+        )
+        .unwrap();
+        // NOTE: a synthetic-model (`<...>`) ToolUse would diverge — DailyGrouper
+        // counts its tool while StatsAggregator's is_real_model `continue` skips
+        // it (stats.rs's documented intent). That combo doesn't occur in real
+        // data (synthetic entries carry no tool_use), so it stays latent; a
+        // fold_entry merge must pick one behavior and extend this fixture.
+        let files = vec![file.clone()];
+
+        // StatsAggregator consumes its cache; persist to a temp file and read back.
+        let temp_stats = dir.join("stats_cache.json");
+        let _ = StatsAggregator::aggregate_with_shared_cache(
+            &files,
+            crate::infrastructure::Cache::empty_at(temp_stats.clone()),
+        );
+        let stats_data: crate::infrastructure::CacheData =
+            serde_json::from_str(&std::fs::read_to_string(&temp_stats).unwrap()).unwrap();
+
+        // DailyGrouper takes `&mut Option<Cache>`; inspect it in-memory.
+        let mut group_cache =
+            Some(crate::infrastructure::Cache::empty_at(dir.join("group_cache.json")));
+        let _ = DailyGrouper::group_by_date_with_shared_cache(&files, &mut group_cache);
+        let group_cache = group_cache.unwrap();
+
+        let key = file.to_string_lossy().to_string();
+        let stats_daily = &stats_data.files[&key].daily_stats;
+        let group_daily = &group_cache.get(&file).unwrap().daily_stats;
+
+        // Order-independent (HashMaps): compare serialized JSON values.
+        assert_eq!(
+            serde_json::to_value(stats_daily).unwrap(),
+            serde_json::to_value(group_daily).unwrap(),
+            "StatsAggregator vs DailyGrouper per-day CachedDailyStats diverge"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sample of real `~/.claude` JSONL files: the oldest + newest by mtime
+    /// (most likely to carry schema drift — old fields vs newest schema) plus a
+    /// time-seeded random middle slice, so each run checks a different set of
+    /// real shapes. Empty (→ caller no-ops) on CI / a fresh checkout with no
+    /// data. Nothing leaves the machine; the test reads but never commits.
+    fn sample_real_jsonl(max_random: usize, boundary: usize) -> Vec<std::path::PathBuf> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let Ok(home) = std::env::var("HOME") else {
+            return vec![];
+        };
+        let pattern = format!("{home}/.claude/projects/*/*.jsonl");
+        let mut files: Vec<std::path::PathBuf> = glob::glob(&pattern)
+            .map(|g| g.filter_map(std::result::Result::ok).collect())
+            .unwrap_or_default();
+        if files.is_empty() {
+            return vec![];
+        }
+        files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let n = files.len();
+        let b = boundary.min(n);
+        let mut sample: Vec<std::path::PathBuf> = Vec::new();
+        sample.extend(files.iter().take(b).cloned());
+        sample.extend(files.iter().rev().take(b).cloned());
+        if n > 2 * b {
+            // Seeded by wall-clock nanos so the middle slice varies per run; the
+            // assertion is *agreement* (holds for any correct sample), so the
+            // randomness broadens shape coverage over runs without flaking.
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos()) as u64;
+            let mut mid: Vec<std::path::PathBuf> = files[b..n - b].to_vec();
+            mid.sort_by_key(|p| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                seed.hash(&mut h);
+                p.hash(&mut h);
+                h.finish()
+            });
+            sample.extend(mid.into_iter().take(max_random));
+        }
+        sample.sort();
+        sample.dedup();
+        sample
+    }
+
+    /// Real-data agreement check kept in the per-commit gate by running the two
+    /// aggregators over a SAMPLE of real files (not `load_data`-ing everything).
+    /// Catches shapes the hand-built fixture can't anticipate; no-ops on CI.
+    /// The fixture twin guards CI + pins absolute values; the pre-push hook runs
+    /// the `#[ignore]`d exhaustive all-files version over ALL of `~/.claude`.
+    #[test]
+    fn stats_and_grouper_agree_on_sampled_real_files() {
+        // Small sample keeps this in the per-commit gate; the time-seeded
+        // randomness broadens shape coverage across runs.
+        let sample = sample_real_jsonl(12, 2);
+        if sample.is_empty() {
+            return;
+        }
+        let (stats, _) = StatsAggregator::aggregate_with_shared_cache(
+            &sample,
+            crate::infrastructure::Cache::new_empty(),
+        );
+        let mut cache = Some(crate::infrastructure::Cache::new_empty());
+        let groups = DailyGrouper::group_by_date_with_shared_cache(&sample, &mut cache);
+
+        let g = sum_grouper_tokens(&groups);
+        let s = &stats.total_tokens;
+        let pairs: [(u64, u64, &str); 6] = [
+            (g.input_tokens, s.input_tokens, "input"),
+            (g.output_tokens, s.output_tokens, "output"),
+            (g.cache_creation_tokens, s.cache_creation_tokens, "cache_w"),
+            (g.cache_read_tokens, s.cache_read_tokens, "cache_r"),
+            (g.cache_creation_5m_tokens, s.cache_creation_5m_tokens, "cache_5m"),
+            (g.cache_creation_1h_tokens, s.cache_creation_1h_tokens, "cache_1h"),
+        ];
+        for (gv, sv, name) in pairs {
+            let max = gv.max(sv);
+            let diff = gv.abs_diff(sv);
+            // 0.5% + 1024 floor: a live ccsight session can mutate a sampled
+            // file between the two aggregator passes; real regressions are
+            // multi-megatoken, so this stays sharp.
+            let allowed = (max / 200).max(1024);
+            assert!(
+                diff <= allowed,
+                "{name}: grouper={gv} stats={sv} diff={diff} > allowed={allowed} \
+                 — the two aggregation paths diverged on sampled real files."
             );
         }
     }

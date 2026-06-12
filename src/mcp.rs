@@ -298,7 +298,7 @@ impl CcsightServer {
             .map(|(model, (cost, tokens))| {
                 serde_json::json!({
                     "model": model,
-                    "cost_usd": (cost * 100.0).round() / 100.0,
+                    "cost_usd": round_cents(cost),
                     "tokens": tokens,
                 })
             })
@@ -318,7 +318,7 @@ impl CcsightServer {
                     "project": project,
                     "sessions": sessions,
                     "work_tokens": work_tokens,
-                    "cost_usd": (cost * 100.0).round() / 100.0,
+                    "cost_usd": round_cents(cost),
                 })
             })
             .collect();
@@ -446,7 +446,7 @@ impl CcsightServer {
         let mut result = serde_json::json!({
             "period": period_label,
             "date_range": date_range,
-            "total_cost_usd": (total_cost * 100.0).round() / 100.0,
+            "total_cost_usd": round_cents(total_cost),
             "pricing_gap": pricing_gap_json,
             "mcp_servers": mcp_status_json,
             "total_sessions": session_count,
@@ -472,7 +472,7 @@ impl CcsightServer {
                 .map(|(date, (cost, sessions, tokens))| {
                     serde_json::json!({
                         "date": date.to_string(),
-                        "cost_usd": (cost * 100.0).round() / 100.0,
+                        "cost_usd": round_cents(cost),
                         "sessions": sessions,
                         "work_tokens": tokens,
                     })
@@ -622,7 +622,7 @@ impl CcsightServer {
                 "snippet": result.snippet,
                 "match_type": match_type,
                 "tokens": session.work_tokens(),
-                "cost_usd": (cost * 100.0).round() / 100.0,
+                "cost_usd": round_cents(cost),
                 "session_id": session_id,
                 "git_branch": session.git_branch,
             }));
@@ -1059,6 +1059,12 @@ impl CcsightServer {
     }
 }
 
+/// Round a dollar figure to whole cents for JSON `cost_usd` output. Clamps at
+/// 0 so a zero-token session can't emit `-0.0` (the TUI clamps via format_cost).
+fn round_cents(cost: f64) -> f64 {
+    (cost.max(0.0) * 100.0).round() / 100.0
+}
+
 fn clean_summary(text: &str) -> String {
     let text = text.trim();
     if text.starts_with("Implement the following plan:") || text.starts_with("/plan") {
@@ -1215,7 +1221,7 @@ fn build_session_json(
             "cache_creation": cache_creation,
             "cache_read": cache_read,
         },
-        "cost_usd": (cost * 100.0).round() / 100.0,
+        "cost_usd": round_cents(cost),
         "summary": summary,
         "git_branch": session.git_branch,
         "duration_mins": duration_mins,

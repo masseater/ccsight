@@ -124,6 +124,24 @@ pub enum ConvListMode {
     Live,
 }
 
+/// The single modal overlay currently shown, or `None`. Exactly one popup
+/// at a time — "two open at once" is unrepresentable, and the dismiss /
+/// guard sites match exhaustively so a new variant forces a decision. Pane
+/// view / search / breakdown-focus are separate axes, not popups here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActivePopup {
+    #[default]
+    None,
+    Help,
+    ProjectDetail,
+    Summary,
+    Detail,
+    DashboardDetail,
+    InsightsDetail,
+    FilterPopup,
+    ProjectPopup,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodFilter {
     All,
@@ -458,6 +476,58 @@ pub struct LoadedData {
 
 pub(crate) type LoadResult = Result<LoadedData, String>;
 
+/// Per-frame layout scratch: hit-test Rects the render pass writes and the
+/// mouse handlers read. No cross-field invariant — each field is reset by the
+/// draw pass that owns it (some in `draw()`, the trigger Rects in `draw_tabs`).
+/// Grouped out of `AppState` to keep the stateful fields legible.
+#[derive(Default)]
+pub struct LayoutAreas {
+    pub conversation_content_area: Option<ratatui::layout::Rect>,
+    pub tab_areas: Vec<(Tab, ratatui::layout::Rect)>,
+    pub tools_detail_tab_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Click areas for the per-category rows in the Dashboard Tools panel preview.
+    /// `(section_index, area)` where section_index matches `tools_detail_section`
+    /// (0=Tools (Built-in + MCP), 1=Skills, 2=Commands, 3=Subagents). Built-in and
+    /// MCP both route to section 0. Clicking opens the detail popup with that
+    /// section pre-selected.
+    pub tools_panel_category_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Click areas for MCP server rows in the Tools detail MCP tab. Each entry is
+    /// `(server_index, area)` where the index matches the sorted server list position.
+    /// Clicking a recorded area toggles expansion and moves the cursor to that server.
+    pub mcp_server_row_areas: Vec<(usize, ratatui::layout::Rect)>,
+    /// Click areas for project rows in the Projects detail popup (Dashboard
+    /// panel 1). `(project_index, area)` where index is the sorted projects
+    /// list position. Click selects the row; second click (or Enter) opens
+    /// the per-project detail popup.
+    pub project_detail_row_areas: Vec<(usize, ratatui::layout::Rect)>,
+    pub pane_areas: Vec<ratatui::layout::Rect>,
+    pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
+    pub insights_panel_areas: Vec<ratatui::layout::Rect>,
+    pub session_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
+    /// Active-frame row hit-test data. `(inner_rect, scroll, active_count)` so
+    /// `handle_mouse_click` can translate row coords into a session index.
+    /// The past-snapshot view reuses this single frame.
+    pub live_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
+    /// Paused-frame row hit-test data. `(inner_rect, scroll)`; the global
+    /// session index is `live_active.len() + row`. `None` in past view.
+    pub live_paused_list_area: Option<(ratatui::layout::Rect, usize)>,
+    pub breakdown_panel_area: Option<ratatui::layout::Rect>,
+    pub summary_popup_area: Option<ratatui::layout::Rect>,
+    pub active_popup_area: Option<ratatui::layout::Rect>,
+    pub daily_header_area: Option<ratatui::layout::Rect>,
+    // Tab-bar trigger Rects. Populated by `draw_tabs` only, which is skipped
+    // in conv view — `draw()` MUST reset these before rendering the conv
+    // layout, otherwise stale Rects from the previous frame shadow widgets
+    // placed at the same coords (e.g. per-pane `[i]` buttons).
+    pub filter_popup_area_trigger: Option<ratatui::layout::Rect>,
+    pub project_popup_area_trigger: Option<ratatui::layout::Rect>,
+    pub pin_view_trigger: Option<ratatui::layout::Rect>,
+    pub help_trigger: Option<ratatui::layout::Rect>,
+    pub filter_popup_area: Option<ratatui::layout::Rect>,
+    pub project_popup_area: Option<ratatui::layout::Rect>,
+    pub search_results_area: Option<ratatui::layout::Rect>,
+}
+
 pub struct AppState {
     pub needs_draw: bool,
     pub tab: Tab,
@@ -469,10 +539,15 @@ pub struct AppState {
     pub aggregated_model_tokens: std::collections::HashMap<String, TokenStats>,
     pub models_without_pricing: std::collections::HashSet<String>,
     pub daily_groups: Vec<DailyGroup>,
+    /// Per-day cost sums for the aggregate panels (Recent Costs, Costs
+    /// detail, monthly rollups). Deliberately carries no unpriced flag: the
+    /// "$?"/"*" marking is a per-session-view concern, and aggregate panels
+    /// render the plain (lower-bound) sum. `models_without_pricing` is the
+    /// surface that says WHICH models are missing rates.
     pub daily_costs: Vec<(NaiveDate, f64)>,
     pub selected_day: usize,
     pub selected_session: usize,
-    pub show_detail: bool,
+    pub active_popup: ActivePopup,
     /// When set, `draw_detail_popup` renders this session instead of the
     /// daily-filter-driven `(selected_day, selected_session)` pair. Used by
     /// the Live tab so detail can be inspected even when the session is
@@ -482,7 +557,6 @@ pub struct AppState {
     /// detail popup. Set alongside `session_detail_override` when the popup
     /// is opened from the Live tab.
     pub session_detail_live_extra: Option<(u32, String, String)>,
-    pub show_help: bool,
     /// Live sessions tab data — populated by `live_sessions_task` poller.
     pub live_active: Vec<crate::infrastructure::live_sessions::LiveSession>,
     pub live_paused: Vec<crate::infrastructure::live_sessions::LiveSession>,
@@ -532,12 +606,10 @@ pub struct AppState {
     /// Per-project drilldown popup. Opened from the Projects detail popup
     /// (panel 1) via Enter on the focused row. `project_detail_path` is the
     /// raw project_name (matching `SessionInfo::project_name` for lookup).
-    pub show_project_detail: bool,
     pub project_detail_path: String,
     pub project_detail_scroll: usize,
     pub help_scroll: u16,
     pub show_conversation: bool,
-    pub show_summary: bool,
     pub summary_content: String,
     pub summary_scroll: usize,
     pub summary_type: Option<SummaryType>,
@@ -556,7 +628,6 @@ pub struct AppState {
     /// (panel 1 / Projects). Cursor-less panels keep both in
     /// `dashboard_scroll`. Vim `scrolloff` pattern; mirrors MCP server detail.
     pub dashboard_viewport: [usize; 7],
-    pub show_dashboard_detail: bool,
     /// Daily Activity detail popup (panel 5) view toggle: `false` = per-day
     /// bars (the historical default), `true` = ISO-week aggregation. Toggled
     /// by `w` inside the popup; persisted for the session so reopening keeps
@@ -610,7 +681,6 @@ pub struct AppState {
     pub selecting: bool,
     pub mouse_down_pos: Option<(u16, u16)>,
     pub screen_buffer: Option<ratatui::buffer::Buffer>,
-    pub conversation_content_area: Option<ratatui::layout::Rect>,
     pub updating_session: Option<(usize, usize)>,
     pub updating_task: Option<(
         mpsc::Receiver<Result<String, String>>,
@@ -633,68 +703,31 @@ pub struct AppState {
     pub animation_frame: usize,
     pub retention_warning: Option<RetentionWarning>,
     pub retention_warning_dismissed: bool,
-    pub show_insights_detail: bool,
     pub insights_detail_scroll: usize,
     /// Vertical scroll offset for the Session/Conv detail popup (`show_detail`).
     /// Reset to 0 each time the popup is (re)opened.
     pub session_detail_scroll: usize,
+    /// "Recent conversation" preview for the Session Detail popup: the last few
+    /// `(role, one-line text)` messages, loaded once per session in the
+    /// background. `None` while loading. `session_detail_recent_for` records
+    /// which session's file the result belongs to so switching sessions
+    /// reloads and reopening the same one is instant.
+    pub session_detail_recent: Option<Vec<(String, String)>>,
+    pub session_detail_recent_task: Option<mpsc::Receiver<Vec<(String, String)>>>,
+    pub session_detail_recent_for: Option<PathBuf>,
     pub insights_panel: usize,
     pub toast_message: Option<String>,
     pub toast_time: Option<std::time::Instant>,
     pub panes: Vec<ConversationPane>,
     pub active_pane_index: Option<usize>,
     pub session_list_hidden: bool,
-    pub tab_areas: Vec<(Tab, ratatui::layout::Rect)>,
-    pub tools_detail_tab_areas: Vec<(usize, ratatui::layout::Rect)>,
-    /// Click areas for the per-category rows in the Dashboard Tools panel preview.
-    /// `(section_index, area)` where section_index matches `tools_detail_section`
-    /// (0=Tools (Built-in + MCP), 1=Skills, 2=Commands, 3=Subagents). Built-in and
-    /// MCP both route to section 0. Clicking opens the detail popup with that
-    /// section pre-selected.
-    pub tools_panel_category_areas: Vec<(usize, ratatui::layout::Rect)>,
-    /// Click areas for MCP server rows in the Tools detail MCP tab. Each entry is
-    /// `(server_index, area)` where the index matches the sorted server list position.
-    /// Clicking a recorded area toggles expansion and moves the cursor to that server.
-    pub mcp_server_row_areas: Vec<(usize, ratatui::layout::Rect)>,
-    /// Click areas for project rows in the Projects detail popup (Dashboard
-    /// panel 1). `(project_index, area)` where index is the sorted projects
-    /// list position. Click selects the row; second click (or Enter) opens
-    /// the per-project detail popup.
-    pub project_detail_row_areas: Vec<(usize, ratatui::layout::Rect)>,
-    pub pane_areas: Vec<ratatui::layout::Rect>,
-    pub dashboard_panel_areas: Vec<ratatui::layout::Rect>,
-    pub insights_panel_areas: Vec<ratatui::layout::Rect>,
-    pub session_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
-    /// Active-frame row hit-test data. `(inner_rect, scroll, active_count)` so
-    /// `handle_mouse_click` can translate row coords into a session index.
-    /// The past-snapshot view reuses this single frame.
-    pub live_list_area: Option<(ratatui::layout::Rect, usize, usize)>,
-    /// Paused-frame row hit-test data. `(inner_rect, scroll)`; the global
-    /// session index is `live_active.len() + row`. `None` in past view.
-    pub live_paused_list_area: Option<(ratatui::layout::Rect, usize)>,
-    pub breakdown_panel_area: Option<ratatui::layout::Rect>,
-    pub summary_popup_area: Option<ratatui::layout::Rect>,
-    pub active_popup_area: Option<ratatui::layout::Rect>,
-    pub daily_header_area: Option<ratatui::layout::Rect>,
-    // Tab-bar trigger Rects. Populated by `draw_tabs` only, which is skipped
-    // in conv view — `draw()` MUST reset these before rendering the conv
-    // layout, otherwise stale Rects from the previous frame shadow widgets
-    // placed at the same coords (e.g. per-pane `[i]` buttons).
-    pub filter_popup_area_trigger: Option<ratatui::layout::Rect>,
-    pub project_popup_area_trigger: Option<ratatui::layout::Rect>,
-    pub pin_view_trigger: Option<ratatui::layout::Rect>,
-    pub help_trigger: Option<ratatui::layout::Rect>,
-    pub filter_popup_area: Option<ratatui::layout::Rect>,
-    pub project_popup_area: Option<ratatui::layout::Rect>,
-    pub search_results_area: Option<ratatui::layout::Rect>,
+    pub layout: LayoutAreas,
     pub period_filter: PeriodFilter,
-    pub show_filter_popup: bool,
     pub filter_popup_selected: usize,
     pub filter_input_mode: bool,
     pub filter_input: TextInput,
     pub filter_input_error: bool,
     pub project_filter: Option<String>,
-    pub show_project_popup: bool,
     pub project_popup_selected: usize,
     pub project_popup_scroll: usize,
     pub project_list: Vec<(String, u64, NaiveDate)>,
@@ -726,6 +759,38 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Show a transient toast. Sets message and timestamp together so a caller
+    /// can't leave `toast_time` unset (which would strand the toast on screen).
+    pub fn toast(&mut self, msg: impl Into<String>) {
+        self.toast_message = Some(msg.into());
+        self.toast_time = Some(std::time::Instant::now());
+    }
+
+    pub fn show_help(&self) -> bool {
+        self.active_popup == ActivePopup::Help
+    }
+    pub fn show_project_detail(&self) -> bool {
+        self.active_popup == ActivePopup::ProjectDetail
+    }
+    pub fn show_summary(&self) -> bool {
+        self.active_popup == ActivePopup::Summary
+    }
+    pub fn show_detail(&self) -> bool {
+        self.active_popup == ActivePopup::Detail
+    }
+    pub fn show_dashboard_detail(&self) -> bool {
+        self.active_popup == ActivePopup::DashboardDetail
+    }
+    pub fn show_insights_detail(&self) -> bool {
+        self.active_popup == ActivePopup::InsightsDetail
+    }
+    pub fn show_filter_popup(&self) -> bool {
+        self.active_popup == ActivePopup::FilterPopup
+    }
+    pub fn show_project_popup(&self) -> bool {
+        self.active_popup == ActivePopup::ProjectPopup
+    }
+
     /// Single source of truth for "active days" — calendar days with at
     /// least one billable-token session. Matches the Costs panel ratio
     /// and the Overview headline so all surfaces agree.
@@ -904,10 +969,9 @@ impl AppState {
             daily_costs: Vec::new(),
             selected_day: 0,
             selected_session: 0,
-            show_detail: false,
+            active_popup: ActivePopup::None,
             session_detail_override: None,
             session_detail_live_extra: None,
-            show_help: false,
             help_scroll: 0,
             live_active: Vec::new(),
             live_paused: Vec::new(),
@@ -922,11 +986,9 @@ impl AppState {
             live_past_sessions: Vec::new(),
             live_past_snapshot_meta: None,
             live_past_snapshot_total: 0,
-            show_project_detail: false,
             project_detail_path: String::new(),
             project_detail_scroll: 0,
             show_conversation: false,
-            show_summary: false,
             summary_content: String::new(),
             summary_scroll: 0,
             summary_type: None,
@@ -947,7 +1009,6 @@ impl AppState {
             mcp_expanded_servers: std::collections::HashSet::new(),
             mcp_selected_server: 0,
             mcp_selected_tool: None,
-            show_dashboard_detail: false,
             search_mode: false,
             search_input: TextInput::default(),
             search_results: Vec::new(),
@@ -969,7 +1030,6 @@ impl AppState {
             selecting: false,
             mouse_down_pos: None,
             screen_buffer: None,
-            conversation_content_area: None,
             updating_session: None,
             updating_task: None,
             last_data_update: None,
@@ -980,45 +1040,24 @@ impl AppState {
             animation_frame: 0,
             retention_warning: crate::infrastructure::check_cleanup_period(),
             retention_warning_dismissed: false,
-            show_insights_detail: false,
             insights_detail_scroll: 0,
             session_detail_scroll: 0,
+            session_detail_recent: None,
+            session_detail_recent_task: None,
+            session_detail_recent_for: None,
             insights_panel: 0,
             toast_message: None,
             toast_time: None,
             panes: Vec::new(),
             active_pane_index: None,
             session_list_hidden: false,
-            tab_areas: Vec::new(),
-            tools_detail_tab_areas: Vec::new(),
-            tools_panel_category_areas: Vec::new(),
-            mcp_server_row_areas: Vec::new(),
-            project_detail_row_areas: Vec::new(),
-            pane_areas: Vec::new(),
-            dashboard_panel_areas: Vec::new(),
-            insights_panel_areas: Vec::new(),
-            session_list_area: None,
-            live_list_area: None,
-            live_paused_list_area: None,
-            breakdown_panel_area: None,
-            summary_popup_area: None,
-            active_popup_area: None,
-            daily_header_area: None,
-            filter_popup_area_trigger: None,
-            project_popup_area_trigger: None,
-            pin_view_trigger: None,
-            help_trigger: None,
-            filter_popup_area: None,
-            project_popup_area: None,
-            search_results_area: None,
+            layout: LayoutAreas::default(),
             period_filter: PeriodFilter::All,
-            show_filter_popup: false,
             filter_popup_selected: 0,
             filter_input_mode: false,
             filter_input: TextInput::default(),
             filter_input_error: false,
             project_filter: None,
-            show_project_popup: false,
             project_popup_selected: 0,
             project_popup_scroll: 0,
             project_list: Vec::new(),
@@ -1037,7 +1076,7 @@ impl AppState {
     }
 
     pub(crate) fn clear_summary(&mut self) {
-        self.show_summary = false;
+        self.active_popup = crate::ActivePopup::None;
         self.generating_summary = false;
         self.summary_task = None;
         self.summary_content.clear();
@@ -1174,11 +1213,14 @@ impl AppState {
             for group in &self.daily_groups {
                 for session in &group.sessions {
                     for (model, tokens) in &session.day_tokens_by_model {
-                        let entry = all_model_tokens.entry(model.clone()).or_default();
-                        entry.input_tokens += tokens.input_tokens;
-                        entry.output_tokens += tokens.output_tokens;
-                        entry.cache_creation_tokens += tokens.cache_creation_tokens;
-                        entry.cache_read_tokens += tokens.cache_read_tokens;
+                        // merge() carries the 5m/1h cache split — calculate_cost
+                        // prices those (no fallback to the flat total), so a
+                        // hand-rolled 4-field fold would zero the cache-write
+                        // cost for every model.
+                        all_model_tokens
+                            .entry(model.clone())
+                            .or_default()
+                            .merge(tokens);
                     }
                 }
             }
@@ -1232,13 +1274,15 @@ impl AppState {
                 stats.total_tokens.output_tokens += session.day_output_tokens;
 
                 for (model, tokens) in &session.day_tokens_by_model {
-                    let entry = stats.model_tokens.entry(model.clone()).or_default();
-                    entry.input_tokens += tokens.input_tokens;
-                    entry.output_tokens += tokens.output_tokens;
-                    entry.cache_creation_tokens += tokens.cache_creation_tokens;
-                    entry.cache_read_tokens += tokens.cache_read_tokens;
+                    stats
+                        .model_tokens
+                        .entry(model.clone())
+                        .or_default()
+                        .merge(tokens);
 
                     stats.total_tokens.cache_creation_tokens += tokens.cache_creation_tokens;
+                    stats.total_tokens.cache_creation_5m_tokens += tokens.cache_creation_5m_tokens;
+                    stats.total_tokens.cache_creation_1h_tokens += tokens.cache_creation_1h_tokens;
                     stats.total_tokens.cache_read_tokens += tokens.cache_read_tokens;
 
                     *stats.model_usage.entry(model.clone()).or_insert(0) += 1;
@@ -1407,6 +1451,32 @@ mod filtered_stats_tests {
             state.stats.total_sessions_count, 1,
             "session count must exclude the subagent"
         );
+    }
+
+    // The per-model fold must carry the 5m/1h cache split — calculate_cost
+    // prices ONLY those two fields (no fallback to the flat total), so a
+    // hand-rolled fold that drops them zeroes the cache-write cost for
+    // every model. Pins the rebuild path at its bug site.
+    #[test]
+    fn filtered_rebuild_keeps_per_model_cache_ttl_split() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // lint-ok: date-literal
+        let model = "claude-sonnet-4-20250514";
+        let mut s = make_session_with_tokens("~/proj", 1000, 500, model);
+        {
+            let ts = s.day_tokens_by_model.get_mut(model).unwrap();
+            ts.cache_creation_tokens = 300;
+            ts.cache_creation_5m_tokens = 200;
+            ts.cache_creation_1h_tokens = 100;
+            ts.cache_read_tokens = 50;
+        }
+        let mut state = make_test_app_state(vec![make_daily_group(date, vec![s])]);
+        state.period_filter = PeriodFilter::Custom(date, Some(date));
+        state.apply_filter();
+        let folded = &state.stats.model_tokens[model];
+        assert_eq!(folded.cache_creation_5m_tokens, 200, "5m split dropped");
+        assert_eq!(folded.cache_creation_1h_tokens, 100, "1h split dropped");
+        assert_eq!(folded.cache_creation_tokens, 300);
+        assert_eq!(folded.cache_read_tokens, 50);
     }
 
     #[test]

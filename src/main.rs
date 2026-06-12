@@ -123,6 +123,7 @@ fn main() -> io::Result<()> {
     // alone exits to keep cron-style pipelines TTY-error-free.
     // Path migration before any state path is looked up.
     infrastructure::migrate_legacy_state_dirs();
+    infrastructure::ensure_private_state_root();
 
     if args.clear_cache {
         if let Ok(cache_path) = infrastructure::cache_path() {
@@ -254,13 +255,11 @@ fn poll_clipboard_task(state: &mut AppState) {
             }
             Ok(Err(e)) => {
                 state.clipboard_task = None;
-                state.toast_message = Some(format!("Clipboard error: {e}"));
-                state.toast_time = Some(std::time::Instant::now());
+                state.toast(format!("Clipboard error: {e}"));
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 state.clipboard_task = None;
-                state.toast_message = Some("Clipboard write failed (thread panicked)".to_string());
-                state.toast_time = Some(std::time::Instant::now());
+                state.toast("Clipboard write failed (thread panicked)".to_string());
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -283,12 +282,348 @@ fn poll_index_build_task(state: &mut AppState) {
                 state.index_build_task = None;
                 state.last_index_build = Some(std::time::Instant::now());
                 if state.search_index.is_none() {
-                    state.toast_message = Some("Search index build failed; will retry".to_string());
-                    state.toast_time = Some(std::time::Instant::now());
+                    state.toast("Search index build failed; will retry".to_string());
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
+    }
+}
+
+/// File path of the session the detail popup is showing. Must mirror the two
+/// `draw_session_detail` call sites so the preview loads the right session:
+/// `session_detail_override` (Live) wins; in the conversation view the active
+/// pane's file path; otherwise the cursor in the current day's user sessions.
+fn detail_session_path(state: &AppState) -> Option<std::path::PathBuf> {
+    if let Some(ref s) = state.session_detail_override {
+        return Some(s.file_path.clone());
+    }
+    if state.show_conversation {
+        return state
+            .active_pane_index
+            .and_then(|i| state.panes.get(i))
+            .and_then(|p| p.file_path.clone())
+            .or_else(|| get_conv_session_file(state, state.selected_session));
+    }
+    let group = state.daily_groups.get(state.selected_day)?;
+    group
+        .user_sessions()
+        .nth(state.selected_session)
+        .map(|s| s.file_path.clone())
+}
+
+/// Kick off the background "Recent conversation" load when the detail popup is
+/// open and showing a session whose preview isn't loaded yet. Keyed on the
+/// file path so switching sessions reloads and reopening the same one is a
+/// no-op (cached result renders instantly).
+fn ensure_session_recent_load(state: &mut AppState) {
+    if !state.show_detail() {
+        return;
+    }
+    let Some(path) = detail_session_path(state) else {
+        return;
+    };
+    if state.session_detail_recent_for.as_ref() == Some(&path) {
+        return;
+    }
+    state.session_detail_recent_for = Some(path.clone());
+    state.session_detail_recent = None;
+    let (tx, rx) = mpsc::channel();
+    state.session_detail_recent_task = Some(rx);
+    thread::spawn(move || {
+        let recent = conversation::load_conversation(&path)
+            .map(|msgs| conversation::recent_message_previews(&msgs, 6))
+            .unwrap_or_default();
+        let _ = tx.send(recent);
+    });
+}
+
+fn poll_session_recent_task(state: &mut AppState) {
+    if let Some(ref rx) = state.session_detail_recent_task {
+        match rx.try_recv() {
+            Ok(recent) => {
+                state.session_detail_recent = Some(recent);
+                state.session_detail_recent_task = None;
+                state.needs_draw = true;
+            }
+            // Loader thread vanished — render as "no messages" rather than a
+            // stuck "loading…".
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.session_detail_recent = Some(Vec::new());
+                state.session_detail_recent_task = None;
+                state.needs_draw = true;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// Periodic-reload result. `Disconnected` means the reload thread panicked
+/// before sending — clear `data_reload_task` so the `is_some()` guard doesn't
+/// block all future reloads.
+fn poll_data_reload_task(state: &mut AppState) {
+    if let Some(ref reload_rx) = state.data_reload_task {
+        let outcome = reload_rx.try_recv();
+        match outcome {
+            Ok(result) => {
+                state.data_reload_task = None;
+                // Reset the throttle timestamp regardless of outcome so a
+                // transient load failure (filesystem hiccup, partial JSONL)
+                // doesn't immediately re-spawn the loader on the next tick
+                // and turn into a thread storm.
+                state.last_data_update = Some(std::time::Instant::now());
+                if let Ok(data) = result {
+                    state.apply_loaded_data(data);
+
+                    // The Recent-conversation preview is keyed by path only,
+                    // so without this a reopened detail popup would keep the
+                    // preview captured before this reload. Only invalidated
+                    // while the popup is closed — clearing mid-view would
+                    // flash "loading" and re-read the JSONL every reload.
+                    if !state.show_detail() {
+                        state.session_detail_recent_for = None;
+                        state.session_detail_recent = None;
+                    }
+
+                    if state.selected_day >= state.daily_groups.len() {
+                        state.selected_day = state.daily_groups.len().saturating_sub(1);
+                    }
+                    if let Some(group) = state.daily_groups.get(state.selected_day) {
+                        let session_count = group.user_sessions().count();
+                        if state.selected_session >= session_count {
+                            state.selected_session = session_count.saturating_sub(1);
+                        }
+                    }
+                    state.search_results.clear();
+                    state.search_selected = 0;
+                    start_index_build(state);
+                    if state.search_mode && !state.search_input.text.is_empty() {
+                        let ctx_owned = build_search_filter_ctx(state);
+                        state.search_results = search::perform_search(
+                            &state.daily_groups,
+                            &state.search_input.text,
+                            &ctx_owned.as_ref(),
+                        );
+                        start_content_search(state);
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.data_reload_task = None;
+                state.last_data_update = Some(std::time::Instant::now());
+                state.toast("Reload failed (thread panicked); retrying in 30s");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// Drain a tantivy/content search result into `search_results`, remapping
+/// stale `session_path` to the current `daily_groups` and re-applying filters
+/// (the view may have changed between dispatch and arrival). `Disconnected`
+/// clears the task so the spinner stops and `/` can restart.
+fn poll_search_task(state: &mut AppState) {
+    if let Some((ref rx, ref query)) = state.search_task {
+        match rx.try_recv() {
+            Ok(content_results) => {
+                if *query == state.search_input.text {
+                    let path_lookup: std::collections::HashMap<String, (usize, usize)> = state
+                        .daily_groups
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(day_idx, group)| {
+                            group
+                                .user_sessions()
+                                .enumerate()
+                                .map(move |(session_idx, session)| {
+                                    (
+                                        session.file_path.to_string_lossy().into_owned(),
+                                        (day_idx, session_idx),
+                                    )
+                                })
+                        })
+                        .collect();
+                    let (filters, _) = crate::search::parse_search_query(&state.search_input.text);
+                    let ctx_owned = build_search_filter_ctx(state);
+                    let ctx = ctx_owned.as_ref();
+                    for mut result in content_results {
+                        if let Some(path) = result.session_path.as_ref() {
+                            let Some(&(day_idx, session_idx)) = path_lookup.get(path) else {
+                                continue;
+                            };
+                            result.day_idx = day_idx;
+                            result.session_idx = session_idx;
+                        }
+                        // Filter step on top of the tantivy / file-content
+                        // hits — same predicates as `perform_search`.
+                        let group = state.daily_groups.get(result.day_idx);
+                        let session = group.and_then(|g| {
+                            g.sessions
+                                .iter()
+                                .filter(|s| !s.is_subagent)
+                                .nth(result.session_idx)
+                        });
+                        let Some(group) = group else { continue };
+                        let Some(session) = session else { continue };
+                        if !crate::search::period_matches_for_filter(
+                            group.date,
+                            filters.period,
+                            ctx.today,
+                        ) {
+                            continue;
+                        }
+                        if !crate::search::session_passes_filters(session, &filters, &ctx) {
+                            continue;
+                        }
+                        // Dedupe by file_path so a multi-day session doesn't
+                        // appear once per day. perform_search deduped its own
+                        // output; this catches tantivy hits that arrive after.
+                        let already = state.search_results.iter().any(|r| {
+                            let other = state.daily_groups.get(r.day_idx).and_then(|g| {
+                                g.sessions
+                                    .iter()
+                                    .filter(|s| !s.is_subagent)
+                                    .nth(r.session_idx)
+                            });
+                            other.is_some_and(|o| o.file_path == session.file_path)
+                        });
+                        if !already {
+                            state.search_results.push(result);
+                        }
+                    }
+                }
+                state.search_task = None;
+                state.searching = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.search_task = None;
+                state.searching = false;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// Splice a JSONL-summary regen result back into the right session, or surface
+/// the failure. `Disconnected` clears the slot so a panicked regen thread
+/// doesn't block future regens.
+fn poll_updating_task(state: &mut AppState) {
+    if let Some((ref rx, ref file_path, day_idx, _session_idx, actual_idx)) = state.updating_task {
+        let outcome = rx.try_recv();
+        match outcome {
+            Ok(result) => {
+                let file_path = file_path.clone();
+                state.updating_task = None;
+                state.updating_session = None;
+                // Error surface: a full Summary popup only when nothing else
+                // is open — replacing an open popup would clobber it (popups
+                // are mutually exclusive). Otherwise a toast, so the failure
+                // is still visible without stealing the user's context.
+                let report_error = |state: &mut AppState, msg: String| {
+                    if state.active_popup == crate::ActivePopup::None {
+                        state.active_popup = crate::ActivePopup::Summary;
+                        state.summary_content = msg;
+                        state.summary_scroll = 0;
+                    } else {
+                        state.toast(msg);
+                    }
+                };
+                match result {
+                    Ok(new_summary) => {
+                        if update_jsonl_summary(&file_path, &new_summary).is_ok() {
+                            if let Some(group) = state.daily_groups.get_mut(day_idx)
+                                && let Some(session) = group.sessions.get_mut(actual_idx)
+                            {
+                                session.summary = Some(new_summary);
+                            }
+                        } else {
+                            report_error(state, "❌ Failed to write JSONL file".to_string());
+                        }
+                    }
+                    Err(e) => {
+                        report_error(state, format!("❌ Error: {e}"));
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state.updating_task = None;
+                state.updating_session = None;
+                state.toast("Summary regen failed (thread panicked)");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// Drain each conversation pane's background message-load result. `Disconnected`
+/// clears the pane's flag so a panicked loader doesn't leave it "Loading…".
+fn poll_pane_loads(state: &mut AppState) {
+    for pane in &mut state.panes {
+        if let Some(ref rx) = pane.load_task {
+            match rx.try_recv() {
+                Ok(messages) => {
+                    let is_reload = !pane.messages.is_empty();
+                    let old_count = pane.message_lines.len();
+                    let was_at_last = old_count > 0 && pane.selected_message >= old_count - 1;
+
+                    pane.messages = messages;
+                    pane.loading = false;
+                    pane.load_task = None;
+                    pane.rendered = None;
+
+                    if is_reload {
+                        if was_at_last {
+                            if let Some(msg) = pane
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|m| !ui::is_thinking_only_message(m))
+                            {
+                                pane.focused_timestamp = msg.timestamp.clone();
+                            }
+                            pane.scroll = usize::MAX;
+                            pane.selected_message = usize::MAX;
+                        }
+                    } else {
+                        pane.search_matches.clear();
+                        pane.search_current = 0;
+                        pane.search_saved_scroll = None;
+                        pane.scroll = usize::MAX;
+                        pane.selected_message = usize::MAX;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pane.load_task = None;
+                    pane.loading = false;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+}
+
+/// Initial-load result. `Disconnected` means the loader thread panicked before
+/// sending — surface the error and clear `loading` so the spinner doesn't spin
+/// forever. `rx` is the run-local initial-load channel.
+fn poll_initial_load(state: &mut AppState, rx: &mpsc::Receiver<LoadResult>) {
+    if !state.loading {
+        return;
+    }
+    match rx.try_recv() {
+        Ok(Ok(data)) => {
+            state.apply_loaded_data(data);
+            state.loading = false;
+            start_index_build(state);
+        }
+        Ok(Err(e)) => {
+            state.error = Some(e);
+            state.loading = false;
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            state.error = Some("Initial data load failed (thread panicked)".to_string());
+            state.loading = false;
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
     }
 }
 
@@ -313,7 +648,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
     });
 
     loop {
-        if state.tab == Tab::Dashboard && !state.show_dashboard_detail {
+        if state.tab == Tab::Dashboard && !state.show_dashboard_detail() {
             let today = Local::now().date_naive();
             if let Some(oldest) = state.daily_groups.iter().map(|g| g.date).min() {
                 let days_from_oldest = (today - oldest).num_days().max(0) as usize;
@@ -354,77 +689,9 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             state.needs_draw = true;
         }
 
-        // Initial-load result. `Disconnected` means the loader thread
-        // panicked before sending — without this branch the `loading` flag
-        // would stay true forever and the spinner would spin indefinitely.
-        if state.loading {
-            match rx.try_recv() {
-                Ok(Ok(data)) => {
-                    state.apply_loaded_data(data);
-                    state.loading = false;
-                    start_index_build(&mut state);
-                }
-                Ok(Err(e)) => {
-                    state.error = Some(e);
-                    state.loading = false;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    state.error = Some("Initial data load failed (thread panicked)".to_string());
-                    state.loading = false;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_initial_load(&mut state, &rx);
 
-        // Periodic-reload result. `Disconnected` means the reload thread
-        // panicked before sending — without clearing `data_reload_task`,
-        // the `is_some()` guard would block all future reloads.
-        if let Some(ref reload_rx) = state.data_reload_task {
-            let outcome = reload_rx.try_recv();
-            match outcome {
-                Ok(result) => {
-                    state.data_reload_task = None;
-                    // Reset the throttle timestamp regardless of outcome so a
-                    // transient load failure (filesystem hiccup, partial JSONL)
-                    // doesn't immediately re-spawn the loader on the next tick
-                    // and turn into a thread storm.
-                    state.last_data_update = Some(std::time::Instant::now());
-                    if let Ok(data) = result {
-                        state.apply_loaded_data(data);
-
-                        if state.selected_day >= state.daily_groups.len() {
-                            state.selected_day = state.daily_groups.len().saturating_sub(1);
-                        }
-                        if let Some(group) = state.daily_groups.get(state.selected_day) {
-                            let session_count = group.user_sessions().count();
-                            if state.selected_session >= session_count {
-                                state.selected_session = session_count.saturating_sub(1);
-                            }
-                        }
-                        state.search_results.clear();
-                        state.search_selected = 0;
-                        start_index_build(&mut state);
-                        if state.search_mode && !state.search_input.text.is_empty() {
-                            let ctx_owned = build_search_filter_ctx(&state);
-                            state.search_results = search::perform_search(
-                                &state.daily_groups,
-                                &state.search_input.text,
-                                &ctx_owned.as_ref(),
-                            );
-                            start_content_search(&mut state);
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    state.data_reload_task = None;
-                    state.last_data_update = Some(std::time::Instant::now());
-                    state.toast_message =
-                        Some("Reload failed (thread panicked); retrying in 30s".to_string());
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_data_reload_task(&mut state);
 
         // Live sessions: poll every 5s. Reads ~/.claude/sessions/*.json
         // (Claude Code's first-party metadata) so no ambiguity; cost is a
@@ -500,48 +767,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             }
         }
 
-        if let Some((ref rx, ref file_path, day_idx, _session_idx, actual_idx)) =
-            state.updating_task
-        {
-            let outcome = rx.try_recv();
-            match outcome {
-                Ok(result) => {
-                    let file_path = file_path.clone();
-                    state.updating_task = None;
-                    state.updating_session = None;
-                    match result {
-                        Ok(new_summary) => {
-                            if update_jsonl_summary(&file_path, &new_summary).is_ok() {
-                                if let Some(group) = state.daily_groups.get_mut(day_idx)
-                                    && let Some(session) = group.sessions.get_mut(actual_idx)
-                                {
-                                    session.summary = Some(new_summary);
-                                }
-                            } else if !state.show_detail {
-                                state.show_summary = true;
-                                state.summary_content = "❌ Failed to write JSONL file".to_string();
-                                state.summary_scroll = 0;
-                            }
-                        }
-                        Err(e) => {
-                            if !state.show_detail {
-                                state.show_summary = true;
-                                state.summary_content = format!("❌ Error: {e}");
-                                state.summary_scroll = 0;
-                            }
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    state.updating_task = None;
-                    state.updating_session = None;
-                    state.toast_message =
-                        Some("Summary regen failed (thread panicked)".to_string());
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        poll_updating_task(&mut state);
 
         if state.show_conversation {
             for pane in &mut state.panes {
@@ -572,50 +798,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
             }
         }
 
-        for pane in &mut state.panes {
-            if let Some(ref rx) = pane.load_task {
-                match rx.try_recv() {
-                    Ok(messages) => {
-                        let is_reload = !pane.messages.is_empty();
-                        let old_count = pane.message_lines.len();
-                        let was_at_last = old_count > 0 && pane.selected_message >= old_count - 1;
-
-                        pane.messages = messages;
-                        pane.loading = false;
-                        pane.load_task = None;
-                        pane.rendered = None;
-
-                        if is_reload {
-                            if was_at_last {
-                                if let Some(msg) = pane
-                                    .messages
-                                    .iter()
-                                    .rev()
-                                    .find(|m| !ui::is_thinking_only_message(m))
-                                {
-                                    pane.focused_timestamp = msg.timestamp.clone();
-                                }
-                                pane.scroll = usize::MAX;
-                                pane.selected_message = usize::MAX;
-                            }
-                        } else {
-                            pane.search_matches.clear();
-                            pane.search_current = 0;
-                            pane.search_saved_scroll = None;
-                            pane.scroll = usize::MAX;
-                            pane.selected_message = usize::MAX;
-                        }
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        // Loader panicked. Without clearing the flag and
-                        // the rx, the pane would stay "Loading..." forever.
-                        pane.load_task = None;
-                        pane.loading = false;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-        }
+        poll_pane_loads(&mut state);
 
         poll_summary_task(&mut state);
 
@@ -626,93 +809,12 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 
         poll_index_build_task(&mut state);
 
-        if let Some((ref rx, ref query)) = state.search_task {
-            match rx.try_recv() {
-                Ok(content_results) => {
-                    if *query == state.search_input.text {
-                        // Remap tantivy `session_path` to current daily_groups
-                        // so filter changes between dispatch and arrival don't
-                        // leak stale `(day_idx, session_idx)`. File-content
-                        // fallback already targets the current view.
-                        let path_lookup: std::collections::HashMap<String, (usize, usize)> = state
-                            .daily_groups
-                            .iter()
-                            .enumerate()
-                            .flat_map(|(day_idx, group)| {
-                                group.user_sessions().enumerate().map(
-                                    move |(session_idx, session)| {
-                                        (
-                                            session.file_path.to_string_lossy().into_owned(),
-                                            (day_idx, session_idx),
-                                        )
-                                    },
-                                )
-                            })
-                            .collect();
-                        let (filters, _) =
-                            crate::search::parse_search_query(&state.search_input.text);
-                        let ctx_owned = build_search_filter_ctx(&state);
-                        let ctx = ctx_owned.as_ref();
-                        for mut result in content_results {
-                            if let Some(path) = result.session_path.as_ref() {
-                                let Some(&(day_idx, session_idx)) = path_lookup.get(path) else {
-                                    continue;
-                                };
-                                result.day_idx = day_idx;
-                                result.session_idx = session_idx;
-                            }
-                            // Filter step on top of the tantivy / file-content
-                            // hits — same predicates as `perform_search`.
-                            let group = state.daily_groups.get(result.day_idx);
-                            let session = group.and_then(|g| {
-                                g.sessions
-                                    .iter()
-                                    .filter(|s| !s.is_subagent)
-                                    .nth(result.session_idx)
-                            });
-                            let Some(group) = group else { continue };
-                            let Some(session) = session else { continue };
-                            if !crate::search::period_matches_for_filter(
-                                group.date,
-                                filters.period,
-                                ctx.today,
-                            ) {
-                                continue;
-                            }
-                            if !crate::search::session_passes_filters(session, &filters, &ctx) {
-                                continue;
-                            }
-                            // Dedupe by file_path so a multi-day session
-                            // doesn't appear once per day in the result
-                            // list. perform_search already deduped its
-                            // own output; this guard catches tantivy hits
-                            // that arrive after.
-                            let already = state.search_results.iter().any(|r| {
-                                let other = state.daily_groups.get(r.day_idx).and_then(|g| {
-                                    g.sessions
-                                        .iter()
-                                        .filter(|s| !s.is_subagent)
-                                        .nth(r.session_idx)
-                                });
-                                other.is_some_and(|o| o.file_path == session.file_path)
-                            });
-                            if !already {
-                                state.search_results.push(result);
-                            }
-                        }
-                    }
-                    state.search_task = None;
-                    state.searching = false;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Search thread panicked; clear so the spinner stops
-                    // and the next `/` keystroke can start a fresh search.
-                    state.search_task = None;
-                    state.searching = false;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
+        // Session Detail "Recent conversation" preview: trigger a background
+        // load when the popup opens on a new session, then drain the result.
+        ensure_session_recent_load(&mut state);
+        poll_session_recent_task(&mut state);
+
+        poll_search_task(&mut state);
 
         if event::poll(Duration::from_millis(50))? {
             let ev = match std::panic::catch_unwind(event::read) {
@@ -754,7 +856,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             state.text_selection = Some((sc, sr, mouse.column, mouse.row));
 
                             if state.show_conversation
-                                && let Some(ca) = state.conversation_content_area
+                                && let Some(ca) = state.layout.conversation_content_area
                             {
                                 let mut scrolled = false;
                                 let scroll_amount = 2;
@@ -795,7 +897,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             if let (Some(sel), Some(buf)) =
                                 (&state.text_selection, &state.screen_buffer)
                             {
-                                let conv_area = if let Some(pa) = state.active_popup_area {
+                                let conv_area = if let Some(pa) = state.layout.active_popup_area {
                                     Some(ratatui::layout::Rect {
                                         x: pa.x + 1,
                                         y: pa.y + 1,
@@ -803,7 +905,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                         height: pa.height.saturating_sub(2),
                                     })
                                 } else if state.show_conversation {
-                                    state.conversation_content_area
+                                    state.layout.conversation_content_area
                                 } else {
                                     None
                                 };
@@ -830,8 +932,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                                 );
                                 if !text.is_empty() {
                                     let len = text.chars().count();
-                                    state.toast_message = Some(format!("Copied ({len} chars)"));
-                                    state.toast_time = Some(std::time::Instant::now());
+                                    state.toast(format!("Copied ({len} chars)"));
                                     state.clipboard_task =
                                         Some(handlers::tasks::spawn_clipboard_write(text));
                                 }
@@ -908,8 +1009,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             break;
                         }
                         state.ctrl_c_pressed = true;
-                        state.toast_message = Some("Press again to quit".to_string());
-                        state.toast_time = Some(std::time::Instant::now());
+                        state.toast("Press again to quit".to_string());
                         state.needs_draw = true;
                         continue;
                     }
@@ -917,17 +1017,17 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                         state.ctrl_c_pressed = false;
                     }
 
-                    if state.show_help {
+                    if state.show_help() {
                         handlers::keyboard::handle_help_key(&mut state, key);
-                    } else if state.show_project_detail {
+                    } else if state.show_project_detail() {
                         handlers::keyboard::handle_project_detail_key(&mut state, key);
-                    } else if state.show_filter_popup {
+                    } else if state.show_filter_popup() {
                         handlers::keyboard::handle_filter_popup_key(&mut state, key);
-                    } else if state.show_project_popup {
+                    } else if state.show_project_popup() {
                         handlers::keyboard::handle_project_popup_key(&mut state, key);
-                    } else if state.show_summary {
+                    } else if state.show_summary() {
                         handlers::keyboard::handle_summary_popup_key(&mut state, key);
-                    } else if state.show_detail {
+                    } else if state.show_detail() {
                         // Detail popup wins over conv-view dispatch so its
                         // footer keys (r/R/s/S, ↑↓, i) reach the popup
                         // handler. Conv handler's Esc/Space duplicates live
@@ -949,9 +1049,9 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
                             start_content_search,
                             open_conversation_in_pane,
                         );
-                    } else if state.show_dashboard_detail {
+                    } else if state.show_dashboard_detail() {
                         handlers::keyboard::handle_dashboard_detail_key(&mut state, key);
-                    } else if state.show_insights_detail {
+                    } else if state.show_insights_detail() {
                         handlers::keyboard::handle_insights_detail_key(&mut state, key);
                     } else if handlers::keyboard::handle_default_key(
                         &mut state,
@@ -971,36 +1071,38 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 }
 
 /// Closes whichever popup overlay is currently showing. Adding a new
-/// `show_<x>` flag requires the same guard in three mouse handlers
+/// `ActivePopup` variant requires the same guard in three mouse handlers
 /// (`handle_mouse_click` / `handle_double_click` / `handle_mouse_scroll`)
 /// — review side-by-side; mechanical lint is too noisy because some
 /// popups legitimately skip double-click or scroll.
 pub(crate) fn dismiss_overlay(state: &mut AppState) {
-    if state.show_help {
-        state.show_help = false;
+    if state.show_help() {
+        state.active_popup = crate::ActivePopup::None;
         return;
     }
-    if state.show_project_detail {
-        state.show_project_detail = false;
+    if state.show_project_detail() {
+        // Drilled into from the Projects-list DashboardDetail popup; closing
+        // returns there, not to the bare dashboard (two-level drill-back).
+        state.active_popup = crate::ActivePopup::DashboardDetail;
         state.project_detail_scroll = 0;
         state.project_detail_path.clear();
         return;
     }
-    if state.show_filter_popup {
+    if state.show_filter_popup() {
         if state.filter_input_mode {
             state.filter_input_mode = false;
             state.filter_input.clear();
             state.filter_input_error = false;
         } else {
-            state.show_filter_popup = false;
+            state.active_popup = crate::ActivePopup::None;
         }
         return;
     }
-    if state.show_project_popup {
-        state.show_project_popup = false;
+    if state.show_project_popup() {
+        state.active_popup = crate::ActivePopup::None;
         return;
     }
-    if state.show_summary {
+    if state.show_summary() {
         state.clear_summary();
         return;
     }
@@ -1021,18 +1123,18 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
         state.search_preview_mode = false;
         return;
     }
-    if state.show_detail {
-        state.show_detail = false;
+    if state.show_detail() {
+        state.active_popup = crate::ActivePopup::None;
         state.session_detail_override = None;
         state.session_detail_live_extra = None;
         return;
     }
-    if state.show_dashboard_detail {
-        state.show_dashboard_detail = false;
+    if state.show_dashboard_detail() {
+        state.active_popup = crate::ActivePopup::None;
         return;
     }
-    if state.show_insights_detail {
-        state.show_insights_detail = false;
+    if state.show_insights_detail() {
+        state.active_popup = crate::ActivePopup::None;
         return;
     }
     if state.show_conversation {
@@ -1078,12 +1180,17 @@ pub(crate) fn dismiss_overlay(state: &mut AppState) {
 }
 
 pub(crate) fn has_blocking_popup(state: &AppState) -> bool {
-    state.show_help
-        || state.show_project_detail
-        || state.show_summary
-        || state.show_detail
-        || state.show_dashboard_detail
-        || state.show_insights_detail
+    use crate::ActivePopup::{
+        DashboardDetail, Detail, FilterPopup, Help, InsightsDetail, None, ProjectDetail,
+        ProjectPopup, Summary,
+    };
+    // Exhaustive so a new ActivePopup variant forces a blocking/non-blocking
+    // decision here. FilterPopup / ProjectPopup are non-blocking (clicks fall
+    // through to the underlying tab); the six detail/help overlays block.
+    match state.active_popup {
+        Help | ProjectDetail | Summary | Detail | DashboardDetail | InsightsDetail => true,
+        None | FilterPopup | ProjectPopup => false,
+    }
 }
 
 /// Total visible row count in the Live tab. Today view = active + paused;

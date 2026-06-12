@@ -38,12 +38,11 @@ pub(crate) fn step_live_view_snapshot(state: &mut AppState, delta: i32) {
     };
     let next = next.min(total);
     if next == state.live_view_snapshot_offset {
-        state.toast_message = Some(if delta > 0 {
-            "Already at oldest snapshot".to_string()
+        state.toast(if delta > 0 {
+            "Already at oldest snapshot"
         } else {
-            "Already at today".to_string()
+            "Already at today"
         });
-        state.toast_time = Some(std::time::Instant::now());
         return;
     }
     state.live_view_snapshot_offset = next;
@@ -100,11 +99,11 @@ pub(crate) fn step_live_view_snapshot(state: &mut AppState, delta: i32) {
     state.needs_draw = true;
 }
 
-/// `state.show_help == true` branch — Esc/q/? close, j/k/↑↓ scroll the body.
+/// `ActivePopup::Help` branch — Esc/q/? close, j/k/↑↓ scroll the body.
 pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
-            state.show_help = false;
+            state.active_popup = crate::ActivePopup::None;
             state.help_scroll = 0;
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -131,13 +130,16 @@ pub(crate) fn handle_help_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.show_project_detail == true` branch — Esc/q/Enter close (Enter
+/// `ActivePopup::ProjectDetail` branch — Esc/q/Enter close (Enter
 /// mirrors the insights detail pattern so the same key toggles open/close),
 /// j/k/↑↓ scroll.
 pub(crate) fn handle_project_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-            state.show_project_detail = false;
+            // Project detail is only ever drilled into from the Projects-list
+            // DashboardDetail popup, so closing returns there (the two-level
+            // drill-back), not straight to the bare dashboard.
+            state.active_popup = crate::ActivePopup::DashboardDetail;
             state.project_detail_scroll = 0;
             state.project_detail_path.clear();
         }
@@ -157,12 +159,12 @@ pub(crate) fn handle_project_detail_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.show_insights_detail == true` branch — Esc/q/Enter/i close,
+/// `ActivePopup::InsightsDetail` branch — Esc/q/Enter/i close,
 /// ←/→ h/l cycle through 4 panels (wrap), ↑/↓ j/k scroll the body.
 pub(crate) fn handle_insights_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('i') => {
-            state.show_insights_detail = false;
+            state.active_popup = crate::ActivePopup::None;
         }
         KeyCode::Left | KeyCode::Char('h') => {
             state.insights_panel = if state.insights_panel == 0 {
@@ -190,7 +192,7 @@ pub(crate) fn handle_insights_detail_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.show_filter_popup == true` branch — period filter popup with two
+/// `ActivePopup::FilterPopup` branch — period filter popup with two
 /// sub-modes (preset list nav vs Custom date input).
 pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
     let total_items = PeriodFilter::ALL_VARIANTS.len() + 1;
@@ -210,7 +212,7 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
                 if let Some(filter) = PeriodFilter::parse_custom(&state.filter_input.text) {
                     state.period_filter = filter;
                     state.apply_filter();
-                    state.show_filter_popup = false;
+                    state.active_popup = crate::ActivePopup::None;
                     state.filter_input_mode = false;
                     state.filter_input.clear();
                     state.filter_input_error = false;
@@ -248,7 +250,7 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
         let on_custom_row = state.filter_popup_selected == custom_idx;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => {
-                state.show_filter_popup = false;
+                state.active_popup = crate::ActivePopup::None;
             }
             KeyCode::Up | KeyCode::Char('k') if state.filter_popup_selected > 0 => {
                 state.filter_popup_selected -= 1;
@@ -260,7 +262,7 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
                 if state.filter_popup_selected < PeriodFilter::ALL_VARIANTS.len() {
                     state.period_filter = PeriodFilter::ALL_VARIANTS[state.filter_popup_selected];
                     state.apply_filter();
-                    state.show_filter_popup = false;
+                    state.active_popup = crate::ActivePopup::None;
                 } else {
                     state.filter_input_mode = true;
                     let text = match state.period_filter {
@@ -292,13 +294,13 @@ pub(crate) fn handle_filter_popup_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.show_detail == true` branch — Session detail popup. Esc/q/Enter/i
+/// `ActivePopup::Detail` branch — Session detail popup. Esc/q/Enter/i
 /// close, ↑↓/j/k scroll, Space toggles pin, C opens conversation in a new
 /// pane, S/r kicks off (re-)summary, R regenerates the JSONL summary.
 pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('i') => {
-            state.show_detail = false;
+            state.active_popup = crate::ActivePopup::None;
             state.session_detail_override = None;
             state.session_detail_live_extra = None;
         }
@@ -312,12 +314,8 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
             if let Some(group) = state.daily_groups.get(state.selected_day) {
                 let sessions: Vec<_> = group.user_sessions().collect();
                 if let Some(session) = sessions.get(state.selected_session) {
-                    state.pins.toggle(&session.file_path);
-                    if let Err(e) = state.pins.save() {
-                        state.toast_message = Some(format!("Pin save failed: {e}"));
-                        state.toast_time = Some(std::time::Instant::now());
-                    }
-                    state.needs_draw = true;
+                    let p = session.file_path.clone();
+                    crate::handlers::pane::toggle_pin(state, &p);
                 }
             }
         }
@@ -336,14 +334,12 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
                     Some(cmd) => {
                         state.clipboard_task =
                             Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-                        state.toast_message = Some(format!("Copied: {cmd}"));
+                        state.toast(format!("Copied: {cmd}"));
                     }
                     None => {
-                        state.toast_message =
-                            Some("Cowork — re-open from Claude Desktop".to_string());
+                        state.toast("Cowork — re-open from Claude Desktop");
                     }
                 }
-                state.toast_time = Some(std::time::Instant::now());
                 state.needs_draw = true;
             }
         }
@@ -361,7 +357,7 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
                     state.active_pane_index = Some(state.panes.len() - 1);
                     state.conv_list_mode = ConvListMode::Day;
                     state.show_conversation = true;
-                    state.show_detail = false;
+                    state.active_popup = crate::ActivePopup::None;
                     state.session_detail_override = None;
                     state.session_detail_live_extra = None;
                 }
@@ -672,12 +668,7 @@ pub(crate) fn handle_conversation_key(
             if state.active_pane_index.is_none()
                 && let Some(fp) = get_conv_session_file(state, state.selected_session)
             {
-                state.pins.toggle(&fp);
-                if let Err(e) = state.pins.save() {
-                    state.toast_message = Some(format!("Pin save failed: {e}"));
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-                state.needs_draw = true;
+                crate::handlers::pane::toggle_pin(state, &fp);
             }
         }
         KeyCode::Char('m') => {
@@ -926,10 +917,7 @@ pub(crate) fn handle_conversation_key(
             let idx = state.selected_session;
             if state.pins.move_down(idx) {
                 state.selected_session = idx + 1;
-                if let Err(e) = state.pins.save() {
-                    state.toast_message = Some(format!("Pin save failed: {e}"));
-                    state.toast_time = Some(std::time::Instant::now());
-                }
+                crate::handlers::pane::persist_pins(state);
                 if state.panes.len() == 1 {
                     preview_conversation_in_pane(state);
                 }
@@ -942,10 +930,7 @@ pub(crate) fn handle_conversation_key(
             let idx = state.selected_session;
             if state.pins.move_up(idx) {
                 state.selected_session = idx - 1;
-                if let Err(e) = state.pins.save() {
-                    state.toast_message = Some(format!("Pin save failed: {e}"));
-                    state.toast_time = Some(std::time::Instant::now());
-                }
+                crate::handlers::pane::persist_pins(state);
                 if state.panes.len() == 1 {
                     preview_conversation_in_pane(state);
                 }
@@ -986,15 +971,14 @@ pub(crate) fn handle_conversation_key(
             {
                 let content = ui::extract_message_text(msg);
                 let len = content.chars().count();
-                state.toast_message = Some(format!("Copied ({len} chars)"));
-                state.toast_time = Some(std::time::Instant::now());
+                state.toast(format!("Copied ({len} chars)"));
                 state.clipboard_task = Some(crate::handlers::tasks::spawn_clipboard_write(content));
             }
         }
         KeyCode::Char('i') => {
             // Only the open path lives here; closing is owned by the
             // Session Detail popup's own handler (`i`/Esc/q/Enter).
-            state.show_detail = true;
+            state.active_popup = crate::ActivePopup::Detail;
             state.session_detail_scroll = 0;
         }
         KeyCode::Enter if state.active_pane_index.is_none() => {
@@ -1020,8 +1004,7 @@ pub(crate) fn handle_default_key(
                 return true;
             }
             state.ctrl_c_pressed = true;
-            state.toast_message = Some("Press q again to quit".to_string());
-            state.toast_time = Some(std::time::Instant::now());
+            state.toast("Press q again to quit".to_string());
             state.needs_draw = true;
         }
         KeyCode::Esc if state.daily_breakdown_focus => {
@@ -1034,7 +1017,7 @@ pub(crate) fn handle_default_key(
             state.retention_warning_dismissed = true;
         }
         KeyCode::Char('?') => {
-            state.show_help = true;
+            state.active_popup = crate::ActivePopup::Help;
         }
         KeyCode::Char(' ') if state.tab == Tab::Live => {
             // Pin / unpin the currently-selected Live row — same semantics as
@@ -1042,12 +1025,7 @@ pub(crate) fn handle_default_key(
             // a single toggle path.
             let path = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
             if let Some(path) = path {
-                state.pins.toggle(&path);
-                if let Err(e) = state.pins.save() {
-                    state.toast_message = Some(format!("Pin save failed: {e}"));
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-                state.needs_draw = true;
+                crate::handlers::pane::toggle_pin(state, &path);
             }
         }
         KeyCode::Char('y') if state.tab == Tab::Live => {
@@ -1073,49 +1051,11 @@ pub(crate) fn handle_default_key(
                 );
                 state.clipboard_task =
                     Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-                state.toast_message = Some(format!("Copied: {cmd}"));
-                state.toast_time = Some(std::time::Instant::now());
+                state.toast(format!("Copied: {cmd}"));
             }
         }
         KeyCode::Char('i') if state.tab == Tab::Live => {
-            // Live sessions can sit outside the current filter, so look
-            // up in `original_daily_groups` and stash via
-            // `session_detail_override`. Snapshot live fields up-front to
-            // dodge the `live_selected_session` borrow.
-            let live_info = crate::live_selected_session(state).map(|live| {
-                let started = live
-                    .started_at
-                    .map(|t| {
-                        t.with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M")
-                            .to_string()
-                    })
-                    .unwrap_or_default();
-                (
-                    live.jsonl_path.clone(),
-                    live.pid,
-                    live.status.clone().unwrap_or_else(|| "—".to_string()),
-                    started,
-                )
-            });
-            if let Some((Some(jsonl), pid, status, started)) = live_info {
-                let found = state.original_daily_groups.iter().find_map(|g| {
-                    g.sessions
-                        .iter()
-                        .find(|s| s.file_path == jsonl && !s.is_subagent)
-                        .cloned()
-                });
-                if let Some(session) = found {
-                    state.session_detail_override = Some(session);
-                    state.session_detail_live_extra = Some((pid, status, started));
-                    state.show_detail = true;
-                    state.session_detail_scroll = 0;
-                } else {
-                    state.toast_message =
-                        Some("Session not yet indexed; ccsight reloads every 30s".to_string());
-                    state.toast_time = Some(std::time::Instant::now());
-                }
-            }
+            crate::handlers::pane::open_live_session_detail(state);
         }
         KeyCode::Enter if state.tab == Tab::Live => {
             let jsonl = crate::live_selected_session(state).and_then(|s| s.jsonl_path.clone());
@@ -1143,7 +1083,7 @@ pub(crate) fn handle_default_key(
             }
         }
         KeyCode::Char('f') => {
-            state.show_filter_popup = true;
+            state.active_popup = crate::ActivePopup::FilterPopup;
             state.filter_popup_selected =
                 if matches!(state.period_filter, PeriodFilter::Custom(_, _)) {
                     PeriodFilter::ALL_VARIANTS.len()
@@ -1155,7 +1095,7 @@ pub(crate) fn handle_default_key(
                 };
         }
         KeyCode::Char('p') => {
-            state.show_project_popup = true;
+            state.active_popup = crate::ActivePopup::ProjectPopup;
             // Preselect against the SAME sorted view the popup renders and the
             // Enter handler indexes (`project_list_sorted`, recency by
             // default) — using the raw `project_list` order here would land
@@ -1177,12 +1117,8 @@ pub(crate) fn handle_default_key(
             {
                 let sessions: Vec<_> = group.user_sessions().collect();
                 if let Some(session) = sessions.get(state.selected_session) {
-                    state.pins.toggle(&session.file_path);
-                    if let Err(e) = state.pins.save() {
-                        state.toast_message = Some(format!("Pin save failed: {e}"));
-                        state.toast_time = Some(std::time::Instant::now());
-                    }
-                    state.needs_draw = true;
+                    let p = session.file_path.clone();
+                    crate::handlers::pane::toggle_pin(state, &p);
                 }
             }
         }
@@ -1228,12 +1164,10 @@ pub(crate) fn handle_default_key(
         | KeyCode::Char('2')
         | KeyCode::Char('3')
         | KeyCode::Char('4') => {
-            if state.show_summary || state.generating_summary {
+            if state.show_summary() || state.generating_summary {
                 state.clear_summary();
             }
-            state.show_dashboard_detail = false;
-            state.show_insights_detail = false;
-            state.show_detail = false;
+            state.active_popup = crate::ActivePopup::None;
             state.session_detail_override = None;
             state.session_detail_live_extra = None;
             state.daily_breakdown_focus = false;
@@ -1389,9 +1323,9 @@ pub(crate) fn handle_default_key(
                 }
                 open_conversation_in_pane(state);
             } else if state.tab == Tab::Dashboard {
-                state.show_dashboard_detail = true;
+                state.active_popup = crate::ActivePopup::DashboardDetail;
             } else if state.tab == Tab::Insights {
-                state.show_insights_detail = true;
+                state.active_popup = crate::ActivePopup::InsightsDetail;
                 state.insights_detail_scroll = 0;
             }
         }
@@ -1495,10 +1429,10 @@ pub(crate) fn handle_default_key(
         }
         KeyCode::Char('i') => {
             if state.tab == Tab::Daily {
-                state.show_detail = true;
+                state.active_popup = crate::ActivePopup::Detail;
                 state.session_detail_scroll = 0;
             } else if state.tab == Tab::Insights {
-                state.show_insights_detail = true;
+                state.active_popup = crate::ActivePopup::InsightsDetail;
                 state.insights_detail_scroll = 0;
             }
         }
@@ -1507,7 +1441,7 @@ pub(crate) fn handle_default_key(
     false
 }
 
-/// `state.show_dashboard_detail == true` branch — Tools detail popup with
+/// `ActivePopup::DashboardDetail` branch — Tools detail popup with
 /// MCP-tab-specific cursor logic + cross-section/cross-panel navigation.
 /// MCP tab uses row-based cursor (`mcp_selected_server` indexes the sorted
 /// server list; `mcp_selected_tool` is `Option<usize>` for tool index within
@@ -1626,11 +1560,11 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
             if let Some((name, _)) = projects.get(state.dashboard_scroll[1]) {
                 state.project_detail_path = (*name).clone();
                 state.project_detail_scroll = 0;
-                state.show_project_detail = true;
+                state.active_popup = crate::ActivePopup::ProjectDetail;
             }
         }
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-            state.show_dashboard_detail = false;
+            state.active_popup = crate::ActivePopup::None;
         }
         KeyCode::Char('w') if state.dashboard_panel == 5 => {
             state.activity_view_weekly = !state.activity_view_weekly;
@@ -1710,7 +1644,7 @@ pub(crate) fn handle_dashboard_detail_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-/// `state.show_summary == true` branch — Esc/q close the popup, ↑↓/j/k scroll
+/// `ActivePopup::Summary` branch — Esc/q close the popup, ↑↓/j/k scroll
 /// the body, `r` re-runs the summary generation.
 pub(crate) fn handle_summary_popup_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
@@ -1890,13 +1824,13 @@ pub(crate) fn handle_search_mode_key(
     }
 }
 
-/// `state.show_project_popup == true` branch — Esc/q/p close, ↑↓/j/k navigate,
+/// `ActivePopup::ProjectPopup` branch — Esc/q/p close, ↑↓/j/k navigate,
 /// Enter applies the project filter (idx 0 = "All").
 pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
     let total = state.project_list.len() + 1;
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
-            state.show_project_popup = false;
+            state.active_popup = crate::ActivePopup::None;
         }
         KeyCode::Up | KeyCode::Char('k') if state.project_popup_selected > 0 => {
             state.project_popup_selected -= 1;
@@ -1916,7 +1850,7 @@ pub(crate) fn handle_project_popup_key(state: &mut AppState, key: KeyEvent) {
                 }
             }
             state.apply_filter();
-            state.show_project_popup = false;
+            state.active_popup = crate::ActivePopup::None;
         }
         _ => {}
     }
@@ -1936,6 +1870,19 @@ mod tests {
         step_live_view_snapshot(&mut state, -1);
         assert_eq!(state.live_view_snapshot_offset, 0);
         assert_eq!(state.toast_message.as_deref(), Some("Already at today"));
+    }
+
+    // Closing ProjectDetail must return to the Projects-list DashboardDetail
+    // popup (two-level drill-back), never the bare dashboard — mutual
+    // exclusion in ActivePopup makes None the natural wrong edit here.
+    #[test]
+    fn project_detail_esc_returns_to_dashboard_detail() {
+        let mut state = crate::test_helpers::helpers::make_test_app_state(Vec::new());
+        state.active_popup = crate::ActivePopup::ProjectDetail;
+        state.project_detail_path = "~/proj".to_string();
+        handle_project_detail_key(&mut state, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.active_popup, crate::ActivePopup::DashboardDetail);
+        assert!(state.project_detail_path.is_empty());
     }
 
     fn noop(_: &mut AppState) {}

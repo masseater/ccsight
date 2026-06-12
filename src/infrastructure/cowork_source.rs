@@ -3,9 +3,9 @@
 //! (macOS only; empty list on other platforms).
 //!
 //! ccsight reads `audit.jsonl` for conversation data and joins the
-//! sibling `local_<uuid>.json` for title / processName (sandbox `cwd` =
-//! `/sessions/<vmname>` is not user-friendly). The schema is unofficial
-//! and may change without notice; the reader skips malformed files
+//! sibling `local_<uuid>.json` for title / cliSessionId / userSelectedFolders
+//! (the sandbox `cwd` = `/sessions/<vmname>` is not user-friendly). The schema
+//! is unofficial and may change without notice; the reader skips malformed
 //! silently to stay tolerant of upstream churn.
 use std::path::{Path, PathBuf};
 
@@ -15,11 +15,11 @@ use serde::Deserialize;
 /// uses are deserialized; everything else is ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoworkMetadata {
-    /// Human-readable VM bundle name (e.g. `intelligent-eager-cerf`). Used as
-    /// project name because the sandbox `cwd` is `/sessions/<vmname>` which
-    /// isn't user-friendly.
-    #[serde(rename = "processName")]
-    pub process_name: Option<String>,
+    /// Real host folders the user pointed this Cowork session at. Present when
+    /// the session worked against an actual project (vs a sandbox / scheduled
+    /// / health-check run, where it is empty). Drives project attribution.
+    #[serde(rename = "userSelectedFolders", default)]
+    pub user_selected_folders: Vec<String>,
     /// User-curated session title (e.g. "IT general controls improvement
     /// report"). Maps to `SessionInfo.custom_title`.
     pub title: Option<String>,
@@ -93,30 +93,27 @@ pub fn read_metadata_for_audit(audit_path: &Path) -> Option<CoworkMetadata> {
     serde_json::from_str(&content).ok()
 }
 
-/// Best-effort project-name fallback when metadata json is missing/unreadable.
-/// Uses the stem of the session directory (`local_<uuid>` ⇒ `local_<uuid>`).
-pub fn fallback_project_name_from_audit(audit_path: &Path) -> String {
-    audit_path
-        .parent()
-        .and_then(|d| d.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("cowork")
-        .to_string()
-}
-
-/// User-facing project name. Regular JSONL → in-stream `cwd`; Cowork
-/// audit.jsonl → sibling metadata's `processName` (in-stream `cwd` is
-/// a meaningless sandbox path). Single source of truth — both cache
-/// writer and live grouper route through this.
+/// User-facing project name. Regular JSONL → in-stream `cwd`. Cowork
+/// audit.jsonl → its `userSelectedFolders` (real project) if any, else a
+/// single `Cowork` bucket — the in-stream `cwd` is a meaningless sandbox
+/// path. Single source of truth — both cache writer and live grouper route
+/// through this.
 pub fn resolve_project_name(file: &Path, extracted: Option<String>) -> Option<String> {
     if !is_cowork_audit_path(file) {
         return extracted;
     }
-    let meta = read_metadata_for_audit(file);
-    meta.as_ref()
-        .and_then(|m| m.process_name.clone())
-        .or(extracted)
-        .or_else(|| Some(fallback_project_name_from_audit(file)))
+    Some(cowork_project_name(read_metadata_for_audit(file).as_ref()))
+}
+
+/// Project name for a Cowork session: the real `userSelectedFolders` it was
+/// pointed at (so it merges with normal sessions there), else a single
+/// `Cowork` bucket. Folder-less Cowork (sandbox / scheduled / MCP health-check)
+/// otherwise scatters the Projects list with random per-session VM codenames.
+fn cowork_project_name(meta: Option<&CoworkMetadata>) -> String {
+    meta.and_then(|m| m.user_selected_folders.first())
+        .filter(|f| !f.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "Cowork".to_string())
 }
 
 /// Resolve the curated session title for Cowork sessions. Returns `None`
@@ -168,16 +165,9 @@ mod tests {
 
         // Metadata join should locate the sibling json.
         let meta = read_metadata_for_audit(&out[0]).expect("metadata present");
-        assert_eq!(meta.process_name.as_deref(), Some("happy-fox"));
         assert_eq!(meta.title.as_deref(), Some("Test session"));
 
         let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_fallback_project_name() {
-        let p = PathBuf::from("/tmp/acc/env/local_abc/audit.jsonl");
-        assert_eq!(fallback_project_name_from_audit(&p), "local_abc");
     }
 
     #[test]
@@ -202,5 +192,37 @@ mod tests {
             meta.cli_session_id.as_deref(),
             Some("abc12345-aaaa-bbbb-cccc-ddddeeeeffff")
         );
+    }
+
+    #[test]
+    fn resolve_project_name_passes_through_non_cowork() {
+        // Non-cowork path → the in-stream cwd is returned unchanged.
+        let plain = PathBuf::from("/Users/x/.claude/projects/-tmp/abc.jsonl");
+        assert_eq!(
+            resolve_project_name(&plain, Some("/Users/x/dev/foo".to_string())),
+            Some("/Users/x/dev/foo".to_string())
+        );
+    }
+
+    #[test]
+    fn cowork_project_name_is_folder_aware() {
+        // WITH a real folder → attributed there (merges with normal sessions).
+        let with_folder: CoworkMetadata =
+            serde_json::from_str(r#"{"userSelectedFolders":["/Users/x/dev/real"],"title":"w"}"#)
+                .unwrap();
+        assert_eq!(cowork_project_name(Some(&with_folder)), "/Users/x/dev/real");
+
+        // WITHOUT a folder (sandbox / scheduled / MCP check) → "Cowork" bucket,
+        // regardless of the random processName.
+        let sandbox: CoworkMetadata = serde_json::from_str(
+            r#"{"processName":"stoic-practical-bell","title":"Mcp connection check"}"#,
+        )
+        .unwrap();
+        assert_eq!(cowork_project_name(Some(&sandbox)), "Cowork");
+
+        // Empty folder list / missing metadata → bucket.
+        let empty: CoworkMetadata = serde_json::from_str(r#"{"userSelectedFolders":[]}"#).unwrap();
+        assert_eq!(cowork_project_name(Some(&empty)), "Cowork");
+        assert_eq!(cowork_project_name(None), "Cowork");
     }
 }

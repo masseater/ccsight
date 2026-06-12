@@ -376,9 +376,12 @@ fn draw_insights_weekly(
                     theme::LABEL_MUTED
                 }),
             ),
-            Span::styled("█".repeat(filled), Style::default().fg(bar_color)),
             Span::styled(
-                "░".repeat(bar_width - filled),
+                "█".repeat(filled.min(bar_width)),
+                Style::default().fg(bar_color),
+            ),
+            Span::styled(
+                "░".repeat(bar_width.saturating_sub(filled)),
                 Style::default().fg(theme::SEPARATOR),
             ),
             Span::styled(
@@ -925,7 +928,7 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(chunks[2]);
 
-    state.insights_panel_areas = vec![
+    state.layout.insights_panel_areas = vec![
         chunks[0],        // 0: Metrics
         chunks[1],        // 1: Today vs Average
         bottom_chunks[0], // 2: Weekly
@@ -938,23 +941,15 @@ pub(super) fn draw_insights(frame: &mut Frame, area: Rect, state: &mut AppState)
     // Weekly activity (all-time average by weekday)
     draw_insights_weekly(frame, bottom_chunks[0], state, today, calendar_days);
 
-    let help_spans = vec![
-        Span::styled(" ?", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":help ", Style::default().fg(theme::DIM)),
-        Span::styled("q", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":quit ", Style::default().fg(theme::DIM)),
-        Span::styled("←→", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":panel ", Style::default().fg(theme::DIM)),
-        Span::styled("↑↓", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":scroll ", Style::default().fg(theme::DIM)),
-        Span::styled("Enter", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":detail ", Style::default().fg(theme::DIM)),
-        Span::styled("/", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":search ", Style::default().fg(theme::DIM)),
-        Span::styled("m", Style::default().fg(theme::PRIMARY)),
-        Span::styled(":pins", Style::default().fg(theme::DIM)),
-    ];
-    let help_line = Paragraph::new(Line::from(help_spans));
+    let help_line = Paragraph::new(super::help_bar(&[
+        ("?", "help"),
+        ("q", "quit"),
+        ("←→", "panel"),
+        ("↑↓", "scroll"),
+        ("Enter", "detail"),
+        ("/", "search"),
+        ("m", "pins"),
+    ]));
     frame.render_widget(help_line, chunks[3]);
 }
 
@@ -1422,25 +1417,7 @@ fn insights_detail_metrics(
                 (180.0 + 38.0 * intensity) as u8,
                 (100.0 + 55.0 * intensity) as u8,
             );
-            let name: String = {
-                use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-                if UnicodeWidthStr::width(tool_name.as_str()) <= name_w {
-                    tool_name.clone()
-                } else {
-                    let mut width = 0usize;
-                    let mut result = String::new();
-                    for ch in tool_name.chars() {
-                        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
-                        if width + ch_w > name_w.saturating_sub(1) {
-                            break;
-                        }
-                        result.push(ch);
-                        width += ch_w;
-                    }
-                    result.push('…');
-                    result
-                }
-            };
+            let name = super::truncate_with_ellipsis(&tool_name, name_w);
             lines.push(Line::from(vec![
                 Span::styled(format!(" {name:<name_w$}"), Style::default().fg(color)),
                 Span::styled(
@@ -1723,17 +1700,13 @@ fn insights_detail_metrics(
 }
 
 pub(super) fn draw_insights_detail_popup(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let popup_width = 80.min(area.width.saturating_sub(4));
-    let popup_height = area.height.saturating_sub(4).min(40);
+    // Shared size with the Session / Dashboard detail popups (see
+    // `super::detail_popup_area`) so the three present identically.
+    let popup_area = super::detail_popup_area(area);
+    let popup_width = popup_area.width;
+    let popup_height = popup_area.height;
 
-    let popup_area = Rect {
-        x: area.x + (area.width.saturating_sub(popup_width)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_height)) / 2,
-        width: popup_width,
-        height: popup_height,
-    };
-
-    state.active_popup_area = Some(popup_area);
+    state.layout.active_popup_area = Some(popup_area);
     frame.render_widget(Clear, popup_area);
 
     let today = chrono::Local::now().date_naive();
