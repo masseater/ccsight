@@ -213,100 +213,142 @@ pub fn read_cwd_from_jsonl(path: &Path) -> Option<String> {
         if !line.contains("\"cwd\"") {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
-            && let Some(cwd) = v.get("cwd").and_then(|c| c.as_str())
-            && !cwd.is_empty()
-        {
-            return Some(cwd.to_string());
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            // Claude Code: top-level `cwd`; Codex CLI: `payload.cwd`
+            let cwd = v
+                .get("cwd")
+                .or_else(|| v.get("payload").and_then(|p| p.get("cwd")))
+                .and_then(|c| c.as_str());
+            if let Some(cwd) = cwd {
+                if !cwd.is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
         }
     }
     None
 }
 
-/// Scan `~/.claude/projects/**/*.jsonl` for sessions whose mtime is within
-/// `window` of `now` and whose UUID is *not* in `active_ids`. The returned
-/// sessions carry minimal metadata: cwd / name / status are unknown from a
-/// JSONL alone (callers can enrich from `state.daily_groups`).
+/// Scan `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`
+/// for sessions whose mtime is within `window` of `now` and whose UUID is
+/// *not* in `active_ids`. The returned sessions carry minimal metadata:
+/// cwd / name / status are unknown from a JSONL alone (callers can enrich
+/// from `state.daily_groups`).
 pub fn discover_recently_paused(
     active_ids: &std::collections::HashSet<String>,
     window: Duration,
     now: SystemTime,
 ) -> Vec<LiveSession> {
-    let Some(projects) = claude_projects_dir() else {
-        return Vec::new();
-    };
     let cutoff = now - window;
-    let Ok(project_entries) = std::fs::read_dir(&projects) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for project_dir in project_entries.flatten() {
-        let project_path = project_dir.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let Ok(jsonl_entries) = std::fs::read_dir(&project_path) else {
-            continue;
-        };
-        for jsonl_entry in jsonl_entries.flatten() {
-            let jsonl_path = jsonl_entry.path();
-            if jsonl_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(stem) = jsonl_path
-                .file_stem()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            // Subagent JSONL artifacts (`agent-<uuid>.jsonl`) are byproducts
-            // of a parent session and not user-resumable on their own —
-            // listing them in "Recently paused" is noise.
-            if stem.starts_with("agent-") {
-                continue;
-            }
-            if active_ids.contains(&stem) {
-                continue;
-            }
-            let Ok(modified) = std::fs::metadata(&jsonl_path).and_then(|m| m.modified()) else {
-                continue;
-            };
-            if modified < cutoff {
-                continue;
-            }
-            let jsonl_mtime = mtime_utc(&jsonl_path);
-            // Prefer the JSONL's authoritative `cwd` over the slug: a real
-            // `-` in the path is indistinguishable from the `/`→`-`
-            // separator, so reversing the slug collapses `foo-bar-baz` to
-            // `foo/bar/baz` and the label loses everything but the tail.
-            let cwd = read_cwd_from_jsonl(&jsonl_path).map_or_else(
-                || {
-                    let dir_name = project_path
-                        .file_name()
+
+    // Claude Code sessions
+    if let Some(projects) = claude_projects_dir() {
+        if let Ok(project_entries) = std::fs::read_dir(&projects) {
+            for project_dir in project_entries.flatten() {
+                let project_path = project_dir.path();
+                if !project_path.is_dir() {
+                    continue;
+                }
+                let Ok(jsonl_entries) = std::fs::read_dir(&project_path) else {
+                    continue;
+                };
+                for jsonl_entry in jsonl_entries.flatten() {
+                    let jsonl_path = jsonl_entry.path();
+                    if jsonl_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Some(stem) = jsonl_path
+                        .file_stem()
                         .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    PathBuf::from(dir_name.replace('-', "/"))
-                },
-                PathBuf::from,
-            );
-            out.push(LiveSession {
-                session_id: stem,
-                jsonl_path: Some(jsonl_path),
-                cwd,
-                name: None,
-                status: None,
-                pid: 0,
-                started_at: None,
-                updated_at: None,
-                jsonl_mtime,
-                is_live: false,
-                was_recently_live: false,
-            });
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if stem.starts_with("agent-") {
+                        continue;
+                    }
+                    if active_ids.contains(&stem) {
+                        continue;
+                    }
+                    let Ok(modified) = std::fs::metadata(&jsonl_path).and_then(|m| m.modified())
+                    else {
+                        continue;
+                    };
+                    if modified < cutoff {
+                        continue;
+                    }
+                    let jsonl_mtime = mtime_utc(&jsonl_path);
+                    let cwd = read_cwd_from_jsonl(&jsonl_path).map_or_else(
+                        || {
+                            let dir_name = project_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("");
+                            PathBuf::from(dir_name.replace('-', "/"))
+                        },
+                        PathBuf::from,
+                    );
+                    out.push(LiveSession {
+                        session_id: stem,
+                        jsonl_path: Some(jsonl_path),
+                        cwd,
+                        name: None,
+                        status: None,
+                        pid: 0,
+                        started_at: None,
+                        updated_at: None,
+                        jsonl_mtime,
+                        is_live: false,
+                        was_recently_live: false,
+                    });
+                }
+            }
         }
     }
+
+    // Codex CLI sessions
+    collect_codex_paused(&mut out, active_ids, cutoff);
+
     out.sort_by_key(|s| std::cmp::Reverse(s.jsonl_mtime.unwrap_or(DateTime::<Utc>::UNIX_EPOCH)));
     out
+}
+
+fn collect_codex_paused(
+    out: &mut Vec<LiveSession>,
+    active_ids: &std::collections::HashSet<String>,
+    cutoff: SystemTime,
+) {
+    let codex_files = super::codex_source::find_codex_session_files();
+    for jsonl_path in codex_files {
+        let session_id =
+            super::codex_source::codex_session_id_from_path(&jsonl_path).unwrap_or_default();
+        if session_id.is_empty() || active_ids.contains(&session_id) {
+            continue;
+        }
+        let Ok(modified) = std::fs::metadata(&jsonl_path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified < cutoff {
+            continue;
+        }
+        let jsonl_mtime = mtime_utc(&jsonl_path);
+        let cwd =
+            read_cwd_from_jsonl(&jsonl_path).map_or_else(|| PathBuf::from("Codex"), PathBuf::from);
+        out.push(LiveSession {
+            session_id,
+            jsonl_path: Some(jsonl_path),
+            cwd,
+            name: None,
+            status: None,
+            pid: 0,
+            started_at: None,
+            updated_at: None,
+            jsonl_mtime,
+            is_live: false,
+            was_recently_live: false,
+        });
+    }
 }
 
 /// Mark paused entries that were alive in the prior run's final snapshot
