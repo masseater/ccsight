@@ -248,9 +248,8 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                     "function_call_output" => {
                         let output = payload
                             .get("output")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                            .cloned()
+                            .unwrap_or(serde_json::Value::String(String::new()));
                         let call_id = payload
                             .get("call_id")
                             .and_then(|v| v.as_str())
@@ -258,7 +257,7 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
 
                         pending_tool_calls.push(ContentBlock::ToolResult {
                             tool_use_id: call_id,
-                            content: serde_json::Value::String(output),
+                            content: output,
                             is_error: false,
                         });
                     }
@@ -338,10 +337,6 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
             request_id: None,
         });
     }
-
-    // Extract git branch from cwd if it looks like a codex-app-spaces path
-    // (Codex doesn't record git_branch directly in its JSONL)
-    populate_git_branch_from_cwd(&mut entries);
 
     Ok(entries)
 }
@@ -434,13 +429,6 @@ fn extract_text_from_content_array(payload: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn populate_git_branch_from_cwd(entries: &mut [LogEntry]) {
-    // Codex doesn't directly emit git branch. We could run `git` to detect
-    // it, but that's an I/O side-effect the parser shouldn't have. Leave
-    // git_branch as None — the aggregator will handle it gracefully.
-    let _ = entries;
 }
 
 #[cfg(test)]
@@ -594,6 +582,35 @@ mod tests {
             entries[1].message.as_ref().unwrap().content.extract_text(),
             "Here is my response"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_parse_tool_only_turn_creates_assistant_via_token_count() {
+        let tmp =
+            std::env::temp_dir().join(format!("ccsight-codex-toolonly-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let path = write_codex_session(
+            &tmp,
+            &[
+                r#"{"timestamp":"2026-06-20T00:01:16Z","type":"session_meta","payload":{"id":"t1","cwd":"/proj"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:17Z","type":"turn_context","payload":{"model":"o3"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:18Z","type":"event_msg","payload":{"type":"user_message","message":"Run tests"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:19Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:20Z","type":"response_item","payload":{"type":"function_call_output","output":"ok","call_id":"c1"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:21Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":50}}}}"#,
+            ],
+        );
+
+        let entries = parse_codex_file(&path).unwrap();
+        // User + synthetic assistant (created by ensure_assistant_entry)
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].entry_type, EntryType::Assistant);
+        let usage = entries[1].message.as_ref().unwrap().usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 200);
 
         let _ = fs::remove_dir_all(&tmp);
     }
