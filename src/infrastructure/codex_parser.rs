@@ -242,6 +242,9 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                             call_id_map.insert(cid, idx);
                         }
                     }
+                    // ToolResult lands on assistant-role entries (unlike
+                    // Claude Code where ToolResult is on user-role). All
+                    // current consumers iterate blocks unconditionally.
                     "function_call_output" => {
                         let output = payload
                             .get("output")

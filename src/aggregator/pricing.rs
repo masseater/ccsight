@@ -363,6 +363,7 @@ impl CostCalculator {
         );
 
         // --- OpenAI models (Codex CLI) ---
+        // Pricing: https://openai.com/api/pricing/
         // OpenAI has no cache write concept; cache_write fields are 0.
         // cache_read maps to OpenAI's "cached input" discount.
 
