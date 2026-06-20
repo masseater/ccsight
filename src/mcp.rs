@@ -10,7 +10,22 @@ use crate::aggregator::{CostCalculator, DailyGroup, DailyGrouper};
 use crate::conversation::{ConversationBlock, ConversationMessage, load_conversation};
 use crate::infrastructure::FileDiscovery;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn session_full_id(file_path: &Path) -> String {
+    crate::infrastructure::cowork_session_id(file_path)
+        .or_else(|| {
+            file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn session_short_id(file_path: &Path) -> String {
+    session_full_id(file_path).chars().take(8).collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct CcsightServer {
@@ -597,14 +612,7 @@ impl CcsightServer {
 
             let cost: f64 = session.cost(calculator);
 
-            let session_id: String = session
-                .file_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .chars()
-                .take(8)
-                .collect();
+            let session_id = session_short_id(&session.file_path);
 
             let match_type = match result.match_type {
                 crate::search::SearchMatchType::ProjectName => "project",
@@ -951,12 +959,7 @@ impl CcsightServer {
             .iter()
             .filter(|g| date_filter.is_none() || Some(g.date) == date_filter)
             .flat_map(|g| g.sessions.iter().map(move |s| (g.date, s)))
-            .find(|(_, s)| {
-                s.file_path
-                    .file_stem()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(session_id))
-            });
+            .find(|(_, s)| session_full_id(&s.file_path).starts_with(session_id));
 
         let Some((date, session)) = found else {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -1189,14 +1192,7 @@ fn build_session_json(
     );
     let duration_mins = (session.day_last_timestamp - session.day_first_timestamp).num_minutes();
 
-    let session_id = session
-        .file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .chars()
-        .take(8)
-        .collect::<String>();
+    let session_id = session_short_id(&session.file_path);
 
     let model_display = session
         .model
