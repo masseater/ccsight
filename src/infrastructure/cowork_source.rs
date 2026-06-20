@@ -99,6 +99,9 @@ pub fn read_metadata_for_audit(audit_path: &Path) -> Option<CoworkMetadata> {
 /// path. Single source of truth — both cache writer and live grouper route
 /// through this.
 pub fn resolve_project_name(file: &Path, extracted: Option<String>) -> Option<String> {
+    if super::codex_source::is_codex_path(file) {
+        return super::codex_source::resolve_codex_project_name(file, extracted);
+    }
     if !is_cowork_audit_path(file) {
         return extracted;
     }
@@ -131,6 +134,9 @@ pub fn resolve_cowork_title(file: &Path) -> Option<String> {
 /// `audit` (the stem of every `audit.jsonl`). Returns `None` for non-cowork
 /// files so the regular file-stem path is unaffected.
 pub fn cowork_session_id(file: &Path) -> Option<String> {
+    if super::codex_source::is_codex_path(file) {
+        return super::codex_source::codex_session_id_from_path(file);
+    }
     if !is_cowork_audit_path(file) {
         return None;
     }

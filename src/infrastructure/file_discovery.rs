@@ -67,12 +67,11 @@ impl FileDiscovery {
             Vec::new()
         };
 
-        // Cowork session logs (Claude Desktop sandbox) live outside `~/.claude/`
-        // and use the same JSONL line shape with a few field renames the
-        // parser handles. Empty on platforms without the dir. Discovery is
-        // silent here — printing to stderr corrupts the TUI; future format
-        // breakage surfaces via per-file parse warnings instead.
+        // External session logs (Cowork / Codex) live outside ~/.claude/
+        // and use different JSONL schemas; per-source parsers handle the
+        // translation. Empty on platforms without the respective dirs.
         files.extend(super::cowork_source::find_cowork_audit_files());
+        files.extend(super::codex_source::find_codex_session_files());
 
         files.sort_by(|a, b| {
             let a_modified = a.metadata().and_then(|m| m.modified()).ok();

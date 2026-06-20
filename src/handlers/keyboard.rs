@@ -337,7 +337,11 @@ pub(crate) fn handle_session_detail_key(state: &mut AppState, key: KeyEvent) {
                         state.toast(format!("Copied: {cmd}"));
                     }
                     None => {
-                        state.toast("Cowork — re-open from Claude Desktop");
+                        if crate::infrastructure::is_codex_path(&path) {
+                            state.toast("Codex session — resume from Codex CLI");
+                        } else {
+                            state.toast("Cowork — re-open from Claude Desktop");
+                        }
                     }
                 }
                 state.needs_draw = true;
@@ -1034,24 +1038,25 @@ pub(crate) fn handle_default_key(
             let sel = crate::live_selected_session(state)
                 .map(|s| (s.jsonl_path.clone(), s.cwd.clone(), s.session_id.clone()));
             if let Some((jsonl_path, fallback_cwd, session_id)) = sel {
-                // Authoritative cwd = the JSONL's `cwd` field; it preserves a
-                // literal `-` in the path that the slug reversal mangles into
-                // `/`. Fall back to the discovered cwd (pid.json for active
-                // sessions) only when no JSONL exists yet.
-                let cwd = jsonl_path
+                let is_codex = jsonl_path
                     .as_deref()
-                    .and_then(crate::infrastructure::live_sessions::read_cwd_from_jsonl)
-                    .unwrap_or_else(|| fallback_cwd.to_string_lossy().into_owned());
-                // Both cwd and session_id are POSIX-quoted — the underlying
-                // JSON is on disk and could be tampered with.
-                let cmd = format!(
-                    "cd {} && claude -r {}",
-                    crate::shell::shell_quote_cwd(&cwd),
-                    crate::shell::posix_shell_quote(&session_id),
-                );
-                state.clipboard_task =
-                    Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
-                state.toast(format!("Copied: {cmd}"));
+                    .is_some_and(crate::infrastructure::is_codex_path);
+                if is_codex {
+                    state.toast("Codex session — resume from Codex CLI");
+                } else {
+                    let cwd = jsonl_path
+                        .as_deref()
+                        .and_then(crate::infrastructure::live_sessions::read_cwd_from_jsonl)
+                        .unwrap_or_else(|| fallback_cwd.to_string_lossy().into_owned());
+                    let cmd = format!(
+                        "cd {} && claude -r {}",
+                        crate::shell::shell_quote_cwd(&cwd),
+                        crate::shell::posix_shell_quote(&session_id),
+                    );
+                    state.clipboard_task =
+                        Some(crate::handlers::tasks::spawn_clipboard_write(cmd.clone()));
+                    state.toast(format!("Copied: {cmd}"));
+                }
             }
         }
         KeyCode::Char('i') if state.tab == Tab::Live => {
