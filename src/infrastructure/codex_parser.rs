@@ -299,11 +299,12 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                     }
                     "message" => {
                         let role_str = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                        if role_str == "user" {
-                            let text = extract_text_from_content_array(payload);
-                            if !text.is_empty()
-                                && entries.iter().all(|e| e.entry_type != EntryType::User)
-                            {
+                        let text = extract_text_from_content_array(payload);
+                        if text.is_empty() {
+                            continue;
+                        }
+                        match role_str {
+                            "user" => {
                                 entries.push(LogEntry {
                                     uuid: None,
                                     parent_uuid: None,
@@ -328,6 +329,40 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                                     request_id: None,
                                 });
                             }
+                            "assistant" => {
+                                let content = if pending_tool_calls.is_empty() {
+                                    MessageContent::Text(text)
+                                } else {
+                                    let mut blocks = vec![ContentBlock::Text { text }];
+                                    blocks.append(&mut pending_tool_calls);
+                                    call_id_map.clear();
+                                    MessageContent::Blocks(blocks)
+                                };
+                                entries.push(LogEntry {
+                                    uuid: None,
+                                    parent_uuid: None,
+                                    session_id: session_id.clone(),
+                                    timestamp: event.timestamp,
+                                    entry_type: EntryType::Assistant,
+                                    message: Some(Message {
+                                        role: Role::Assistant,
+                                        content,
+                                        usage: None,
+                                        model: model.clone(),
+                                        id: None,
+                                    }),
+                                    summary: None,
+                                    custom_title: None,
+                                    ai_title: None,
+                                    cwd: cwd.clone(),
+                                    git_branch: git_branch.clone(),
+                                    version: version.clone(),
+                                    is_sidechain: false,
+                                    user_type: None,
+                                    request_id: None,
+                                });
+                            }
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -449,7 +484,7 @@ fn extract_text_from_content_array(payload: &serde_json::Value) -> String {
         .iter()
         .filter_map(|block| {
             let t = block.get("type")?.as_str()?;
-            if t == "input_text" || t == "text" {
+            if t == "input_text" || t == "output_text" || t == "text" {
                 block.get("text").and_then(|v| v.as_str()).map(String::from)
             } else {
                 None
