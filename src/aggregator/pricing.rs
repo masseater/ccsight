@@ -461,7 +461,7 @@ impl CostCalculator {
             },
         );
 
-        // o4-mini: base $1.10 / $4.40, cached input $0.14
+        // o4-mini: base $1.10 / $4.40, cached input $0.275
         pricing.insert(
             "o4-mini".to_string(),
             ModelPricing {
@@ -469,7 +469,7 @@ impl CostCalculator {
                 output_cost_per_mtok: 4.40,
                 cache_write_5m_cost_per_mtok: 0.0,
                 cache_write_1h_cost_per_mtok: 0.0,
-                cache_read_cost_per_mtok: 0.14,
+                cache_read_cost_per_mtok: 0.275,
             },
         );
 

@@ -379,6 +379,8 @@ fn ensure_assistant_entry(
         .last()
         .is_some_and(|e| e.entry_type == EntryType::Assistant)
     {
+        pending_tool_calls.clear();
+        call_id_map.clear();
         return;
     }
     let content = if pending_tool_calls.is_empty() {

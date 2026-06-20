@@ -1,13 +1,16 @@
-//! Live Claude Code session discovery.
+//! Live Claude Code / Codex CLI session discovery.
 //!
 //! Reads `~/.claude/sessions/<pid>.json` — first-party metadata Claude Code
 //! writes for every running session. Each file pins `pid → sessionId → cwd`
 //! with no ambiguity, so detection is exact (no argv parsing, no temporal
 //! heuristics).
 //!
-//! For "recently paused", scans `~/.claude/projects/**/*.jsonl` for files
-//! whose mtime is within the last 24h and whose sessionId is *not* in the
-//! active set.
+//! For "recently paused", scans `~/.claude/projects/**/*.jsonl` and
+//! `~/.codex/sessions/**/*.jsonl` for files whose mtime is within the last
+//! 24h and whose sessionId is *not* in the active set.
+//!
+//! Codex CLI does not write PID metadata files, so Codex sessions appear
+//! only as "recently paused" (never "active") even while running.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
