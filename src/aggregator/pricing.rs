@@ -1021,10 +1021,13 @@ mod tests {
     fn test_openai_models_have_pricing() {
         let calculator = CostCalculator::new();
         assert!(calculator.get_pricing(Some("gpt-5.5")).is_some());
+        assert!(calculator.get_pricing(Some("gpt-5.4")).is_some());
         assert!(calculator.get_pricing(Some("gpt-4.1")).is_some());
         assert!(calculator.get_pricing(Some("gpt-4.1-mini")).is_some());
+        assert!(calculator.get_pricing(Some("gpt-4.1-nano")).is_some());
         assert!(calculator.get_pricing(Some("o3")).is_some());
         assert!(calculator.get_pricing(Some("o3-pro")).is_some());
+        assert!(calculator.get_pricing(Some("o3-mini")).is_some());
         assert!(calculator.get_pricing(Some("o4-mini")).is_some());
     }
 
@@ -1051,6 +1054,7 @@ mod tests {
         assert_eq!(normalize_model_name("gpt-4.1-nano"), "GPT-4.1-nano");
         assert_eq!(normalize_model_name("o3"), "o3");
         assert_eq!(normalize_model_name("o3-pro"), "o3-pro");
+        assert_eq!(normalize_model_name("o3-mini"), "o3-mini");
         assert_eq!(normalize_model_name("o4-mini"), "o4-mini");
     }
 

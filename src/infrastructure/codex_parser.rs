@@ -602,4 +602,31 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn test_parse_response_item_assistant_message() {
+        let tmp =
+            std::env::temp_dir().join(format!("ccsight-codex-resp-asst-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+
+        let path = write_codex_session(
+            &tmp,
+            &[
+                r#"{"timestamp":"2026-06-20T00:01:16Z","type":"session_meta","payload":{"id":"r1","cwd":"/proj"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:17Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:18Z","type":"event_msg","payload":{"type":"user_message","message":"Hello"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:19Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here is my response"}]}}"#,
+            ],
+        );
+
+        let entries = parse_codex_file(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].entry_type, EntryType::Assistant);
+        assert_eq!(
+            entries[1].message.as_ref().unwrap().content.extract_text(),
+            "Here is my response"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
