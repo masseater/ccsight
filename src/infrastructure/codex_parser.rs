@@ -217,7 +217,10 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                                 serde_json::from_value::<TokenInfo>(info_val.clone())
                             {
                                 if let Some(last) = token_info.last_token_usage {
-                                    if last.input_tokens == 0 && last.output_tokens == 0 {
+                                    if last.input_tokens == 0
+                                        && last.output_tokens == 0
+                                        && last.reasoning_output_tokens == 0
+                                    {
                                         continue;
                                     }
                                     let usage = Usage {
@@ -303,9 +306,8 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                         if text.is_empty() {
                             continue;
                         }
-                        // role:user from response_item/message carries the
-                        // developer/system prompt, not the actual user input.
                         // event_msg/user_message is the canonical user turn;
+                        // response_item/message role:user duplicates it, so
                         // only assistant responses are captured here.
                         if role_str == "assistant" {
                             let content = if pending_tool_calls.is_empty() {
