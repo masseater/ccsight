@@ -91,6 +91,7 @@ pub fn normalize_model_name(model: &str) -> String {
                     {
                         return format!("{display}{version}");
                     }
+                    let suffix = strip_date_suffix(suffix);
                     return format!("{display}{version}-{suffix}");
                 }
             } else {
@@ -1056,6 +1057,16 @@ mod tests {
         assert_eq!(normalize_model_name("o3-pro"), "o3-pro");
         assert_eq!(normalize_model_name("o3-mini"), "o3-mini");
         assert_eq!(normalize_model_name("o4-mini"), "o4-mini");
+        // Date suffixes on variant models
+        assert_eq!(normalize_model_name("gpt-5.5-20261231"), "GPT-5.5");
+        assert_eq!(
+            normalize_model_name("gpt-4.1-mini-20250101"),
+            "GPT-4.1-mini"
+        );
+        assert_eq!(
+            normalize_model_name("gpt-4.1-nano-20260601"),
+            "GPT-4.1-nano"
+        );
     }
 
     #[test]
