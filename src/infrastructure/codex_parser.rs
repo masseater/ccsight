@@ -177,6 +177,7 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                             {
                                 if let Some(last) = token_info.last_token_usage {
                                     if last.input_tokens == 0
+                                        && last.cached_input_tokens == 0
                                         && last.output_tokens == 0
                                         && last.reasoning_output_tokens == 0
                                     {
