@@ -18,9 +18,7 @@ use serde::Deserialize;
 
 use crate::domain::{ContentBlock, EntryType, LogEntry, Message, MessageContent, Role, Usage};
 
-const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_LINE_SIZE: usize = 50 * 1024 * 1024;
-const MAX_ENTRIES: usize = 100_000;
+use crate::parser::{max_entries, max_file_size, max_line_size};
 
 // ---------------------------------------------------------------------------
 // Codex-native event structs (deserialized from JSONL)
@@ -79,7 +77,7 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
         File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 
     let metadata = file.metadata()?;
-    if metadata.len() > MAX_FILE_SIZE {
+    if metadata.len() > max_file_size() {
         anyhow::bail!("Codex file too large: {} bytes", metadata.len());
     }
 
@@ -99,12 +97,12 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
     let mut call_id_map: HashMap<String, usize> = HashMap::new();
 
     for line_result in reader.lines() {
-        if entries.len() >= MAX_ENTRIES {
+        if entries.len() >= max_entries() {
             break;
         }
 
         let Ok(line) = line_result else { continue };
-        if line.len() > MAX_LINE_SIZE || line.trim().is_empty() {
+        if line.len() > max_line_size() || line.trim().is_empty() {
             continue;
         }
 

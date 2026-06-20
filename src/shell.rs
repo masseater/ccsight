@@ -32,9 +32,11 @@ fn shell_quote_cwd_with_home(path: &str, home: Option<&str>) -> String {
 /// `~/.claude/projects/<slug>/<uuid>.jsonl`. The cwd comes from the
 /// JSONL's `cwd` field (authoritative); reversing the slug is lossy when
 /// the real path contains `-`, so it's only a fallback. `None` for Cowork
-/// audit logs (desktop app only).
+/// audit logs and Codex sessions (neither uses `claude -r`).
 pub fn resume_command_from_jsonl(jsonl_path: &std::path::Path) -> Option<String> {
-    if crate::infrastructure::is_cowork_audit_path(jsonl_path) {
+    if crate::infrastructure::is_cowork_audit_path(jsonl_path)
+        || crate::infrastructure::is_codex_path(jsonl_path)
+    {
         return None;
     }
     let session_id = jsonl_path.file_stem().and_then(|s| s.to_str())?;

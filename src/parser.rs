@@ -28,7 +28,7 @@ const DEFAULT_MAX_ENTRIES: usize = 100_000;
 const MIN_MAX_ENTRIES: usize = 100;
 const MAX_MAX_ENTRIES: usize = 1_000_000;
 
-fn max_file_size() -> u64 {
+pub(crate) fn max_file_size() -> u64 {
     std::env::var("CCSIGHT_MAX_FILE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -37,7 +37,7 @@ fn max_file_size() -> u64 {
         })
 }
 
-fn max_line_size() -> usize {
+pub(crate) fn max_line_size() -> usize {
     std::env::var("CCSIGHT_MAX_LINE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -46,7 +46,7 @@ fn max_line_size() -> usize {
         })
 }
 
-fn max_entries() -> usize {
+pub(crate) fn max_entries() -> usize {
     std::env::var("CCSIGHT_MAX_ENTRIES")
         .ok()
         .and_then(|s| s.parse().ok())

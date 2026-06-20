@@ -4775,11 +4775,11 @@ fn draw_session_detail(
         }
     }
 
-    // Session ID + resume command. Cowork audit.jsonl files all share the
-    // file stem `audit`, so prefer `cliSessionId` from sibling metadata —
-    // and skip the `claude -r` resume command entirely since Cowork sessions
-    // run in a sandbox VM that the local CLI cannot attach to.
+    // Session ID + resume command. Cowork/Codex files need special handling:
+    // Cowork stems are all `audit`, Codex stems are `rollout-...`, so prefer
+    // `cowork_session_id` (which also handles Codex UUID extraction).
     let is_cowork = crate::infrastructure::is_cowork_audit_path(&session.file_path);
+    let is_codex = crate::infrastructure::is_codex_path(&session.file_path);
     let session_id: String = crate::infrastructure::cowork_session_id(&session.file_path)
         .or_else(|| {
             session
@@ -4798,6 +4798,11 @@ fn draw_session_detail(
     if is_cowork {
         lines.push(Line::from(vec![Span::styled(
             "    (Cowork — re-open from Claude Desktop)",
+            Style::default().fg(theme::DIM),
+        )]));
+    } else if is_codex {
+        lines.push(Line::from(vec![Span::styled(
+            "    (Codex session — resume from Codex CLI)",
             Style::default().fg(theme::DIM),
         )]));
     } else {
