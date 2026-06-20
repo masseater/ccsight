@@ -183,10 +183,11 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                                     {
                                         continue;
                                     }
+                                    // output_tokens already includes
+                                    // reasoning_output_tokens as a subset.
                                     let usage = Usage {
                                         input_tokens: last.input_tokens,
-                                        output_tokens: last.output_tokens
-                                            + last.reasoning_output_tokens,
+                                        output_tokens: last.output_tokens,
                                         cache_creation_input_tokens: 0,
                                         cache_read_input_tokens: last.cached_input_tokens,
                                         cache_creation: None,
@@ -497,7 +498,7 @@ mod tests {
         );
         let usage = entries[1].message.as_ref().unwrap().usage.as_ref().unwrap();
         assert_eq!(usage.input_tokens, 1000);
-        assert_eq!(usage.output_tokens, 600); // 500 + 100 reasoning
+        assert_eq!(usage.output_tokens, 500); // reasoning already included
         assert_eq!(usage.cache_read_input_tokens, 200);
 
         let _ = fs::remove_dir_all(&tmp);

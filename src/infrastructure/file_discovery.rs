@@ -67,6 +67,9 @@ impl FileDiscovery {
             Vec::new()
         };
 
+        // External session logs (Cowork / Codex) live outside ~/.claude/
+        // and use different JSONL schemas; per-source parsers handle the
+        // translation. Empty on platforms without the respective dirs.
         files.extend(super::cowork_source::find_cowork_audit_files());
         files.extend(super::codex_source::find_codex_session_files());
 
