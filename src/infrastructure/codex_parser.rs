@@ -167,50 +167,9 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                             request_id: None,
                         });
                     }
-                    "agent_message" => {
-                        let text = payload
-                            .get("text")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if text.is_empty() {
-                            continue;
-                        }
-
-                        // Flush any pending tool calls into this assistant entry
-                        let content = if pending_tool_calls.is_empty() {
-                            MessageContent::Text(text)
-                        } else {
-                            let mut blocks = vec![ContentBlock::Text { text }];
-                            blocks.append(&mut pending_tool_calls);
-                            call_id_map.clear();
-                            MessageContent::Blocks(blocks)
-                        };
-
-                        entries.push(LogEntry {
-                            uuid: None,
-                            parent_uuid: None,
-                            session_id: session_id.clone(),
-                            timestamp: event.timestamp,
-                            entry_type: EntryType::Assistant,
-                            message: Some(Message {
-                                role: Role::Assistant,
-                                content,
-                                usage: None,
-                                model: model.clone(),
-                                id: None,
-                            }),
-                            summary: None,
-                            custom_title: None,
-                            ai_title: None,
-                            cwd: cwd.clone(),
-                            git_branch: git_branch.clone(),
-                            version: version.clone(),
-                            is_sidechain: false,
-                            user_type: None,
-                            request_id: None,
-                        });
-                    }
+                    // agent_message is skipped: text is almost always
+                    // empty, and the actual response arrives via
+                    // response_item/message (role:assistant).
                     "token_count" => {
                         if let Some(info_val) = payload.get("info") {
                             if let Ok(token_info) =
@@ -503,7 +462,7 @@ mod tests {
                 r#"{"timestamp":"2026-06-20T00:01:16Z","type":"session_meta","payload":{"id":"abc-123","cwd":"/home/user/project","cli_version":"0.142.0"}}"#,
                 r#"{"timestamp":"2026-06-20T00:01:17Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/home/user/project"}}"#,
                 r#"{"timestamp":"2026-06-20T00:01:18Z","type":"event_msg","payload":{"type":"user_message","message":"Hello world"}}"#,
-                r#"{"timestamp":"2026-06-20T00:01:20Z","type":"event_msg","payload":{"type":"agent_message","text":"Hi there!","phase":"commentary"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:19Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi there!"}]}}"#,
                 r#"{"timestamp":"2026-06-20T00:01:22Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":500,"reasoning_output_tokens":100}}}}"#,
             ],
         );
@@ -526,6 +485,10 @@ mod tests {
             entries[1].message.as_ref().unwrap().model.as_deref(),
             Some("gpt-5.5")
         );
+        assert_eq!(
+            entries[1].message.as_ref().unwrap().content.extract_text(),
+            "Hi there!"
+        );
         let usage = entries[1].message.as_ref().unwrap().usage.as_ref().unwrap();
         assert_eq!(usage.input_tokens, 1000);
         assert_eq!(usage.output_tokens, 600); // 500 + 100 reasoning
@@ -547,7 +510,7 @@ mod tests {
                 r#"{"timestamp":"2026-06-20T00:01:18Z","type":"event_msg","payload":{"type":"user_message","message":"Fix the bug"}}"#,
                 r#"{"timestamp":"2026-06-20T00:01:19Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"c1"}}"#,
                 r#"{"timestamp":"2026-06-20T00:01:20Z","type":"response_item","payload":{"type":"function_call_output","output":"file.rs","call_id":"c1"}}"#,
-                r#"{"timestamp":"2026-06-20T00:01:21Z","type":"event_msg","payload":{"type":"agent_message","text":"Found it","phase":"commentary"}}"#,
+                r#"{"timestamp":"2026-06-20T00:01:21Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Found it"}]}}"#,
             ],
         );
 
