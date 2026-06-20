@@ -181,10 +181,13 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                                     {
                                         continue;
                                     }
-                                    // output_tokens already includes
-                                    // reasoning_output_tokens as a subset.
+                                    // OpenAI totals are supersets:
+                                    // input_tokens includes cached_input_tokens,
+                                    // output_tokens includes reasoning_output_tokens.
                                     let usage = Usage {
-                                        input_tokens: last.input_tokens,
+                                        input_tokens: last
+                                            .input_tokens
+                                            .saturating_sub(last.cached_input_tokens),
                                         output_tokens: last.output_tokens,
                                         cache_creation_input_tokens: 0,
                                         cache_read_input_tokens: last.cached_input_tokens,
@@ -483,7 +486,7 @@ mod tests {
             "Hi there!"
         );
         let usage = entries[1].message.as_ref().unwrap().usage.as_ref().unwrap();
-        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.input_tokens, 800); // 1000 - 200 cached
         assert_eq!(usage.output_tokens, 500); // reasoning already included
         assert_eq!(usage.cache_read_input_tokens, 200);
 
