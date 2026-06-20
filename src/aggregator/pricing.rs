@@ -18,6 +18,14 @@ const FAMILIES: &[(&str, &str)] = &[
     ("mythos", "Mythos"),
 ];
 
+const OPENAI_FAMILIES: &[(&str, &str)] = &[
+    ("gpt-", "GPT-"),
+    ("o3-pro", "o3-pro"),
+    ("o4-mini", "o4-mini"),
+    ("o3-mini", "o3-mini"),
+    ("o3", "o3"),
+];
+
 pub fn normalize_model_name(model: &str) -> String {
     for &(family, display) in FAMILIES {
         if !model.contains(family) {
@@ -66,14 +74,49 @@ pub fn normalize_model_name(model: &str) -> String {
         return model.to_string();
     }
 
-    // Unknown model family — keep the raw API name so the UI can show it individually
-    // (and flag it with a "no pricing" badge) rather than collapsing every unknown
-    // model into a single "Other" bucket. Empty input falls back to literal "unknown".
+    // OpenAI model normalization: strip date suffixes, capitalize GPT prefix.
+    for &(prefix, display) in OPENAI_FAMILIES {
+        if let Some(rest) = model.strip_prefix(prefix) {
+            if display == "GPT-" {
+                // gpt-5.5-2026... → GPT-5.5
+                let version: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                let after_version = &rest[version.len()..];
+                let suffix = after_version.strip_prefix('-').unwrap_or(after_version);
+                if !version.is_empty() {
+                    if suffix.is_empty()
+                        || suffix.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    {
+                        return format!("{display}{version}");
+                    }
+                    return format!("{display}{version}-{suffix}");
+                }
+            } else {
+                // o3, o3-pro, o4-mini — already at display form if no date suffix
+                let date_stripped = strip_date_suffix(model);
+                return date_stripped.to_string();
+            }
+        }
+    }
+
     if model.is_empty() {
         "unknown".to_string()
     } else {
         model.to_string()
     }
+}
+
+fn strip_date_suffix(model: &str) -> &str {
+    // Strip trailing `-YYYYMMDD` date suffix (8+ digits after last `-`)
+    if let Some(last_dash) = model.rfind('-') {
+        let suffix = &model[last_dash + 1..];
+        if suffix.len() >= 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return &model[..last_dash];
+        }
+    }
+    model
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +358,118 @@ impl CostCalculator {
                 cache_write_5m_cost_per_mtok: 0.30,
                 cache_write_1h_cost_per_mtok: 0.50,
                 cache_read_cost_per_mtok: 0.03,
+            },
+        );
+
+        // --- OpenAI models (Codex CLI) ---
+        // OpenAI has no cache write concept; cache_write fields are 0.
+        // cache_read maps to OpenAI's "cached input" discount.
+
+        // GPT-5.5: base $5 / $30, cached input $0.50
+        pricing.insert(
+            "gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 5.0,
+                output_cost_per_mtok: 30.0,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
+
+        // GPT-5.4: base $2.50 / $15, cached input $0.25
+        pricing.insert(
+            "gpt-5.4".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 2.5,
+                output_cost_per_mtok: 15.0,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.25,
+            },
+        );
+
+        // GPT-4.1: base $2 / $8, cached input $0.50
+        pricing.insert(
+            "gpt-4.1".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 2.0,
+                output_cost_per_mtok: 8.0,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
+
+        // GPT-4.1-mini: base $0.40 / $1.60, cached input $0.10
+        pricing.insert(
+            "gpt-4.1-mini".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 0.40,
+                output_cost_per_mtok: 1.60,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.10,
+            },
+        );
+
+        // GPT-4.1-nano: base $0.10 / $0.40, cached input $0.025
+        pricing.insert(
+            "gpt-4.1-nano".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 0.10,
+                output_cost_per_mtok: 0.40,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.025,
+            },
+        );
+
+        // o3: base $2 / $8, cached input $0.50
+        pricing.insert(
+            "o3".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 2.0,
+                output_cost_per_mtok: 8.0,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.50,
+            },
+        );
+
+        // o3-pro: base $20 / $80
+        pricing.insert(
+            "o3-pro".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 20.0,
+                output_cost_per_mtok: 80.0,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.0,
+            },
+        );
+
+        // o3-mini: base $1.10 / $4.40, cached input $0.55
+        pricing.insert(
+            "o3-mini".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 1.10,
+                output_cost_per_mtok: 4.40,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.55,
+            },
+        );
+
+        // o4-mini: base $1.10 / $4.40, cached input $0.14
+        pricing.insert(
+            "o4-mini".to_string(),
+            ModelPricing {
+                input_cost_per_mtok: 1.10,
+                output_cost_per_mtok: 4.40,
+                cache_write_5m_cost_per_mtok: 0.0,
+                cache_write_1h_cost_per_mtok: 0.0,
+                cache_read_cost_per_mtok: 0.14,
             },
         );
 
@@ -844,6 +999,15 @@ mod tests {
             "claude-haiku-4-5",
             "claude-3-5-haiku",
             "claude-3-haiku",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4.1-nano",
+            "o3",
+            "o3-pro",
+            "o3-mini",
+            "o4-mini",
         ];
         for model in expected_models {
             assert!(
@@ -851,5 +1015,62 @@ mod tests {
                 "Missing pricing for: {model}"
             );
         }
+    }
+
+    #[test]
+    fn test_openai_models_have_pricing() {
+        let calculator = CostCalculator::new();
+        assert!(calculator.get_pricing(Some("gpt-5.5")).is_some());
+        assert!(calculator.get_pricing(Some("gpt-4.1")).is_some());
+        assert!(calculator.get_pricing(Some("gpt-4.1-mini")).is_some());
+        assert!(calculator.get_pricing(Some("o3")).is_some());
+        assert!(calculator.get_pricing(Some("o3-pro")).is_some());
+        assert!(calculator.get_pricing(Some("o4-mini")).is_some());
+    }
+
+    #[test]
+    fn test_openai_o3_does_not_match_o3_pro() {
+        let calculator = CostCalculator::new();
+        let o3 = calculator.get_pricing(Some("o3")).unwrap();
+        let o3_pro = calculator.get_pricing(Some("o3-pro")).unwrap();
+        assert!(
+            (o3.input_cost_per_mtok - 2.0).abs() < 0.01,
+            "o3 input should be $2/M"
+        );
+        assert!(
+            (o3_pro.input_cost_per_mtok - 20.0).abs() < 0.01,
+            "o3-pro input should be $20/M"
+        );
+    }
+
+    #[test]
+    fn test_normalize_openai_model_names() {
+        assert_eq!(normalize_model_name("gpt-5.5"), "GPT-5.5");
+        assert_eq!(normalize_model_name("gpt-4.1"), "GPT-4.1");
+        assert_eq!(normalize_model_name("gpt-4.1-mini"), "GPT-4.1-mini");
+        assert_eq!(normalize_model_name("gpt-4.1-nano"), "GPT-4.1-nano");
+        assert_eq!(normalize_model_name("o3"), "o3");
+        assert_eq!(normalize_model_name("o3-pro"), "o3-pro");
+        assert_eq!(normalize_model_name("o4-mini"), "o4-mini");
+    }
+
+    #[test]
+    fn test_calculate_cost_openai_gpt55() {
+        let calculator = CostCalculator::new();
+        let tokens = TokenStats {
+            input_tokens: 100_000,
+            output_tokens: 100_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 50_000,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+        };
+        let cost = calculator.calculate_cost(&tokens, Some("gpt-5.5")).unwrap();
+        // 100K input @ $5/M = $0.50, 100K output @ $30/M = $3.00,
+        // 50K cached @ $0.50/M = $0.025 → total $3.525
+        assert!(
+            (cost - 3.525).abs() < 0.01,
+            "Expected ~$3.525, got ${cost:.4}"
+        );
     }
 }

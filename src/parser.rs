@@ -59,6 +59,10 @@ pub struct JsonlParser;
 
 impl JsonlParser {
     pub fn parse_file(path: &Path) -> Result<Vec<LogEntry>> {
+        if crate::infrastructure::is_codex_path(path) {
+            return crate::infrastructure::codex_parser::parse_codex_file(path);
+        }
+
         let file =
             File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
 

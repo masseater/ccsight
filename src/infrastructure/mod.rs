@@ -1,5 +1,7 @@
 mod atomic;
 mod cache;
+pub mod codex_parser;
+pub mod codex_source;
 pub mod cowork_source;
 mod file_discovery;
 pub mod live_diagnostic;
@@ -12,6 +14,7 @@ mod state_dir;
 
 pub(crate) use atomic::{atomic_write, atomic_write_with};
 pub use cache::*;
+pub use codex_source::is_codex_path;
 pub use cowork_source::{
     cowork_session_id, is_cowork_audit_path, resolve_cowork_title, resolve_project_name,
 };
