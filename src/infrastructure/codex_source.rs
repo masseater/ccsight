@@ -79,13 +79,16 @@ pub fn resolve_codex_project_name(path: &Path, extracted: Option<String>) -> Opt
     if !is_codex_path(path) {
         return extracted;
     }
-    extracted.map(|cwd| {
-        Path::new(&cwd)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Codex")
-            .to_string()
-    })
+    Some(
+        extracted
+            .and_then(|cwd| {
+                Path::new(&cwd)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "Codex".to_string()),
+    )
 }
 
 #[cfg(test)]

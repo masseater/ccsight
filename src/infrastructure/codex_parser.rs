@@ -303,66 +303,42 @@ pub fn parse_codex_file(path: &Path) -> Result<Vec<LogEntry>> {
                         if text.is_empty() {
                             continue;
                         }
-                        match role_str {
-                            "user" => {
-                                entries.push(LogEntry {
-                                    uuid: None,
-                                    parent_uuid: None,
-                                    session_id: session_id.clone(),
-                                    timestamp: event.timestamp,
-                                    entry_type: EntryType::User,
-                                    message: Some(Message {
-                                        role: Role::User,
-                                        content: MessageContent::Text(text),
-                                        usage: None,
-                                        model: None,
-                                        id: None,
-                                    }),
-                                    summary: None,
-                                    custom_title: None,
-                                    ai_title: None,
-                                    cwd: cwd.clone(),
-                                    git_branch: git_branch.clone(),
-                                    version: version.clone(),
-                                    is_sidechain: false,
-                                    user_type: None,
-                                    request_id: None,
-                                });
-                            }
-                            "assistant" => {
-                                let content = if pending_tool_calls.is_empty() {
-                                    MessageContent::Text(text)
-                                } else {
-                                    let mut blocks = vec![ContentBlock::Text { text }];
-                                    blocks.append(&mut pending_tool_calls);
-                                    call_id_map.clear();
-                                    MessageContent::Blocks(blocks)
-                                };
-                                entries.push(LogEntry {
-                                    uuid: None,
-                                    parent_uuid: None,
-                                    session_id: session_id.clone(),
-                                    timestamp: event.timestamp,
-                                    entry_type: EntryType::Assistant,
-                                    message: Some(Message {
-                                        role: Role::Assistant,
-                                        content,
-                                        usage: None,
-                                        model: model.clone(),
-                                        id: None,
-                                    }),
-                                    summary: None,
-                                    custom_title: None,
-                                    ai_title: None,
-                                    cwd: cwd.clone(),
-                                    git_branch: git_branch.clone(),
-                                    version: version.clone(),
-                                    is_sidechain: false,
-                                    user_type: None,
-                                    request_id: None,
-                                });
-                            }
-                            _ => {}
+                        // role:user from response_item/message carries the
+                        // developer/system prompt, not the actual user input.
+                        // event_msg/user_message is the canonical user turn;
+                        // only assistant responses are captured here.
+                        if role_str == "assistant" {
+                            let content = if pending_tool_calls.is_empty() {
+                                MessageContent::Text(text)
+                            } else {
+                                let mut blocks = vec![ContentBlock::Text { text }];
+                                blocks.append(&mut pending_tool_calls);
+                                call_id_map.clear();
+                                MessageContent::Blocks(blocks)
+                            };
+                            entries.push(LogEntry {
+                                uuid: None,
+                                parent_uuid: None,
+                                session_id: session_id.clone(),
+                                timestamp: event.timestamp,
+                                entry_type: EntryType::Assistant,
+                                message: Some(Message {
+                                    role: Role::Assistant,
+                                    content,
+                                    usage: None,
+                                    model: model.clone(),
+                                    id: None,
+                                }),
+                                summary: None,
+                                custom_title: None,
+                                ai_title: None,
+                                cwd: cwd.clone(),
+                                git_branch: git_branch.clone(),
+                                version: version.clone(),
+                                is_sidechain: false,
+                                user_type: None,
+                                request_id: None,
+                            });
                         }
                     }
                     _ => {}
