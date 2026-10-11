@@ -36,6 +36,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -51,11 +53,17 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - run: tar czf ccsight-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release ccsight
+      - if: runner.os != 'Windows'
+        run: tar czf ccsight-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release ccsight
+      # Windows ships a zip (no tar in a stock PowerShell workflow);
+      # Cargo.toml's binstall override points at it.
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/ccsight.exe -DestinationPath ccsight-${{ matrix.target }}.zip
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ccsight-${{ matrix.target }}
-          path: ccsight-${{ matrix.target }}.tar.gz
+          path: ccsight-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -66,7 +74,9 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
-          files: "ccsight-*.tar.gz"
+          files: |
+            ccsight-*.tar.gz
+            ccsight-*.zip
 
   publish-crate:
     needs: release
