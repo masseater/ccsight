@@ -13,8 +13,13 @@ jobs:
   verify:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Git Bash on the Windows runner, so `bash scripts/...` steps and
+    # multi-line `run:` blocks behave the same on every OS.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install system dependencies (Linux)
@@ -33,6 +38,7 @@ jobs:
       - run: cargo build --locked --release
       - run: bash scripts/lint.sh
       - run: shellcheck --severity=warning scripts/*.sh scripts/hooks/*
+        if: runner.os != 'Windows'
       # Headless TUI launch over a small fixture, driven through every tab and
       # a detail popup (poll-until-ready, not sleep). Catches regressions that
       # compile clean but panic during render or navigation — popup geometry,
@@ -42,7 +48,10 @@ jobs:
       # RustSec action; fails the build when any RUSTSEC-* applies.
       # Keep the ignore list as short as possible. Mirror entries in
       # `.cargo/audit.toml` so local `cargo audit` matches.
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      # One audit is enough — the dependency tree is OS-independent apart
+      # from target-gated crates, which Linux/macOS already cover.
+      - if: runner.os != 'Windows'
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # bincode 1.3.3 unmaintained — required by syntect's dump-load
