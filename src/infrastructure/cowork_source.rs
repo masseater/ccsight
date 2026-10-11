@@ -33,9 +33,12 @@ pub struct CoworkMetadata {
 /// Returns the directory under which Cowork sessions live, or `None` on
 /// platforms / hosts that don't have it.
 pub fn cowork_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let path =
-        PathBuf::from(home).join("Library/Application Support/Claude/local-agent-mode-sessions");
+    // Claude Desktop keeps its data under the platform app-data dir:
+    // `~/Library/Application Support/Claude` on macOS, `%APPDATA%\Claude`
+    // on Windows.
+    let path = dirs::data_dir()?
+        .join("Claude")
+        .join("local-agent-mode-sessions");
     path.is_dir().then_some(path)
 }
 

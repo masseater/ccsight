@@ -16,7 +16,7 @@ pub mod search_index;
 pub use cache::*;
 pub(crate) use ccsight::infrastructure::{atomic_write, atomic_write_with};
 pub use ccsight::infrastructure::{
-    cache_path, ensure_private_state_root, index_dir, migrate_legacy_state_dirs,
+    cache_path, ensure_private_state_root, home_dir, index_dir, migrate_legacy_state_dirs,
     search_history_path,
 };
 pub use cowork_source::{

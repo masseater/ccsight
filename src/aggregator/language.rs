@@ -240,7 +240,7 @@ pub fn for_extension(ext: &str) -> &'static str {
 }
 
 pub(crate) fn from_glob_pattern(pattern: &str) -> Option<&'static str> {
-    let filename = pattern.rsplit('/').next().unwrap_or(pattern);
+    let filename = pattern.rsplit(['/', '\\']).next().unwrap_or(pattern);
     if let Some(brace_start) = filename.find('{')
         && let Some(brace_end) = filename.find('}')
     {
@@ -258,7 +258,7 @@ pub(crate) fn from_glob_pattern(pattern: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn from_path(path: &str) -> Option<&'static str> {
-    let filename = path.rsplit('/').next().unwrap_or(path);
+    let filename = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let filename_lower = filename.to_lowercase();
 
     match filename_lower.as_str() {
@@ -278,7 +278,7 @@ pub(crate) fn from_path(path: &str) -> Option<&'static str> {
 }
 
 pub(crate) fn extension_from_path(path: &str) -> Option<String> {
-    let filename = path.rsplit('/').next().unwrap_or(path).trim();
+    let filename = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
     let filename_lower = filename.to_lowercase();
 
     match filename_lower.as_str() {
@@ -326,7 +326,7 @@ pub(crate) fn parse_extensions_from_glob(pattern: &str) -> Vec<String> {
     // `.trim()` drops trailing newlines/whitespace that some patterns carry;
     // left in place they made `ends_with('}')` fail and leaked the whole
     // `{...}` blob as one "extension".
-    let filename = pattern.rsplit('/').next().unwrap_or(pattern).trim();
+    let filename = pattern.rsplit(['/', '\\']).next().unwrap_or(pattern).trim();
 
     // Brace alternation `{a,b,c}`. Find the FIRST `{`/`}` (a single `rfind('.')`
     // lands inside alternatives that contain a dot, e.g. `{tsconfig.json,*.ts}`,

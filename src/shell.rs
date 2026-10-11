@@ -1,22 +1,44 @@
-//! Shared shell helpers: POSIX single-quote escaping and the one
-//! `cd ... && claude -r ...` resume-command builder every surface (Live `y`,
-//! session detail popup copy + display) routes through. Centralising them
-//! keeps the `format!("cd {} && ...")` lint (#28) enforceable and prevents
-//! copies from drifting if the escaping policy changes.
+//! Shared shell helpers: shell quoting and the one resume-command builder
+//! every surface (Live `y`, session detail popup copy + display) routes
+//! through. Centralising them keeps the `format!("cd {} && ...")` lint (#28)
+//! enforceable and prevents copies from drifting if the escaping policy
+//! changes.
+//!
+//! Two dialects: POSIX sh (`cd '<dir>' && claude -r '<id>'`) for Unix and
+//! Git Bash / MSYS on Windows, and PowerShell for native Windows terminals,
+//! where cmd.exe has no single-quote quoting and Windows PowerShell 5.1
+//! rejects `&&`.
 
-/// POSIX-quote a cwd for `cd ...`, expanding leading `~/` (or bare `~`)
-/// via `$HOME` first. Without expansion `cd '~/dev/foo'` is literal.
-/// `$HOME` absent → plain quote (pasteable, broken — still better than panic).
-pub fn shell_quote_cwd(path: &str) -> String {
-    shell_quote_cwd_with_home(path, std::env::var("HOME").ok().as_deref())
+/// Which shell the copied resume command is written for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeShell {
+    Posix,
+    PowerShell,
 }
 
-/// Testable core: expand a leading `~` against the given home (if any) and
-/// POSIX-quote the result.
-fn shell_quote_cwd_with_home(path: &str, home: Option<&str>) -> String {
+impl ResumeShell {
+    /// POSIX everywhere except native Windows. `MSYSTEM` is exported by Git
+    /// Bash / MSYS2 shells, whose users paste into a POSIX shell.
+    pub fn detect() -> Self {
+        if cfg!(windows) && std::env::var_os("MSYSTEM").is_none() {
+            Self::PowerShell
+        } else {
+            Self::Posix
+        }
+    }
+}
+
+/// Quote a cwd for `shell`, expanding leading `~/` (or bare `~`) via the
+/// home directory first. Without expansion `cd '~/dev/foo'` is literal.
+/// Home absent → plain quote (pasteable, broken — still better than panic).
+fn shell_quote_cwd(shell: ResumeShell, path: &str, home: Option<&str>) -> String {
+    let sep = match shell {
+        ResumeShell::Posix => '/',
+        ResumeShell::PowerShell => '\\',
+    };
     let expanded: String = if let Some(rest) = path.strip_prefix("~/") {
         match home {
-            Some(h) => format!("{h}/{rest}"),
+            Some(h) => format!("{h}{sep}{rest}"),
             None => path.to_string(),
         }
     } else if path == "~" {
@@ -24,20 +46,48 @@ fn shell_quote_cwd_with_home(path: &str, home: Option<&str>) -> String {
     } else {
         path.to_string()
     };
-    posix_shell_quote(&expanded)
+    quote(shell, &expanded)
 }
 
-/// `cd <dir> && claude -r <id>` with both sides POSIX-quoted. `dir` must be
-/// a VERIFIED resume target (`AppState::resume_dir`): `claude -r` only finds
-/// a session when the cwd's official slug matches the transcript's storage
-/// dir, so callers pass that verified path — never a transcript cwd or a
-/// slug reversal directly.
+fn quote(shell: ResumeShell, s: &str) -> String {
+    match shell {
+        ResumeShell::Posix => posix_shell_quote(s),
+        ResumeShell::PowerShell => powershell_quote(s),
+    }
+}
+
+/// Resume command for the current platform's shell (see
+/// [`ResumeShell::detect`]). `dir` must be a VERIFIED resume target
+/// (`AppState::resume_dir`): `claude -r` only finds a session when the cwd's
+/// official slug matches the transcript's storage dir, so callers pass that
+/// verified path — never a transcript cwd or a slug reversal directly.
 pub fn resume_command(dir: &str, session_id: &str) -> String {
-    format!(
-        "cd {} && claude -r {}",
-        shell_quote_cwd(dir),
-        posix_shell_quote(session_id),
+    let home = crate::infrastructure::home_dir();
+    resume_command_for(
+        ResumeShell::detect(),
+        dir,
+        session_id,
+        home.as_deref().and_then(std::path::Path::to_str),
     )
+}
+
+/// Testable core of [`resume_command`]: both interpolations quoted for
+/// `shell`. PowerShell uses `-ErrorAction Stop` so a missing dir aborts the
+/// line instead of resuming from the wrong cwd (the `&&` equivalent).
+fn resume_command_for(
+    shell: ResumeShell,
+    dir: &str,
+    session_id: &str,
+    home: Option<&str>,
+) -> String {
+    let cwd = shell_quote_cwd(shell, dir, home);
+    let id = quote(shell, session_id);
+    match shell {
+        ResumeShell::Posix => format!("cd {cwd} && claude -r {id}"),
+        ResumeShell::PowerShell => {
+            format!("Set-Location -LiteralPath {cwd} -ErrorAction Stop; claude -r {id}")
+        }
+    }
 }
 
 /// POSIX single-quote shell escape. Wraps the input in `'...'` and turns
@@ -57,9 +107,98 @@ pub fn posix_shell_quote(s: &str) -> String {
     out
 }
 
+/// PowerShell verbatim-string escape: wrap in `'...'` and double every
+/// single-quote character. PowerShell also treats the typographic quotes
+/// U+2018..U+201B as single quotes, so those are doubled too — otherwise a
+/// `’` in a path would close the string early.
+pub fn powershell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        out.push(c);
+        if is_powershell_single_quote(c) {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn is_powershell_single_quote(c: char) -> bool {
+    matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{posix_shell_quote, resume_command, shell_quote_cwd_with_home};
+    use super::{
+        ResumeShell, posix_shell_quote, powershell_quote, resume_command_for, shell_quote_cwd,
+    };
+
+    fn resume_command(dir: &str, session_id: &str) -> String {
+        resume_command_for(ResumeShell::Posix, dir, session_id, None)
+    }
+
+    fn shell_quote_cwd_with_home(path: &str, home: Option<&str>) -> String {
+        shell_quote_cwd(ResumeShell::Posix, path, home)
+    }
+
+    #[test]
+    fn powershell_resume_command_quotes_both_interpolations() {
+        let cmd = resume_command_for(
+            ResumeShell::PowerShell,
+            r"C:\Users\me\dev\multi word",
+            "0aef-1234",
+            None,
+        );
+        assert_eq!(
+            cmd,
+            r"Set-Location -LiteralPath 'C:\Users\me\dev\multi word' -ErrorAction Stop; claude -r '0aef-1234'"
+        );
+    }
+
+    #[test]
+    fn powershell_resume_command_expands_tilde_with_backslash() {
+        let cmd = resume_command_for(
+            ResumeShell::PowerShell,
+            "~/dev",
+            "id",
+            Some(r"C:\Users\tester"),
+        );
+        assert!(cmd.starts_with(r"Set-Location -LiteralPath 'C:\Users\tester\dev' "));
+    }
+
+    #[test]
+    fn powershell_quote_doubles_all_single_quote_forms() {
+        assert_eq!(powershell_quote("a'b"), "'a''b'");
+        assert_eq!(powershell_quote("a\u{2019}b"), "'a\u{2019}\u{2019}b'");
+        assert_eq!(powershell_quote("$(evil); x"), "'$(evil); x'");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(1024))]
+
+        /// PowerShell verbatim strings decode by collapsing each doubled
+        /// quote; the decoded form must equal the input, and no quote char
+        /// may appear un-doubled (which would end the string early).
+        #[test]
+        fn powershell_quote_roundtrips(s in ".*") {
+            let quoted: Vec<char> = powershell_quote(&s).chars().collect();
+            let inner = &quoted[1..quoted.len() - 1];
+            let mut decoded = String::new();
+            let mut i = 0;
+            while i < inner.len() {
+                let c = inner[i];
+                if super::is_powershell_single_quote(c) {
+                    proptest::prop_assert!(i + 1 < inner.len() && inner[i + 1] == c);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                decoded.push(c);
+            }
+            proptest::prop_assert_eq!(decoded, s);
+        }
+    }
 
     #[test]
     fn resume_command_quotes_both_interpolations() {

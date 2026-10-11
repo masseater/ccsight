@@ -61,10 +61,9 @@ fn read_global_mcp_servers() -> HashSet<String> {
 /// returning `<plugin-name>/<server-name>` strings to match the runtime form.
 /// Empty set when settings or installed_plugins.json are missing.
 fn read_plugin_mcp_servers() -> HashSet<String> {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = crate::infrastructure::home_dir() else {
         return HashSet::new();
     };
-    let home = PathBuf::from(home);
     let settings_path = home.join(".claude/settings.json");
     let installed_path = home.join(".claude/plugins/installed_plugins.json");
 
@@ -140,8 +139,7 @@ fn plugin_servers_from_install_path(install_path: &Path) -> HashSet<String> {
 }
 
 fn claude_config_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".claude.json"))
+    crate::infrastructure::home_dir().map(|home| home.join(".claude.json"))
 }
 
 /// Compute MCP server usage status by joining configured servers with observed tool_usage.

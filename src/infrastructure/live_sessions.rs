@@ -94,10 +94,10 @@ fn cwd_to_project_dir(cwd: &Path) -> String {
 /// `~/.claude.json` — secondary resume witnesses for storage dirs whose
 /// transcripts carry no usable cwd. Missing / unparsable file → empty.
 pub fn claude_json_project_paths() -> Vec<String> {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = crate::infrastructure::home_dir() else {
         return Vec::new();
     };
-    let path = PathBuf::from(home).join(".claude.json");
+    let path = home.join(".claude.json");
     let Ok(bytes) = std::fs::read(&path) else {
         return Vec::new();
     };
@@ -112,11 +112,11 @@ pub fn claude_json_project_paths() -> Vec<String> {
 }
 
 fn claude_sessions_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("sessions"))
+    crate::infrastructure::home_dir().map(|h| h.join(".claude").join("sessions"))
 }
 
 fn claude_projects_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
+    crate::infrastructure::home_dir().map(|h| h.join(".claude").join("projects"))
 }
 
 fn unix_ms_to_utc(ms: u64) -> Option<DateTime<Utc>> {
@@ -125,16 +125,18 @@ fn unix_ms_to_utc(ms: u64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(secs, nsec)
 }
 
-/// Cross-platform process-existence check. Uses `kill -0 <pid>` which is
-/// POSIX-portable and doesn't require linking libc. ~1ms per check, fine
-/// for the typical small (~15) live-session count.
-fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// PIDs from `pids` that are currently running, via one `sysinfo` refresh
+/// scoped to just those PIDs (works the same on Unix and Windows).
+fn alive_pids(pids: &[u32]) -> std::collections::HashSet<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pids: Vec<Pid> = pids.iter().copied().map(Pid::from_u32).collect();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.processes().keys().map(|p| p.as_u32()).collect()
 }
 
 fn jsonl_path_for(cwd: &Path, session_id: &str) -> Option<PathBuf> {
@@ -162,19 +164,17 @@ pub fn discover_live() -> Vec<LiveSession> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
+    let metas: Vec<SessionMeta> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        .collect();
+    let alive = alive_pids(&metas.iter().map(|m| m.pid).collect::<Vec<_>>());
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_str::<SessionMeta>(&raw) else {
-            continue;
-        };
-        if !is_process_alive(meta.pid) {
+    for meta in metas {
+        if !alive.contains(&meta.pid) {
             continue;
         }
         // Defensive: Claude Code subagents share their parent's PID and so

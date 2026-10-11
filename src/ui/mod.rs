@@ -6615,7 +6615,7 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
     let mut basename_counts: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::new();
     for (name, _, _) in &state.project_list {
-        let base = name.rsplit('/').next().unwrap_or(name.as_str());
+        let base = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
         *basename_counts.entry(base).or_insert(0) += 1;
     }
 
@@ -6644,14 +6644,14 @@ fn draw_project_popup(frame: &mut Frame, area: Rect, state: &mut crate::AppState
         } else if let Some((name, tokens, last_date)) = sorted.get(i - 1).copied() {
             let is_current = state.project_filter.as_ref() == Some(name);
             let marker = if is_current { "\u{25cf}" } else { " " };
-            let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+            let basename = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
             // When two projects share a basename, append the immediate parent
             // directory in parentheses to disambiguate.
             let short_owned: String = if basename_counts.get(basename).copied().unwrap_or(0) > 1 {
                 let parent = name
-                    .rsplit_once('/')
+                    .rsplit_once(['/', '\\'])
                     .map_or("", |(p, _)| p)
-                    .rsplit('/')
+                    .rsplit(['/', '\\'])
                     .next()
                     .unwrap_or("");
                 if parent.is_empty() {

@@ -94,9 +94,26 @@ pub(crate) fn format_project_path(path: &str) -> String {
         } else {
             format!("~/{stripped}")
         }
+    } else if let Some(stripped) = strip_windows_users_prefix(path) {
+        // `C:\Users\<name>\dev\x` → `~\dev\x`, keeping the native separator.
+        if let Some(rest) = stripped.split_once('\\') {
+            format!("~\\{}", rest.1)
+        } else {
+            format!("~\\{stripped}")
+        }
     } else {
         path.to_string()
     }
+}
+
+/// `<drive>:\Users\` prefix (any drive letter, case-insensitive `Users`).
+fn strip_windows_users_prefix(path: &str) -> Option<&str> {
+    let (drive, rest) = path.split_at_checked(1)?;
+    if !drive.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let (prefix, rest) = rest.split_at_checked(":\\Users\\".len())?;
+    prefix.eq_ignore_ascii_case(":\\Users\\").then_some(rest)
 }
 
 #[cfg(test)]

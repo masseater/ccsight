@@ -875,7 +875,7 @@ fn run(mut terminal: DefaultTerminal, limit: usize) -> io::Result<()> {
 
         // Live sessions: poll every 5s. Reads ~/.claude/sessions/*.json
         // (Claude Code's first-party metadata) so no ambiguity; cost is a
-        // dozen ~1KB JSON reads + `kill -0` checks per poll, negligible.
+        // dozen ~1KB JSON reads + a liveness probe per poll, negligible.
         // `Disconnected` means the discovery thread panicked — clear the
         // slot so the next 5s tick re-spawns instead of freezing the panel.
         poll_live_sessions_task(&mut state);
