@@ -1470,6 +1470,19 @@ mod tests {
     }
 
     #[test]
+    fn test_format_project_path_windows_profile() {
+        assert_eq!(
+            super::super::format_project_path(r"C:\Users\alice\work\myapp"),
+            r"~\work\myapp"
+        );
+        assert_eq!(super::super::format_project_path(r"d:\users\bob"), r"~\bob");
+        assert_eq!(
+            super::super::format_project_path(r"C:\opt\project"),
+            r"C:\opt\project"
+        );
+    }
+
+    #[test]
     fn test_format_project_path_linux_home() {
         assert_eq!(
             super::super::format_project_path("/home/alice/work/myapp"),

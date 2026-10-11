@@ -16,7 +16,7 @@ fn detect_user_language() -> String {
     return CACHED.get_or_init(detect_user_language_inner).clone();
 
     fn detect_user_language_inner() -> String {
-        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        if let Some(home) = crate::infrastructure::home_dir() {
             let settings_path = home.join(".claude").join("settings.json");
             if let Ok(content) = std::fs::read_to_string(&settings_path)
                 && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
@@ -67,7 +67,6 @@ pub fn regenerate_day_summary(group: &DailyGroup) -> String {
 fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String {
     use crate::infrastructure::Cache;
     use std::collections::HashMap;
-    use std::process::Command;
 
     if use_cache
         && let Ok(cache) = Cache::load()
@@ -365,10 +364,7 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
         ---\n{context}\n---"
     );
 
-    let result = match Command::new("claude")
-        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
-        .output()
-    {
+    let result = match spawn_claude(&prompt).and_then(std::process::Child::wait_with_output) {
         Ok(output) => {
             if output.status.success() {
                 let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -393,6 +389,35 @@ fn generate_day_summary_internal(group: &DailyGroup, use_cache: bool) -> String 
     }
 
     result
+}
+
+/// `claude -p --model <SUMMARY_MODEL>` with the prompt fed on stdin rather
+/// than argv: Windows caps a whole command line at 32K chars, which a busy
+/// day's summary context can exceed. A writer thread feeds stdin so a large
+/// prompt can't deadlock against the child filling its stdout pipe.
+fn spawn_claude(prompt: &str) -> std::io::Result<std::process::Child> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(claude_program())
+        .args(["-p", "--model", crate::SUMMARY_MODEL])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let prompt = prompt.to_owned();
+        std::thread::spawn(move || {
+            let _write = stdin.write_all(prompt.as_bytes());
+        });
+    }
+    Ok(child)
+}
+
+/// The `claude` executable, resolved with PATHEXT on Windows: std's own
+/// lookup only tries `claude.exe` and misses the npm `claude.cmd` shim.
+/// Falls back to bare `claude` (the spawn error then surfaces as-is).
+fn claude_program() -> std::ffi::OsString {
+    which::which("claude").map_or_else(|_| "claude".into(), std::path::PathBuf::into_os_string)
 }
 
 pub fn extract_session_details(
@@ -453,7 +478,7 @@ pub fn extract_session_details_for_date(
                 if let Some(path) = file_path
                     && matches!(tool_name.as_str(), "Edit" | "Write" | "Read")
                 {
-                    let short_path = path.split('/').next_back().unwrap_or(&path).to_string();
+                    let short_path = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
                     if !files_modified.contains(&short_path) {
                         files_modified.push(short_path);
                     }
@@ -504,7 +529,6 @@ fn generate_session_summary_internal(
     filter_date: Option<chrono::NaiveDate>,
 ) -> String {
     use crate::infrastructure::Cache;
-    use std::process::Command;
 
     let cache_key = summary_cache_key(session, filter_date);
 
@@ -587,10 +611,7 @@ fn generate_session_summary_internal(
         ---\n{context}\n---"
     );
 
-    let result = match Command::new("claude")
-        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
-        .output()
-    {
+    let result = match spawn_claude(&prompt).and_then(std::process::Child::wait_with_output) {
         Ok(output) => {
             if output.status.success() {
                 let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -761,8 +782,6 @@ fn title_prompt(context: &str) -> String {
 pub(crate) fn regenerate_jsonl_title(
     session: &crate::aggregator::SessionInfo,
 ) -> Result<String, String> {
-    use std::process::Command;
-
     let (user_requests, _, _) = extract_session_details(&session.file_path);
 
     if user_requests.is_empty() {
@@ -780,16 +799,10 @@ pub(crate) fn regenerate_jsonl_title(
     let prompt = title_prompt(&context);
 
     use std::io::Read;
-    use std::process::Stdio;
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new("claude")
-        .args(["-p", &prompt, "--model", crate::SUMMARY_MODEL])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn claude: {e}"))?;
+    let mut child = spawn_claude(&prompt).map_err(|e| format!("Failed to spawn claude: {e}"))?;
 
     let timeout = Duration::from_secs(60);
     let start = Instant::now();

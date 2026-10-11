@@ -1921,20 +1921,20 @@ impl AppState {
         let mut basename_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for (name, _, _) in &list {
-            let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+            let basename = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
             *basename_counts.entry(basename).or_insert(0) += 1;
         }
         self.project_labels = list
             .iter()
             .map(|(name, _, _)| {
-                let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+                let basename = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
                 let label = if basename_counts.get(basename).copied().unwrap_or(0) <= 1 {
                     basename.to_string()
                 } else {
                     let parent = name
-                        .rsplit_once('/')
+                        .rsplit_once(['/', '\\'])
                         .map_or("", |(p, _)| p)
-                        .rsplit('/')
+                        .rsplit(['/', '\\'])
                         .next()
                         .unwrap_or("");
                     if parent.is_empty() {

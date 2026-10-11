@@ -26,7 +26,7 @@ pub mod infrastructure {
 
     pub use atomic::{atomic_write, atomic_write_with};
     pub use state_dir::{
-        cache_path, ensure_private_state_root, index_dir, migrate_legacy_state_dirs, pins_path,
-        search_history_path,
+        cache_path, ensure_private_state_root, home_dir, index_dir, migrate_legacy_state_dirs,
+        pins_path, search_history_path,
     };
 }

@@ -2356,7 +2356,7 @@ fn detail_panel_projects(
         let intensity = theme::bar_intensity(ratio);
         let bar_color = theme::ramp_color(theme::RAMP_PURPLE, intensity);
         // Show basename only; the absolute path is in the popup title.
-        let basename = name.rsplit('/').next().unwrap_or(name.as_str());
+        let basename = name.rsplit(['/', '\\']).next().unwrap_or(name.as_str());
         let display_name = super::truncate_with_ellipsis(basename, name_width);
         let cost = project_cost.get(name.as_str()).copied().unwrap_or(0.0);
         let unpriced = super::any_unpriced(&state.daily_groups, |_, s| &s.project_name == *name);

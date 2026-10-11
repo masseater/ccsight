@@ -142,8 +142,8 @@ fn idle_secs_of(path: &Path) -> Option<u64> {
 /// The `--wait` entry point. Exit codes: 0 = fired (printed one line),
 /// 2 = the session id didn't resolve.
 pub(crate) fn run_wait(prefix: &str) -> std::io::Result<()> {
-    let root = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".claude").join("projects"))
+    let root = crate::infrastructure::home_dir()
+        .map(|h| h.join(".claude").join("projects"))
         .unwrap_or_default();
     let jsonl = match resolve_session(&root, prefix) {
         Ok(p) => p,

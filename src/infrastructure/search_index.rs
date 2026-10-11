@@ -745,7 +745,7 @@ mod tests {
     #[test]
     fn test_index_path() {
         let path = SearchIndex::index_path().unwrap();
-        assert!(path.to_string_lossy().contains(".ccsight/index"));
+        assert!(path.ends_with(std::path::Path::new(".ccsight").join("index")));
     }
 
     #[test]

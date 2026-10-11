@@ -1,0 +1,4 @@
+# Shell scripts and git hooks must keep LF even on a Windows checkout
+# (core.autocrlf=true), or bash chokes on the trailing \r.
+*.sh text eol=lf
+scripts/hooks/* text eol=lf

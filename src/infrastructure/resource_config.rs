@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Default, Clone)]
 pub struct ConfiguredResources {
@@ -31,10 +31,9 @@ pub struct ConfiguredResources {
 pub fn discover_configured_resources() -> ConfiguredResources {
     let mut out = ConfiguredResources::default();
 
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = crate::infrastructure::home_dir() else {
         return out;
     };
-    let home = PathBuf::from(home);
 
     // (1) User scope.
     collect_from_root(&home.join(".claude"), None, &mut out);
@@ -149,6 +148,7 @@ fn collect_flat(dir: &Path, plugin_namespace: Option<&str>, dest: &mut HashSet<S
 mod tests {
     use super::*;
     use std::env;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static UNIQ: AtomicUsize = AtomicUsize::new(0);

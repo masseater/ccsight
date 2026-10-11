@@ -19,10 +19,17 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-/// Root directory for ccsight state. `~/.ccsight/` on both macOS and Linux.
+/// The user's home directory. Every `~` lookup in ccsight goes through here
+/// so Windows (no `HOME` in cmd / PowerShell) resolves the same `~/.claude`
+/// and `~/.ccsight` as a Unix shell does.
+pub fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+/// Root directory for ccsight state. `~/.ccsight/` on every platform.
 pub fn state_root() -> Result<PathBuf> {
-    let home = std::env::var("HOME")?;
-    Ok(PathBuf::from(home).join(".ccsight"))
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
+    Ok(home.join(".ccsight"))
 }
 
 pub fn cache_path() -> Result<PathBuf> {
@@ -105,10 +112,9 @@ fn sweep_stale_tmps(dir: &std::path::Path) {
 /// an existing target. Errors silenced — startup must not block; next
 /// run retries.
 pub fn migrate_legacy_state_dirs() {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home) = home_dir() else {
         return;
     };
-    let home = PathBuf::from(home);
     let Ok(new_root) = state_root() else {
         return;
     };
